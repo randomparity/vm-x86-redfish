@@ -172,9 +172,15 @@ operator workflows rather than wrapping Redfish itself.
   >@if [ -n "$(SHELL_SCRIPTS)" ]; then shellcheck $(SHELL_SCRIPTS); fi
   >@for script in $(EXECUTABLE_SCRIPTS); do test -x "$$script"; done
   >@if [ -n "$(SHFMT_PATHS)" ]; then shfmt -i 2 -d $(SHFMT_PATHS); fi
-  >@if [ -n "$(PYTHON_FILES)" ]; then uv run --locked ruff check $(PYTHON_FILES); fi
-  >@if [ -n "$(PYTHON_FILES)" ]; then uv run --locked ruff format --check $(PYTHON_FILES); fi
-  >@if [ -n "$(PYTHON_FILES)" ]; then uv run --locked ty check $(PYTHON_FILES); fi
+  >@if [ -n "$(PYTHON_FILES)" ]; then \
+  >  uv run --locked --only-group dev --no-install-project ruff check $(PYTHON_FILES); \
+  >fi
+  >@if [ -n "$(PYTHON_FILES)" ]; then \
+  >  uv run --locked --only-group dev --no-install-project ruff format --check $(PYTHON_FILES); \
+  >fi
+  >@if [ -n "$(PYTHON_FILES)" ]; then \
+  >  uv run --locked --only-group dev --no-install-project ty check $(PYTHON_FILES); \
+  >fi
   >@if [ -f uv.lock ]; then uv lock --check; fi
   >@if [ -f config/sushy-emulator.conf.py.in ]; then \
   >  test -n "$(PYTHON_313)"; \
@@ -254,8 +260,10 @@ operator workflows rather than wrapping Redfish itself.
           uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         - name: Install Python 3.13
           run: uv python install 3.13
-        - name: Install host test tools
-          run: sudo apt-get update && sudo apt-get install -y bats shellcheck shfmt
+        - name: Install host test and native build tools
+          run: |
+            sudo apt-get update
+            sudo apt-get install -y bats shellcheck shfmt gcc pkg-config libvirt-dev
         - name: Run offline guardrails
           run: make test
   ```
@@ -691,6 +699,8 @@ operator workflows rather than wrapping Redfish itself.
     need_command curl "curl"
     need_command openssl "openssl"
     need_command htpasswd "httpd-tools"
+    need_command gcc "gcc"
+    need_command pkg-config "pkgconf-pkg-config"
     need_command bats "bats"
     need_command shellcheck "ShellCheck"
     need_command shfmt "shfmt"
@@ -766,6 +776,27 @@ operator workflows rather than wrapping Redfish itself.
   PY
   }
 
+  check_native_build_inputs() {
+    local python_bin
+    pkg-config --exists libvirt ||
+      fail "missing libvirt development headers: install libvirt-devel"
+    python_bin="$(python_313)"
+    "$python_bin" - <<'PY' || fail "missing Python 3.13 headers: install python3-devel"
+  import pathlib
+  import sysconfig
+  include = sysconfig.get_config_var("INCLUDEPY")
+  raise SystemExit(0 if include and (pathlib.Path(include) / "Python.h").is_file() else 1)
+  PY
+  }
+
+  check_uv_runtime_dependencies() {
+    UV_PYTHON_DOWNLOADS=never \
+      uv run --locked --no-dev python - <<'PY' || fail "uv cannot import libvirt"
+  import libvirt
+  raise SystemExit(0 if libvirt is not None else 1)
+  PY
+  }
+
   check_loopback_port() {
     local python_bin
     if integration_override_enabled &&
@@ -785,6 +816,8 @@ operator workflows rather than wrapping Redfish itself.
   check_kvm
   check_uefi_firmware
   check_uv_python
+  check_native_build_inputs
+  check_uv_runtime_dependencies
   check_loopback_port
   check_libvirt
   printf 'doctor: host prerequisites are available\n'
@@ -825,13 +858,17 @@ operator workflows rather than wrapping Redfish itself.
     "python find 3.13")
       printf "%s/python313\n" "$BATS_TEST_TMPDIR/bin"
       ;;
+    "run --locked --no-dev python -")
+      exit 0
+      ;;
     *)
       exit 2
       ;;
   esac
   '
-    for command in qemu-system-x86_64 qemu-img uuidgen curl openssl htpasswd bats shellcheck shfmt \
-      grub2-mkrescue xorriso; do
+    install_mock_command pkg-config 'exit 0'
+    for command in qemu-system-x86_64 qemu-img uuidgen curl openssl htpasswd gcc bats \
+      shellcheck shfmt grub2-mkrescue xorriso; do
       install_recording_noop "$command"
     done
     mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
@@ -858,6 +895,14 @@ operator workflows rather than wrapping Redfish itself.
     run ./scripts/doctor
     [ "$status" -ne 0 ]
     [[ "$output" == *"missing command 'uuidgen': install util-linux-core"* ]]
+  }
+
+  @test "doctor reports missing libvirt development headers" {
+    install_all_doctor_success_mocks
+    install_mock_command pkg-config 'exit 1'
+    run ./scripts/doctor
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"missing libvirt development headers"* ]]
   }
 
   @test "doctor rejects inactive default network" {
@@ -907,11 +952,13 @@ operator workflows rather than wrapping Redfish itself.
     install_mock_command uv '
   case "$*" in
     "python find 3.13") printf "%s/python313\n" "$BATS_TEST_TMPDIR/bin" ;;
+    "run --locked --no-dev python -") exit 0 ;;
     *) exit 2 ;;
   esac
   '
+    install_mock_command pkg-config 'exit 0'
     for command in uname qemu-system-x86_64 qemu-img uuidgen curl openssl htpasswd bats \
-      shellcheck shfmt grub2-mkrescue xorriso; do
+      gcc shellcheck shfmt grub2-mkrescue xorriso; do
       install_recording_noop "$command"
     done
     install_mock_command uname 'printf "x86_64\n"'
@@ -925,14 +972,12 @@ operator workflows rather than wrapping Redfish itself.
   Add one more test to prove the read-only contract:
 
   ```bash
-  @test "doctor does not create uv project state" {
+  @test "doctor does not create VM runtime state" {
     install_all_doctor_success_mocks
-    before="$(git status --short uv.lock .venv)"
     run ./scripts/doctor
     [ "$status" -eq 0 ]
-    after="$(git status --short uv.lock .venv)"
-    [ "$after" = "$before" ]
-    [ ! -e .venv ]
+    [ ! -e .state ]
+    [ ! -e .artifacts ]
   }
   ```
 
@@ -2205,6 +2250,67 @@ operator workflows rather than wrapping Redfish itself.
     [[ "$output" == *"unexpected disk source"* ]]
   }
 
+  @test "destroy-vm retries after undefine succeeds and root delete fails" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dumpxml vm-x86-redfish")
+      if [ -f "$BATS_TEST_TMPDIR/domain-absent" ]; then
+        exit 1
+      fi
+      cat <<XML
+  <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+    <uuid>11111111-2222-3333-4444-555555555555</uuid>
+    <metadata>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
+    </metadata>
+    <devices>
+      <disk type="file" device="disk">
+        <source file="/var/lib/libvirt/images/vm-x86-redfish.qcow2"/>
+      </disk>
+    </devices>
+  </domain>
+  XML
+      ;;
+    *"domstate vm-x86-redfish")
+      printf "shut off\n"
+      ;;
+    *"undefine vm-x86-redfish --nvram")
+      touch "$BATS_TEST_TMPDIR/domain-absent"
+      ;;
+    *"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+      ;;
+    *"vol-delete --pool default vm-x86-redfish.qcow2")
+      if [ ! -f "$BATS_TEST_TMPDIR/root-delete-failed" ]; then
+        touch "$BATS_TEST_TMPDIR/root-delete-failed"
+        exit 1
+      fi
+      ;;
+    *"vol-list --pool default --name")
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/destroy-vm
+    [ "$status" -ne 0 ]
+    [ -e "$VM_X86_REDFISH_STATE_DIR/destroy-domain.xml" ]
+    [ -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+    run ./scripts/destroy-vm
+    [ "$status" -eq 0 ]
+    grep -F "vol-delete --pool default vm-x86-redfish.qcow2" \
+      "$BATS_TEST_TMPDIR/commands.log"
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  }
+
   @test "destroy-vm removes uuid media volumes when domain and root are absent" {
     printf '11111111-2222-3333-4444-555555555555\n' \
       >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
@@ -2336,8 +2442,9 @@ operator workflows rather than wrapping Redfish itself.
 
   cleanup_project_state_files() {
     local file
-    for file in domain.xml destroy-domain.xml existing-domain.xml domain-uuid \
-      credentials.env htpasswd tls.crt tls.key connection.env sushy-emulator.conf.py; do
+    for file in domain.xml destroy-domain.xml destroy-domain.current.xml \
+      existing-domain.xml domain-uuid credentials.env htpasswd tls.crt tls.key \
+      connection.env sushy-emulator.conf.py; do
       [ -e "${STATE_DIR}/${file}" ] && rm -- "${STATE_DIR}/${file}"
     done
   }
@@ -2357,24 +2464,56 @@ operator workflows rather than wrapping Redfish itself.
     done <<<"$volumes"
   }
 
+  validate_destroy_proof() {
+    local proof_path="$1"
+    local root_path
+    domain_is_project_owned "$proof_path" ||
+      fail "stored destroy proof is not owned by this project"
+    domain_uuid_matches_state "$proof_path" ||
+      fail "stored destroy proof UUID does not match $DOMAIN_UUID_FILE"
+    domain_root_volume_matches_state "$proof_path" ||
+      fail "stored destroy proof does not reference $ROOT_VOLUME_NAME"
+    if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+      >/dev/null 2>&1; then
+      if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
+        "$ROOT_VOLUME_NAME")"; then
+        fail "cannot resolve root volume path for $ROOT_VOLUME_NAME"
+      fi
+      domain_disk_source_matches "$proof_path" "$root_path" ||
+        fail "stored destroy proof has unexpected disk source"
+    fi
+  }
+
+  cleanup_absent_domain() {
+    local proof_path="$1"
+    local uuid="$2"
+    if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+      >/dev/null 2>&1; then
+      [ -f "$proof_path" ] ||
+        fail "cannot prove ownership of $ROOT_VOLUME_NAME without domain metadata"
+      validate_destroy_proof "$proof_path"
+      virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
+    fi
+    delete_uuid_media_volumes "$uuid"
+    cleanup_tmpdir
+    printf 'destroy: domain %s is already absent\n' "$DEFAULT_DOMAIN_NAME"
+    cleanup_project_state_files
+  }
+
   destroy_transaction() {
-    local root_path uuid xml_path
+    local root_path uuid xml_path xml_probe
     if [ ! -f "$DOMAIN_UUID_FILE" ]; then
       printf 'destroy: no project state found\n'
       return 0
     fi
     uuid="$(read_domain_uuid)"
     xml_path="${STATE_DIR}/destroy-domain.xml"
-    if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_path"; then
-      if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
-        >/dev/null 2>&1; then
-        fail "cannot prove ownership of $ROOT_VOLUME_NAME without domain metadata"
-      fi
-      delete_uuid_media_volumes "$uuid"
-      printf 'destroy: domain %s is already absent\n' "$DEFAULT_DOMAIN_NAME"
-      cleanup_project_state_files
+    xml_probe="${STATE_DIR}/destroy-domain.current.xml"
+    if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_probe"; then
+      cleanup_absent_domain "$xml_path" "$uuid"
       return 0
     fi
+    mv -- "$xml_probe" "$xml_path"
     domain_is_project_owned "$xml_path" ||
       fail "refusing to destroy unowned domain $DEFAULT_DOMAIN_NAME"
     domain_uuid_matches_state "$xml_path" ||
