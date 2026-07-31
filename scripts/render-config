@@ -43,5 +43,5 @@ render_domain() {
 
 case "${1:-}" in
 domain) render_domain ;;
-*) fail "usage: scripts/render-config domain|sushy" ;;
+*) fail "usage: scripts/render-config domain" ;;
 esac
