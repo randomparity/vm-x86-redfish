@@ -61,7 +61,8 @@ esac
   done
   mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
   touch "$BATS_TEST_TMPDIR/dev/kvm"
-  VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm" \
+  VM_X86_REDFISH_INTEGRATION_TEST=1 \
+    VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm" \
     VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf" \
     run ./scripts/doctor
   [ "$status" -eq 0 ]
@@ -94,6 +95,7 @@ esac
   install_mock_command uname 'printf "x86_64\n"'
   mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
   touch "$BATS_TEST_TMPDIR/dev/kvm"
+  export VM_X86_REDFISH_INTEGRATION_TEST=1
   export VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm"
   export VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
 }
