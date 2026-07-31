@@ -104,8 +104,10 @@ operator workflows rather than wrapping Redfish itself.
   }
 
   @test "generated runtime state is ignored" {
-    run git check-ignore .state/domain-uuid .artifacts/example/log.txt .venv/bin/python
-    [ "$status" -eq 0 ]
+    for path in .state/domain-uuid .artifacts/example/log.txt .venv/bin/python; do
+      run git check-ignore --quiet -- "$path"
+      [ "$status" -eq 0 ]
+    done
   }
   ```
 
@@ -601,6 +603,16 @@ operator workflows rather than wrapping Redfish itself.
     install_uv_python_mock
   }
 
+  setup_integration_workspace() {
+    export REPO_ROOT
+    REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+    cd "$REPO_ROOT"
+    export VM_X86_REDFISH_INTEGRATION_TEST=1
+    export VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state"
+    export VM_X86_REDFISH_ARTIFACTS_DIR="$BATS_TEST_TMPDIR/artifacts"
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_ARTIFACTS_DIR"
+  }
+
   setup() {
     setup_test_workspace
   }
@@ -789,14 +801,6 @@ operator workflows rather than wrapping Redfish itself.
   PY
   }
 
-  check_uv_runtime_dependencies() {
-    UV_PYTHON_DOWNLOADS=never \
-      uv run --locked --no-dev python - <<'PY' || fail "uv cannot import libvirt"
-  import libvirt
-  raise SystemExit(0 if libvirt is not None else 1)
-  PY
-  }
-
   check_loopback_port() {
     local python_bin
     if integration_override_enabled &&
@@ -817,7 +821,6 @@ operator workflows rather than wrapping Redfish itself.
   check_uefi_firmware
   check_uv_python
   check_native_build_inputs
-  check_uv_runtime_dependencies
   check_loopback_port
   check_libvirt
   printf 'doctor: host prerequisites are available\n'
@@ -857,9 +860,6 @@ operator workflows rather than wrapping Redfish itself.
   case "$*" in
     "python find 3.13")
       printf "%s/python313\n" "$BATS_TEST_TMPDIR/bin"
-      ;;
-    "run --locked --no-dev python -")
-      exit 0
       ;;
     *)
       exit 2
@@ -952,7 +952,6 @@ operator workflows rather than wrapping Redfish itself.
     install_mock_command uv '
   case "$*" in
     "python find 3.13") printf "%s/python313\n" "$BATS_TEST_TMPDIR/bin" ;;
-    "run --locked --no-dev python -") exit 0 ;;
     *) exit 2 ;;
   esac
   '
@@ -978,6 +977,7 @@ operator workflows rather than wrapping Redfish itself.
     [ "$status" -eq 0 ]
     [ ! -e .state ]
     [ ! -e .artifacts ]
+    [ ! -e .venv ]
   }
   ```
 
@@ -2078,6 +2078,8 @@ operator workflows rather than wrapping Redfish itself.
   chmod +x scripts/run-redfish
   shfmt -i 2 -w scripts/run-redfish tests/render-config.bats
   shellcheck scripts/run-redfish
+  UV_PYTHON_DOWNLOADS=never uv run --locked --no-dev python -c 'import libvirt'
+  UV_PYTHON_DOWNLOADS=never uv run --locked --no-dev sushy-emulator --help
   bats tests/render-config.bats
   make test
   ```
@@ -2646,7 +2648,7 @@ operator workflows rather than wrapping Redfish itself.
   load "helpers/test-helper"
 
   setup() {
-    setup_test_workspace
+    setup_integration_workspace
     export TEST_ID="redfish-${BATS_TEST_NUMBER}-$$"
     export VM_X86_REDFISH_INTEGRATION_TEST=1
     export VM_X86_REDFISH_DOMAIN_NAME="vm-x86-redfish-${TEST_ID}"
@@ -2657,6 +2659,12 @@ operator workflows rather than wrapping Redfish itself.
     [ "$LIBVIRT_URI" = "qemu:///system" ]
     [ "$STORAGE_POOL" = "default" ]
     python_313 >/dev/null
+    case "$(command -v uv)" in
+      "$BATS_TEST_TMPDIR"/*)
+        printf 'integration harness resolved mocked uv\n' >&2
+        return 1
+        ;;
+    esac
     mkdir -p "$VM_X86_REDFISH_ARTIFACTS_DIR"
     TRACKED_CHILDREN=()
   }
