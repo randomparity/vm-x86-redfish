@@ -2,20 +2,24 @@
 
 ## Project Structure & Module Organization
 
-This repository currently contains only `README.md`, which describes the goal: an x86
-libvirt/QEMU virtual machine with a reference Redfish/IPMI management controller. Keep
-top-level documentation and entry-point scripts easy to discover. As implementation is
-added, place reusable shell code in `scripts/`, machine or service configuration in
-`config/`, and automated checks in `tests/`. Do not commit generated VM disks, firmware
+This repository provides an x86 libvirt/QEMU virtual machine with a reference
+Redfish/IPMI management controller. Keep top-level documentation and entry-point scripts
+easy to discover. Place reusable shell code in `scripts/`, machine or service configuration
+in `config/`, and automated checks in `tests/`. Do not commit generated VM disks, firmware
 blobs, logs, or local runtime state.
 
 ## Build, Test, and Development Commands
 
-No build, install, or test commands are checked in yet. Do not assume commands mentioned
-in related VM repositories work here. When adding the first workflow, expose a small,
-documented command surface (for example, `make build`, `make test`, and `make clean`) and
-update both this guide and `README.md`. Commands should be non-interactive where practical,
-fail on errors, and clearly report missing host dependencies such as QEMU or libvirt.
+Use the Make targets below; commands should be non-interactive where practical, fail on
+errors, and clearly report missing host dependencies such as QEMU or libvirt.
+
+- `make doctor`: verify host prerequisites without changing the host.
+- `make create`: create or validate the project-owned VM and Redfish state.
+- `make redfish`: run the loopback Redfish service in the foreground.
+- `make test`: run offline tests and static checks.
+- `make test-integration`: run opt-in host integration tests and mutates host libvirt state.
+- `make destroy`: remove only project-owned VM resources.
+- `make clean`: alias for `make destroy`.
 
 ## Coding Style & Naming Conventions
 
