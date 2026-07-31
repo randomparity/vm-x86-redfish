@@ -19,6 +19,60 @@ setup() {
   [[ "$output" == *"destroy: no project state found"* ]]
 }
 
+@test "destroy-vm rejects a domain UUID directory before libvirt commands" {
+  mkdir "$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  install_mock_command virsh '
+printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"expected regular project state file"* ]]
+  [ -d "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  [ ! -e "$BATS_TEST_TMPDIR/commands.log" ]
+}
+
+@test "destroy-vm rejects a dangling domain UUID symlink before libvirt commands" {
+  ln -s "$BATS_TEST_TMPDIR/missing-domain-uuid" \
+    "$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  install_mock_command virsh '
+printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"expected regular project state file"* ]]
+  [ -L "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  [ ! -e "$BATS_TEST_TMPDIR/commands.log" ]
+}
+
+@test "destroy-vm rejects a domain UUID symlink to a file before libvirt commands" {
+  printf '11111111-2222-4333-8444-555555555555\n' >"$BATS_TEST_TMPDIR/domain-uuid"
+  ln -s "$BATS_TEST_TMPDIR/domain-uuid" "$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  install_mock_command virsh '
+printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"expected regular project state file"* ]]
+  [ -L "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  [ -f "$BATS_TEST_TMPDIR/domain-uuid" ]
+  [ ! -e "$BATS_TEST_TMPDIR/commands.log" ]
+}
+
+@test "destroy-vm rejects a dangling tmp symlink before libvirt commands" {
+  printf '11111111-2222-4333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  ln -s "$BATS_TEST_TMPDIR/missing-tmp" "$VM_X86_REDFISH_STATE_DIR/tmp"
+  install_mock_command virsh '
+printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing symlink"* ]]
+  [ -f "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  [ -L "$VM_X86_REDFISH_STATE_DIR/tmp" ]
+  [ ! -e "$BATS_TEST_TMPDIR/commands.log" ]
+}
+
 @test "destroy-vm refuses domain with mismatched ownership" {
   printf '11111111-2222-4333-8444-555555555555\n' \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"

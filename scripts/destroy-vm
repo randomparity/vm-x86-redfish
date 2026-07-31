@@ -23,6 +23,19 @@ require_safe_state_file_or_absent() {
   state_path_is_safe_file_or_absent "$path" || fail "unexpected project state file: $path"
 }
 
+require_project_state_file() {
+  local path="$1"
+  if [ -L "$path" ] || [ ! -f "$path" ]; then
+    fail "expected regular project state file: $path"
+  fi
+}
+
+require_safe_tmpdir_or_absent() {
+  local tmpdir="${STATE_DIR}/tmp"
+  reject_symlink "$tmpdir"
+  [ ! -e "$tmpdir" ] || require_private_dir "$tmpdir"
+}
+
 cleanup_project_state_files() {
   local file path
   local state_files=(
@@ -96,9 +109,11 @@ cleanup_tmp_child_dir() {
 
 cleanup_tmpdir() {
   local entry tmpdir
-  [ -e "${STATE_DIR}/tmp" ] || return 0
-  require_private_dir "${STATE_DIR}/tmp"
-  tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
+  tmpdir="${STATE_DIR}/tmp"
+  reject_symlink "$tmpdir"
+  [ -e "$tmpdir" ] || return 0
+  require_private_dir "$tmpdir"
+  tmpdir="$(canonical_dir "$tmpdir")"
   while IFS= read -r -d '' entry; do
     if [ -f "$entry" ] && [ ! -L "$entry" ]; then
       rm -- "$entry"
@@ -171,10 +186,12 @@ destroy_domain_if_active() {
 
 destroy_transaction() {
   local current_probe_path root_path uuid xml_path
-  if [ ! -f "$DOMAIN_UUID_FILE" ]; then
+  if [ ! -e "$DOMAIN_UUID_FILE" ] && [ ! -L "$DOMAIN_UUID_FILE" ]; then
     printf 'destroy: no project state found\n'
     return 0
   fi
+  require_project_state_file "$DOMAIN_UUID_FILE"
+  require_safe_tmpdir_or_absent
   uuid="$(read_domain_uuid)"
   xml_path="${STATE_DIR}/destroy-domain.xml"
   current_probe_path="${STATE_DIR}/destroy-domain.current.xml"
