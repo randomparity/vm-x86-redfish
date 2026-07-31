@@ -1,0 +1,1800 @@
+# Redfish-Controlled x86 VM Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development
+> (recommended) or executing-plans to implement this plan task-by-task. Steps use checkbox
+> (`- [ ]`) syntax for tracking.
+
+**Goal:** Build the first repository deliverable: an x86_64 libvirt/QEMU VM managed through
+a loopback-only, TLS-enabled Sushy Emulator Redfish endpoint.
+
+**Architecture:** Bash lifecycle scripts own host orchestration, libvirt XML rendering,
+locking, generated state, and cleanup. Sushy Emulator remains the only Redfish
+implementation; this repo supplies pinned dependencies, configuration, tests, and documented
+operator workflows rather than wrapping Redfish itself.
+
+**Tech Stack:** Bash, Make, Bats, ShellCheck, shfmt, uv, Python 3.13,
+`sushy-tools==2.2.0`, `libvirt-python==12.0.0`, libvirt 12.0.x, QEMU/KVM.
+
+## Global Constraints
+
+- Source spec: `docs/specs/redfish-vm.md` with `Status: Accepted`.
+- Work branch: `feat/redfish-vm-plan`; `BASE_BRANCH=main`.
+- GitHub repo: `randomparity/vm-x86-redfish`; no issue number exists yet.
+- The first release targets Fedora 44 hosts and `qemu:///system`.
+- The fixed developer domain name is `vm-x86-redfish`.
+- Generated configuration, credentials, certificates, identifiers, logs, downloaded media,
+  VM disks, firmware state, and retained diagnostics must stay out of git under `.state/`
+  and `.artifacts/`.
+- Shell scripts must start with `#!/usr/bin/env bash` and `set -euo pipefail`.
+- Use two-space indentation in shell and YAML files, with a 100-character line limit.
+- Format changed shell files with `shfmt -i 2 -w path...` and lint them with `shellcheck`.
+- Python runtime is 3.13 through `uv`; use exact pins in `pyproject.toml` and `uv.lock`.
+- Use `ruff check`, `ruff format`, `ty check`, and `pytest -q` for Python only if Python
+  project code or Python tests are added beyond Sushy configuration validation.
+- GitHub Actions must pin actions by full commit SHA with a version comment and use
+  `persist-credentials: false`.
+- Available pre-implementation guardrail: `git diff --check`.
+- Planned guardrail after Task 1: `make test`.
+- Planned host preflight check: `make doctor`.
+- Planned integration proof: `make test-integration`, opt-in only.
+- ADR coupling verdict: not coupled; no `docs/adr/` index or ADR gate exists in this repo.
+- Security model: Redfish listens only on `127.0.0.1:8000`; discovery root is public; all
+  system, virtual-media, and action resources require Basic authentication.
+
+---
+
+## File Structure
+
+- `.gitignore` records generated state, artifacts, virtual disks, local virtualenvs, Python
+  caches, and coverage output that must never be committed.
+- `Makefile` is the public command surface: `doctor`, `create`, `redfish`, `destroy`,
+  `test`, `test-integration`, and `clean`.
+- `pyproject.toml` and `uv.lock` pin Sushy Emulator and libvirt bindings for the configured
+  Fedora 44 host contract.
+- `.github/workflows/ci.yml` runs the non-mutating local guardrail command.
+- `.github/dependabot.yml` groups weekly GitHub Actions and uv updates with a 7-day cooldown.
+- `config/domain.xml` is a libvirt domain XML template with explicit replacement tokens.
+- `config/sushy-emulator.conf.py.in` is a Python config template rendered into `.state/`.
+- `scripts/lib/common` provides shared constants, path canonicalization, lock handling,
+  safe state-directory checks, ownership checks, and command wrappers used by lifecycle
+  scripts.
+- `scripts/doctor` performs read-only host checks and prints package-level remediation.
+- `scripts/render-config` renders project templates into `.state/`.
+- `scripts/create-vm` creates or validates the project-owned VM, credentials, TLS material,
+  state directories, and generated Sushy config.
+- `scripts/run-redfish` validates runtime state, holds the lifecycle lock, and `exec`s Sushy
+  in the foreground.
+- `scripts/destroy-vm` validates ownership and removes only project-owned libvirt resources
+  and checked state files.
+- `tests/helpers/test-helper.bash` creates per-test temporary workspaces and command mocks.
+- `tests/doctor.bats` covers read-only host checks and missing-dependency diagnostics.
+- `tests/render-config.bats` covers deterministic template rendering and secret file modes.
+- `tests/create-vm.bats` covers create idempotency, ownership rejection, and rollback.
+- `tests/destroy-vm.bats` covers owner-gated cleanup and media-volume matching.
+- `tests/redfish-integration.bats` is opt-in and exercises the real libvirt/Sushy boundary.
+- `tests/fixtures/grub.cfg.in` prints a run-specific serial sentinel and halts.
+
+## Task 1: Project Guardrails and Command Surface
+
+**Files:**
+- Create: `.gitignore`
+- Create: `Makefile`
+- Create: `pyproject.toml`
+- Create: `.github/workflows/ci.yml`
+- Create: `.github/dependabot.yml`
+- Modify: `AGENTS.md`
+- Modify: `README.md`
+
+**Interfaces:**
+- Consumes: Accepted spec and repository standards.
+- Produces: Public commands `make doctor`, `make create`, `make redfish`, `make destroy`,
+  `make test`, `make test-integration`, and `make clean`.
+
+- [ ] **Step 1: Write the failing command-surface check**
+
+  Create `tests/command-surface.bats` with:
+
+  ```bash
+  #!/usr/bin/env bats
+
+  @test "Makefile exposes required public targets" {
+    run make -n doctor create redfish destroy test test-integration clean
+    [ "$status" -eq 0 ]
+  }
+
+  @test "generated runtime state is ignored" {
+    run git check-ignore .state/domain-uuid .artifacts/example/log.txt .venv/bin/python
+    [ "$status" -eq 0 ]
+  }
+  ```
+
+- [ ] **Step 2: Run the command-surface check and verify it fails**
+
+  Run:
+
+  ```bash
+  bats tests/command-surface.bats
+  ```
+
+  Expected: FAIL because `Makefile` and `.gitignore` do not exist yet.
+
+- [ ] **Step 3: Add generated-state ignores**
+
+  Create `.gitignore` with:
+
+  ```gitignore
+  .artifacts/
+  .coverage
+  .pytest_cache/
+  .state/
+  .venv/
+  __pycache__/
+  *.qcow2
+  *.raw
+  ```
+
+- [ ] **Step 4: Add the public Make targets**
+
+  Create `Makefile` with:
+
+  ```makefile
+  SHELL := bash
+  .SHELLFLAGS := -euo pipefail -c
+  .RECIPEPREFIX := >
+
+  .PHONY: doctor create redfish destroy test test-integration clean
+
+  doctor:
+  >./scripts/doctor
+
+  create:
+  >./scripts/create-vm
+
+  redfish:
+  >./scripts/run-redfish
+
+  destroy:
+  >./scripts/destroy-vm
+
+  BATS_TESTS := $(wildcard tests/*.bats)
+  SHELL_PATHS := $(wildcard scripts/* scripts/lib/*)
+
+  test:
+  >@if [ -n "$(BATS_TESTS)" ]; then bats $(BATS_TESTS); fi
+  >@if [ -n "$(SHELL_PATHS)" ]; then shellcheck $(SHELL_PATHS); fi
+  >@if [ -d scripts ] || [ -d tests ]; then shfmt -i 2 -d scripts tests; fi
+  >@if [ -f config/sushy-emulator.conf.py.in ]; then \
+  >  uv run python -m py_compile config/sushy-emulator.conf.py.in; \
+  >fi
+
+  test-integration:
+  >bats tests/redfish-integration.bats
+
+  clean:
+  >./scripts/destroy-vm
+  ```
+
+- [ ] **Step 5: Add the pinned uv project**
+
+  Create `pyproject.toml` with:
+
+  ```toml
+  [project]
+  name = "vm-x86-redfish"
+  version = "0.1.0"
+  requires-python = "==3.13.*"
+  dependencies = [
+    "libvirt-python==12.0.0",
+    "sushy-tools==2.2.0",
+  ]
+
+  [dependency-groups]
+  dev = [
+    "pip-audit==2.10.1",
+    "pytest==9.1.1",
+    "ruff==0.16.1",
+    "ty==0.0.65",
+  ]
+
+  [tool.ruff]
+  line-length = 100
+  target-version = "py313"
+
+  [tool.ty.rules]
+  unresolved-import = "error"
+  ```
+
+  Run:
+
+  ```bash
+  uv lock
+  ```
+
+  Expected: `uv.lock` is created with exact transitive dependency resolution.
+
+- [ ] **Step 6: Add CI and dependency update configuration**
+
+  Create `.github/workflows/ci.yml` with actions pinned to full SHAs looked up on
+  2026-07-31:
+
+  ```yaml
+  name: ci
+
+  on:
+    pull_request:
+    push:
+      branches: [main]
+
+  permissions:
+    contents: read
+
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - name: Check out repository
+          uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+          with:
+            persist-credentials: false
+        - name: Install uv
+          uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        - name: Install host test tools
+          run: sudo apt-get update && sudo apt-get install -y bats shellcheck shfmt
+        - name: Run offline guardrails
+          run: make test
+  ```
+
+  Re-run these lookup commands during implementation before committing. If either tag has a
+  newer stable release, update the pinned SHA and version comment in this same task:
+
+  ```bash
+  git ls-remote --tags https://github.com/actions/checkout.git 'refs/tags/v*'
+  git ls-remote --tags https://github.com/astral-sh/setup-uv.git 'refs/tags/*'
+  ```
+
+  Create `.github/dependabot.yml` with:
+
+  ```yaml
+  version: 2
+  updates:
+    - package-ecosystem: github-actions
+      directory: /
+      schedule:
+        interval: weekly
+      groups:
+        github-actions:
+          patterns: ["*"]
+      cooldown:
+        default-days: 7
+    - package-ecosystem: uv
+      directory: /
+      schedule:
+        interval: weekly
+      groups:
+        python-dependencies:
+          patterns: ["*"]
+      cooldown:
+        default-days: 7
+  ```
+
+- [ ] **Step 7: Document the command surface**
+
+  Update `README.md` so it includes:
+
+  ```markdown
+  ## Commands
+
+  - `make doctor`: verify host prerequisites without changing the host.
+  - `make create`: create or validate the project-owned VM and Redfish state.
+  - `make redfish`: run the loopback Redfish service in the foreground.
+  - `make test`: run offline tests and static checks.
+  - `make test-integration`: run opt-in host integration tests.
+  - `make destroy`: remove only project-owned VM resources.
+  - `make clean`: alias for `make destroy`.
+  ```
+
+  Update `AGENTS.md` "Build, Test, and Development Commands" with the same targets and
+  note that `make test-integration` mutates host libvirt state.
+
+- [ ] **Step 8: Run guardrails and commit**
+
+  Run:
+
+  ```bash
+  bats tests/command-surface.bats
+  make test
+  zizmor .github/workflows/
+  git diff --check
+  ```
+
+  Expected: all commands exit 0. Commit:
+
+  ```bash
+  git add .gitignore Makefile pyproject.toml uv.lock .github README.md AGENTS.md tests
+  git commit -m "chore: add project guardrails"
+  ```
+
+## Task 2: Shared Shell Test Harness and Lifecycle Primitives
+
+**Files:**
+- Create: `scripts/lib/common`
+- Create: `tests/helpers/test-helper.bash`
+- Test: `tests/render-config.bats`
+
+**Interfaces:**
+- Produces shell constants: `PROJECT_NAME`, `DEFAULT_DOMAIN_NAME`, `LIBVIRT_URI`,
+  `STATE_DIR`, `ARTIFACTS_DIR`, `ROOT_VOLUME_NAME`, `DOMAIN_UUID_FILE`, and
+  `LIFECYCLE_LOCK`.
+- Produces functions: `repo_root`, `state_path`, `artifact_path`, `fail`, `need_command`,
+  `canonical_dir`, `ensure_private_dir`, `reject_symlink`, `with_lifecycle_lock`,
+  `read_domain_uuid`, `write_secret_file`, and `volume_name_for_media`.
+
+- [ ] **Step 1: Write tests for private state validation and media volume names**
+
+  Add to `tests/render-config.bats`:
+
+  ```bash
+  #!/usr/bin/env bats
+
+  load "helpers/test-helper"
+
+  @test "ensure_private_dir creates mode 0700 directory" {
+    run bash -c '
+      source scripts/lib/common
+      STATE_DIR="$BATS_TEST_TMPDIR/state"
+      ensure_private_dir "$STATE_DIR"
+      stat -c "%a %F" "$STATE_DIR"
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "700 directory" ]
+  }
+
+  @test "ensure_private_dir rejects symlinks" {
+    mkdir -p "$BATS_TEST_TMPDIR/real"
+    ln -s "$BATS_TEST_TMPDIR/real" "$BATS_TEST_TMPDIR/state"
+    run bash -c '
+      source scripts/lib/common
+      ensure_private_dir "$BATS_TEST_TMPDIR/state"
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"refusing symlink"* ]]
+  }
+
+  @test "media volume name replaces dots and appends domain uuid" {
+    run bash -c '
+      source scripts/lib/common
+      volume_name_for_media "https://example.test/images/fedora.iso" \
+        "11111111-2222-3333-4444-555555555555"
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "fedora-iso-11111111-2222-3333-4444-555555555555.img" ]
+  }
+  ```
+
+- [ ] **Step 2: Run tests and verify they fail**
+
+  Run:
+
+  ```bash
+  bats tests/render-config.bats
+  ```
+
+  Expected: FAIL because `scripts/lib/common` does not exist.
+
+- [ ] **Step 3: Implement shared lifecycle primitives**
+
+  Create `scripts/lib/common` with:
+
+  ```bash
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  PROJECT_NAME="vm-x86-redfish"
+  DEFAULT_DOMAIN_NAME="${VM_X86_REDFISH_DOMAIN_NAME:-vm-x86-redfish}"
+  LIBVIRT_URI="${VM_X86_REDFISH_LIBVIRT_URI:-qemu:///system}"
+  STORAGE_POOL="${VM_X86_REDFISH_STORAGE_POOL:-default}"
+  STATE_DIR="${VM_X86_REDFISH_STATE_DIR:-.state}"
+  ARTIFACTS_DIR="${VM_X86_REDFISH_ARTIFACTS_DIR:-.artifacts}"
+  ROOT_VOLUME_NAME="${VM_X86_REDFISH_ROOT_VOLUME_NAME:-${DEFAULT_DOMAIN_NAME}.qcow2}"
+  DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
+  LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
+
+  fail() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+  }
+
+  repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || pwd
+  }
+
+  need_command() {
+    command -v "$1" >/dev/null 2>&1 || fail "missing command '$1': install $2"
+  }
+
+  reject_symlink() {
+    local path="$1"
+    [ ! -L "$path" ] || fail "refusing symlink: $path"
+  }
+
+  ensure_private_dir() {
+    local path="$1"
+    reject_symlink "$path"
+    mkdir -p "$path"
+    chmod 700 "$path"
+    [ -d "$path" ] || fail "not a directory: $path"
+    [ "$(stat -c '%a' "$path")" = "700" ] || fail "directory must be mode 0700: $path"
+  }
+
+  canonical_dir() {
+    local path="$1"
+    reject_symlink "$path"
+    mkdir -p "$path"
+    realpath -e "$path"
+  }
+
+  write_secret_file() {
+    local path="$1"
+    local content="$2"
+    umask 077
+    printf '%s\n' "$content" >"$path"
+    chmod 600 "$path"
+  }
+
+  read_domain_uuid() {
+    [ -f "$DOMAIN_UUID_FILE" ] || fail "missing domain UUID file: $DOMAIN_UUID_FILE"
+    tr -d '\n' <"$DOMAIN_UUID_FILE"
+  }
+
+  with_lifecycle_lock() {
+    local lock_path="$1"
+    shift
+    ensure_private_dir "$(dirname "$lock_path")"
+    exec 9>"$lock_path"
+    flock -n 9 || fail "lifecycle lock is held: $lock_path"
+    "$@"
+  }
+
+  volume_name_for_media() {
+    local image_url="$1"
+    local domain_uuid="$2"
+    local base
+    base="${image_url##*/}"
+    base="${base%%\?*}"
+    base="${base//./-}"
+    printf '%s-%s.img\n' "$base" "$domain_uuid"
+  }
+  ```
+
+- [ ] **Step 4: Add test helper cleanup**
+
+  Create `tests/helpers/test-helper.bash` with:
+
+  ```bash
+  install_mock_command() {
+    local name="$1"
+    local body="$2"
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat >"$BATS_TEST_TMPDIR/bin/$name" <<SH
+  #!/usr/bin/env bash
+  set -euo pipefail
+  $body
+  SH
+    chmod +x "$BATS_TEST_TMPDIR/bin/$name"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  }
+
+  install_recording_noop() {
+    local name="$1"
+    install_mock_command "$name" \
+      'printf "%s %s\n" "$(basename "$0")" "$*" >>"$BATS_TEST_TMPDIR/commands.log"'
+  }
+
+  setup() {
+    export REPO_ROOT
+    REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+    cd "$REPO_ROOT"
+  }
+  ```
+
+- [ ] **Step 5: Run tests and commit**
+
+  Run:
+
+  ```bash
+  shfmt -i 2 -w scripts/lib/common tests/helpers/test-helper.bash tests/render-config.bats
+  shellcheck scripts/lib/common tests/helpers/test-helper.bash
+  bats tests/render-config.bats
+  make test
+  ```
+
+  Expected: all commands exit 0. Commit:
+
+  ```bash
+  git add scripts/lib/common tests/helpers/test-helper.bash tests/render-config.bats
+  git commit -m "test: add lifecycle shell primitives"
+  ```
+
+## Task 3: Read-Only Host Doctor
+
+**Files:**
+- Create: `scripts/doctor`
+- Create: `tests/doctor.bats`
+- Modify: `README.md`
+
+**Interfaces:**
+- Consumes `need_command`, `LIBVIRT_URI`, and `STORAGE_POOL` from `scripts/lib/common`.
+- Produces `scripts/doctor`, a read-only prerequisite checker used by `make doctor` and
+  documented as non-mutating.
+
+- [ ] **Step 1: Write missing-command diagnostics tests**
+
+  Create `tests/doctor.bats` with:
+
+  ```bash
+  #!/usr/bin/env bats
+
+  load "helpers/test-helper"
+
+  @test "doctor reports missing qemu-img with Fedora package hint" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat >"$BATS_TEST_TMPDIR/bin/uname" <<'SH'
+  #!/usr/bin/env bash
+  printf 'x86_64\n'
+  SH
+    chmod +x "$BATS_TEST_TMPDIR/bin/uname"
+    PATH="$BATS_TEST_TMPDIR/bin" run ./scripts/doctor
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"missing command 'qemu-img': install qemu-img"* ]]
+  }
+
+  @test "doctor rejects non-x86_64 hosts" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat >"$BATS_TEST_TMPDIR/bin/uname" <<'SH'
+  #!/usr/bin/env bash
+  printf 'aarch64\n'
+  SH
+    chmod +x "$BATS_TEST_TMPDIR/bin/uname"
+    PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" run ./scripts/doctor
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unsupported architecture aarch64; expected x86_64"* ]]
+  }
+  ```
+
+- [ ] **Step 2: Run tests and verify they fail**
+
+  Run:
+
+  ```bash
+  bats tests/doctor.bats
+  ```
+
+  Expected: FAIL because `scripts/doctor` does not exist.
+
+- [ ] **Step 3: Implement read-only command and host checks**
+
+  Create `scripts/doctor` with:
+
+  ```bash
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+
+  check_architecture() {
+    local arch
+    arch="$(uname -m)"
+    [ "$arch" = "x86_64" ] || fail "unsupported architecture $arch; expected x86_64"
+  }
+
+  check_commands() {
+    need_command virsh "libvirt-client"
+    need_command qemu-img "qemu-img"
+    need_command uv "uv"
+    need_command curl "curl"
+    need_command openssl "openssl"
+    need_command htpasswd "httpd-tools"
+    need_command bats "bats"
+    need_command shellcheck "ShellCheck"
+    need_command shfmt "shfmt"
+    need_command grub2-mkrescue "grub2-tools-extra"
+    need_command xorriso "xorriso"
+  }
+
+  check_libvirt() {
+    virsh -c "$LIBVIRT_URI" uri >/dev/null ||
+      fail "cannot connect to $LIBVIRT_URI: enable libvirtd and grant access"
+    virsh -c "$LIBVIRT_URI" net-info default >/dev/null ||
+      fail "libvirt default network is unavailable: start it with virsh net-start default"
+    virsh -c "$LIBVIRT_URI" pool-info "$STORAGE_POOL" >/dev/null ||
+      fail "libvirt storage pool '$STORAGE_POOL' is unavailable"
+  }
+
+  check_architecture
+  check_commands
+  check_libvirt
+  printf 'doctor: host prerequisites are available\n'
+  ```
+
+- [ ] **Step 4: Add libvirt mock-boundary tests**
+
+  Extend `tests/doctor.bats` with:
+
+  ```bash
+  @test "doctor checks libvirt URI, default network, and default pool" {
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    "-c qemu:///system uri")
+      exit 0
+      ;;
+    "-c qemu:///system net-info default")
+      exit 0
+      ;;
+    "-c qemu:///system pool-info default")
+      exit 0
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    for command in qemu-img uv curl openssl htpasswd bats shellcheck shfmt \
+      grub2-mkrescue xorriso; do
+      install_recording_noop "$command"
+    done
+    run ./scripts/doctor
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"doctor: host prerequisites are available"* ]]
+    run grep -F "virsh -c qemu:///system uri" "$BATS_TEST_TMPDIR/commands.log"
+    [ "$status" -eq 0 ]
+  }
+  ```
+
+- [ ] **Step 5: Run doctor tests and commit**
+
+  Run:
+
+  ```bash
+  shfmt -i 2 -w scripts/doctor tests/doctor.bats
+  shellcheck scripts/doctor
+  bats tests/doctor.bats
+  make test
+  ```
+
+  Expected: all commands exit 0. Commit:
+
+  ```bash
+  git add scripts/doctor tests/doctor.bats README.md
+  git commit -m "feat: add host doctor"
+  ```
+
+## Task 4: Domain XML Rendering and Ownership Metadata
+
+**Files:**
+- Create: `config/domain.xml`
+- Create: `scripts/render-config`
+- Modify: `tests/render-config.bats`
+
+**Interfaces:**
+- Consumes `DEFAULT_DOMAIN_NAME`, `LIBVIRT_URI`, `ROOT_VOLUME_NAME`, `STATE_DIR`, and
+  `read_domain_uuid`.
+- Produces `.state/domain.xml` with the domain UUID, disk path, and project metadata.
+- Produces `.state/domain-uuid` only when the caller has already decided creation owns this
+  state directory.
+
+- [ ] **Step 1: Write domain rendering tests**
+
+  Add to `tests/render-config.bats`:
+
+  ```bash
+  @test "render-config writes domain XML with UUID and owner metadata" {
+    mkdir -p "$BATS_TEST_TMPDIR/state"
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$BATS_TEST_TMPDIR/state/domain-uuid"
+    VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
+      VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+      run ./scripts/render-config domain
+    [ "$status" -eq 0 ]
+    run grep -F "<name>vm-x86-redfish</name>" "$BATS_TEST_TMPDIR/state/domain.xml"
+    [ "$status" -eq 0 ]
+    run grep -F "<rp:project>vm-x86-redfish</rp:project>" \
+      "$BATS_TEST_TMPDIR/state/domain.xml"
+    [ "$status" -eq 0 ]
+    run grep -F "<uuid>11111111-2222-3333-4444-555555555555</uuid>" \
+      "$BATS_TEST_TMPDIR/state/domain.xml"
+    [ "$status" -eq 0 ]
+  }
+  ```
+
+- [ ] **Step 2: Run rendering tests and verify they fail**
+
+  Run:
+
+  ```bash
+  bats tests/render-config.bats
+  ```
+
+  Expected: FAIL because `scripts/render-config` and `config/domain.xml` do not exist.
+
+- [ ] **Step 3: Add the domain XML template**
+
+  Create `config/domain.xml` with the fixed hardware contract:
+
+  ```xml
+  <domain type='kvm' xmlns:rp='https://github.com/randomparity/vm-x86-redfish'>
+    <name>@DOMAIN_NAME@</name>
+    <uuid>@DOMAIN_UUID@</uuid>
+    <metadata>
+      <rp:vm-x86-redfish>
+        <rp:project>vm-x86-redfish</rp:project>
+        <rp:root-volume>@ROOT_VOLUME_NAME@</rp:root-volume>
+      </rp:vm-x86-redfish>
+    </metadata>
+    <memory unit='MiB'>4096</memory>
+    <vcpu placement='static'>2</vcpu>
+    <os firmware='efi'>
+      <type arch='x86_64' machine='q35'>hvm</type>
+      <firmware>
+        <feature enabled='no' name='secure-boot'/>
+      </firmware>
+      <boot dev='hd'/>
+    </os>
+    <features>
+      <acpi/>
+      <apic/>
+    </features>
+    <cpu mode='host-passthrough' check='none'/>
+    <clock offset='utc'/>
+    <on_poweroff>destroy</on_poweroff>
+    <on_reboot>restart</on_reboot>
+    <on_crash>destroy</on_crash>
+    <devices>
+      <emulator>/usr/bin/qemu-system-x86_64</emulator>
+      <disk type='file' device='disk'>
+        <driver name='qemu' type='qcow2' discard='unmap'/>
+        <source file='@ROOT_VOLUME_PATH@'/>
+        <target dev='vda' bus='virtio'/>
+      </disk>
+      <interface type='network'>
+        <source network='default'/>
+        <model type='virtio'/>
+      </interface>
+      <serial type='pty'>
+        <target type='isa-serial' port='0'>
+          <model name='isa-serial'/>
+        </target>
+      </serial>
+      <console type='pty'>
+        <target type='serial' port='0'/>
+      </console>
+      <channel type='unix'>
+        <target type='virtio' name='org.qemu.guest_agent.0'/>
+      </channel>
+      <graphics type='vnc' listen='127.0.0.1'/>
+      <video>
+        <model type='virtio'/>
+      </video>
+    </devices>
+  </domain>
+  ```
+
+  If libvirt rejects the guest-agent channel in integration because no guest agent is
+  installed, remove the `<channel>` block and update this plan before continuing. Do not add
+  a virtio console; the spec requires COM1 serial only.
+
+- [ ] **Step 4: Implement template rendering without ad hoc shell globbing**
+
+  Create `scripts/render-config` with:
+
+  ```bash
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+
+  render_template() {
+    local input="$1"
+    local output="$2"
+    uv run python - "$input" "$output" <<'PY'
+  import os
+  import pathlib
+  import sys
+
+  source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+  replacements = {
+      "@DOMAIN_NAME@": os.environ["DOMAIN_NAME"],
+      "@DOMAIN_UUID@": os.environ["DOMAIN_UUID"],
+      "@ROOT_VOLUME_NAME@": os.environ["ROOT_VOLUME_NAME"],
+      "@ROOT_VOLUME_PATH@": os.environ["ROOT_VOLUME_PATH"],
+      "@STATE_DIR@": os.environ["STATE_DIR"],
+  }
+  rendered = source
+  for key, value in replacements.items():
+      rendered = rendered.replace(key, value)
+  pathlib.Path(sys.argv[2]).write_text(rendered, encoding="utf-8")
+  PY
+  }
+
+  render_domain() {
+    ensure_private_dir "$STATE_DIR"
+    export DOMAIN_NAME="$DEFAULT_DOMAIN_NAME"
+    export DOMAIN_UUID
+    export ROOT_VOLUME_NAME
+    export ROOT_VOLUME_PATH="${VM_X86_REDFISH_ROOT_VOLUME_PATH:?missing root volume path}"
+    export STATE_DIR
+    DOMAIN_UUID="$(read_domain_uuid)"
+    render_template config/domain.xml "${STATE_DIR}/domain.xml"
+  }
+
+  case "${1:-}" in
+    domain) render_domain ;;
+    *) fail "usage: scripts/render-config domain|sushy" ;;
+  esac
+  ```
+
+- [ ] **Step 5: Run rendering guardrails and commit**
+
+  Run:
+
+  ```bash
+  shfmt -i 2 -w scripts/render-config
+  shellcheck scripts/render-config
+  bats tests/render-config.bats
+  make test
+  ```
+
+  Expected: all commands exit 0. Commit:
+
+  ```bash
+  git add config/domain.xml scripts/render-config tests/render-config.bats
+  git commit -m "feat: render domain XML"
+  ```
+
+## Task 5: VM Creation, Idempotency, and Rollback
+
+**Files:**
+- Create: `scripts/create-vm`
+- Create: `tests/create-vm.bats`
+- Modify: `scripts/lib/common`
+- Modify: `scripts/render-config`
+
+**Interfaces:**
+- Consumes `.state/domain-uuid`, `config/domain.xml`, and `scripts/render-config domain`.
+- Produces project-owned libvirt domain and root volume.
+- Exposes internal integration-test overrides only when
+  `VM_X86_REDFISH_INTEGRATION_TEST=1`.
+
+- [ ] **Step 1: Write create rollback and idempotency tests**
+
+  Create `tests/create-vm.bats` with:
+
+  ```bash
+  #!/usr/bin/env bats
+
+  load "helpers/test-helper"
+
+  setup() {
+    mkdir -p .state
+    install_mock_command uuidgen \
+      'printf "11111111-2222-3333-4444-555555555555\n"'
+  }
+
+  @test "create-vm writes uuid once and defines new owned domain" {
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2"|*"define .state/domain.xml")
+      exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    run ./scripts/create-vm
+    [ "$status" -eq 0 ]
+    [ "$(cat .state/domain-uuid)" = "11111111-2222-3333-4444-555555555555" ]
+    run grep -F "vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2" \
+      "$BATS_TEST_TMPDIR/commands.log"
+    [ "$status" -eq 0 ]
+  }
+
+  @test "create-vm refuses existing domain without project metadata" {
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dominfo vm-x86-redfish")
+      exit 0
+      ;;
+    *"dumpxml vm-x86-redfish")
+      printf "<domain><name>vm-x86-redfish</name></domain>\n"
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    run ./scripts/create-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"existing domain vm-x86-redfish is not owned by this project"* ]]
+  }
+
+  @test "create-vm deletes newly created disk when domain definition fails" {
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2")
+      exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+      ;;
+    *"define .state/domain.xml")
+      exit 1
+      ;;
+    *"vol-delete --pool default vm-x86-redfish.qcow2")
+      exit 0
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    run ./scripts/create-vm
+    [ "$status" -ne 0 ]
+    run grep -F "vol-delete --pool default vm-x86-redfish.qcow2" \
+      "$BATS_TEST_TMPDIR/commands.log"
+    [ "$status" -eq 0 ]
+  }
+  ```
+
+- [ ] **Step 2: Run create tests and verify they fail**
+
+  Run:
+
+  ```bash
+  bats tests/create-vm.bats
+  ```
+
+  Expected: FAIL because `scripts/create-vm` does not exist.
+
+- [ ] **Step 3: Add ownership validation helpers**
+
+  Extend `scripts/lib/common` with:
+
+  ```bash
+  domain_is_project_owned() {
+    local xml="$1"
+    grep -F "<rp:project>vm-x86-redfish</rp:project>" "$xml" >/dev/null
+  }
+
+  domain_uuid_matches_state() {
+    local xml="$1"
+    local uuid
+    uuid="$(read_domain_uuid)"
+    grep -F "<uuid>${uuid}</uuid>" "$xml" >/dev/null
+  }
+
+  integration_override_enabled() {
+    [ "${VM_X86_REDFISH_INTEGRATION_TEST:-}" = "1" ]
+  }
+  ```
+
+- [ ] **Step 4: Implement create-vm transaction**
+
+  Create `scripts/create-vm` with functions:
+
+  ```bash
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+
+  create_domain_uuid_once() {
+    ensure_private_dir "$STATE_DIR"
+    if [ ! -f "$DOMAIN_UUID_FILE" ]; then
+      write_secret_file "$DOMAIN_UUID_FILE" "$(uuidgen)"
+    fi
+  }
+
+  validate_or_reject_existing_domain() {
+    local xml_path="${STATE_DIR}/existing-domain.xml"
+    if virsh -c "$LIBVIRT_URI" dominfo "$DEFAULT_DOMAIN_NAME" >/dev/null 2>&1; then
+      virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_path"
+      domain_is_project_owned "$xml_path" ||
+        fail "existing domain $DEFAULT_DOMAIN_NAME is not owned by this project"
+      domain_uuid_matches_state "$xml_path" ||
+        fail "existing domain $DEFAULT_DOMAIN_NAME UUID does not match $DOMAIN_UUID_FILE"
+      return 0
+    fi
+    return 1
+  }
+
+  create_root_volume() {
+    if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+      >/dev/null 2>&1; then
+      return 1
+    fi
+    virsh -c "$LIBVIRT_URI" vol-create-as "$STORAGE_POOL" "$ROOT_VOLUME_NAME" 40G \
+      --format qcow2
+    return 0
+  }
+
+  create_vm_transaction() {
+    create_domain_uuid_once
+    if validate_or_reject_existing_domain; then
+      return 0
+    fi
+
+    local created_volume=0
+    if create_root_volume; then
+      created_volume=1
+    fi
+    local root_path
+    root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="$root_path" ./scripts/render-config domain
+    if ! virsh -c "$LIBVIRT_URI" define "${STATE_DIR}/domain.xml"; then
+      if [ "$created_volume" -eq 1 ]; then
+        virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
+      fi
+      fail "failed to define libvirt domain $DEFAULT_DOMAIN_NAME"
+    fi
+  }
+
+  with_lifecycle_lock "$LIFECYCLE_LOCK" create_vm_transaction
+  ```
+
+- [ ] **Step 5: Add integration-test override guard tests**
+
+  Extend `tests/create-vm.bats` to assert that `VM_X86_REDFISH_DOMAIN_NAME`,
+  `VM_X86_REDFISH_ROOT_VOLUME_NAME`, and `VM_X86_REDFISH_STATE_DIR` are honored only when
+  `VM_X86_REDFISH_INTEGRATION_TEST=1`. Without the guard, `scripts/create-vm` must fail with:
+
+  ```text
+  error: test-only overrides require VM_X86_REDFISH_INTEGRATION_TEST=1
+  ```
+
+- [ ] **Step 6: Run create guardrails and commit**
+
+  Run:
+
+  ```bash
+  shfmt -i 2 -w scripts/create-vm scripts/lib/common tests/create-vm.bats
+  shellcheck scripts/create-vm scripts/lib/common
+  bats tests/create-vm.bats
+  make test
+  ```
+
+  Expected: all commands exit 0. Commit:
+
+  ```bash
+  git add scripts/create-vm scripts/lib/common tests/create-vm.bats
+  git commit -m "feat: create managed libvirt VM"
+  ```
+
+## Task 6: Credentials, TLS, Sushy Configuration, and Lifecycle Lock
+
+**Files:**
+- Create: `config/sushy-emulator.conf.py.in`
+- Modify: `scripts/create-vm`
+- Modify: `scripts/render-config`
+- Modify: `scripts/lib/common`
+- Modify: `tests/render-config.bats`
+- Modify: `tests/create-vm.bats`
+
+**Interfaces:**
+- Produces `.state/credentials.env`, `.state/htpasswd`, `.state/tls.crt`,
+  `.state/tls.key`, `.state/connection.env`, `.state/tmp/`, and
+  `.state/sushy-emulator.conf.py`.
+- Consumes Sushy config values from the spec, including allowed instance UUID and single
+  `Cd` virtual media device.
+
+- [ ] **Step 1: Write tests for secret-bearing file modes and connection metadata**
+
+  Add tests asserting:
+
+  ```bash
+  @test "create-vm writes private Redfish credentials and connection metadata" {
+    run ./scripts/create-vm
+    [ "$status" -eq 0 ]
+    [ "$(stat -c "%a" .state/credentials.env)" = "600" ]
+    [ "$(stat -c "%a" .state/htpasswd)" = "600" ]
+    [ "$(stat -c "%a" .state/tls.key)" = "600" ]
+    grep -F "REDFISH_ENDPOINT=https://127.0.0.1:8000" .state/connection.env
+    grep -F "REDFISH_CREDENTIALS_FILE=.state/credentials.env" .state/connection.env
+  }
+  ```
+
+- [ ] **Step 2: Run tests and verify they fail**
+
+  Run:
+
+  ```bash
+  bats tests/create-vm.bats tests/render-config.bats
+  ```
+
+  Expected: FAIL because credentials and Sushy config rendering are not implemented.
+
+- [ ] **Step 3: Add Sushy configuration template**
+
+  Create `config/sushy-emulator.conf.py.in` with:
+
+  ```python
+  SUSHY_EMULATOR_LISTEN_IP = "127.0.0.1"
+  SUSHY_EMULATOR_LISTEN_PORT = 8000
+  SUSHY_EMULATOR_LIBVIRT_URI = "qemu:///system"
+  SUSHY_EMULATOR_FEATURE_SET = "vmedia"
+  SUSHY_EMULATOR_ALLOWED_INSTANCES = ["@DOMAIN_UUID@"]
+  SUSHY_EMULATOR_VMEDIA_DEVICES = {"@DOMAIN_UUID@": ["Cd"]}
+  SUSHY_EMULATOR_STORAGE_POOL = "default"
+  SUSHY_EMULATOR_STATE_DIR = "@STATE_DIR@/sushy"
+  SUSHY_EMULATOR_SSL_CERT = "@STATE_DIR@/tls.crt"
+  SUSHY_EMULATOR_SSL_KEY = "@STATE_DIR@/tls.key"
+  SUSHY_EMULATOR_AUTH_FILE = "@STATE_DIR@/htpasswd"
+  ```
+
+  Verify the exact Sushy setting names against the installed `sushy-tools==2.2.0` package
+  during implementation. If a setting name differs, update this template and tests in the
+  same commit.
+
+- [ ] **Step 4: Generate credentials and TLS material**
+
+  Extend `scripts/create-vm` with:
+
+  ```bash
+  create_redfish_credentials_once() {
+    local password
+    if [ ! -f "${STATE_DIR}/credentials.env" ]; then
+      password="$(openssl rand -base64 30)"
+      write_secret_file "${STATE_DIR}/credentials.env" \
+        "REDFISH_USERNAME='admin'
+  REDFISH_PASSWORD='${password}'"
+    fi
+    # shellcheck disable=SC1091
+    source "${STATE_DIR}/credentials.env"
+    htpasswd -bB -c "${STATE_DIR}/htpasswd" "$REDFISH_USERNAME" "$REDFISH_PASSWORD" \
+      >/dev/null
+    chmod 600 "${STATE_DIR}/htpasswd"
+  }
+
+  create_tls_once() {
+    if [ ! -f "${STATE_DIR}/tls.crt" ] || [ ! -f "${STATE_DIR}/tls.key" ]; then
+      openssl req -x509 -newkey rsa:3072 -sha256 -days 365 -nodes \
+        -subj "/CN=localhost" \
+        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+        -keyout "${STATE_DIR}/tls.key" \
+        -out "${STATE_DIR}/tls.crt"
+      chmod 600 "${STATE_DIR}/tls.key" "${STATE_DIR}/tls.crt"
+    fi
+  }
+
+  write_connection_metadata() {
+    write_secret_file "${STATE_DIR}/connection.env" \
+      "REDFISH_ENDPOINT='https://127.0.0.1:8000'
+  REDFISH_CA_CERT='${STATE_DIR}/tls.crt'
+  REDFISH_CREDENTIALS_FILE='${STATE_DIR}/credentials.env'"
+  }
+  ```
+
+- [ ] **Step 5: Render Sushy config and private tmp directory**
+
+  Extend `scripts/render-config` with `sushy)` handling. It must read the domain UUID,
+  ensure `.state/sushy` and `.state/tmp` are private directories, replace `@DOMAIN_UUID@`
+  and `@STATE_DIR@`, and write `.state/sushy-emulator.conf.py`.
+
+- [ ] **Step 6: Run config guardrails and commit**
+
+  Run:
+
+  ```bash
+  shfmt -i 2 -w scripts/create-vm scripts/render-config scripts/lib/common \
+    tests/create-vm.bats tests/render-config.bats
+  shellcheck scripts/create-vm scripts/render-config scripts/lib/common
+  uv run python -m py_compile config/sushy-emulator.conf.py.in
+  bats tests/create-vm.bats tests/render-config.bats
+  make test
+  ```
+
+  Expected: all commands exit 0. Commit:
+
+  ```bash
+  git add config/sushy-emulator.conf.py.in scripts tests
+  git commit -m "feat: generate Redfish service state"
+  ```
+
+## Task 7: Foreground Redfish Service Wrapper
+
+**Files:**
+- Create: `scripts/run-redfish`
+- Modify: `tests/render-config.bats`
+
+**Interfaces:**
+- Consumes `.state/sushy-emulator.conf.py`, `.state/tmp`, and lifecycle lock.
+- Produces a foreground Sushy Emulator process with `TMPDIR` set to canonical `.state/tmp`.
+
+- [ ] **Step 1: Write run-redfish lock and exec tests**
+
+  Add tests asserting:
+
+  ```bash
+  @test "run-redfish refuses when lifecycle lock is held" {
+    mkdir -p .state
+    exec 8>.state/lifecycle.lock
+    flock -n 8
+    run ./scripts/run-redfish
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"lifecycle lock is held"* ]]
+  }
+
+  @test "run-redfish sets TMPDIR and execs sushy-emulator" {
+    mkdir -p .state/tmp
+    touch .state/sushy-emulator.conf.py
+    chmod 700 .state .state/tmp
+    install_mock_command uv 'printf "TMPDIR=%s\nCONFIG=%s\n" "$TMPDIR" "$*"'
+    run ./scripts/run-redfish
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"TMPDIR="*"/.state/tmp"* ]]
+    [[ "$output" == *"run sushy-emulator --config .state/sushy-emulator.conf.py"* ]]
+  }
+  ```
+
+- [ ] **Step 2: Run tests and verify they fail**
+
+  Run:
+
+  ```bash
+  bats tests/render-config.bats
+  ```
+
+  Expected: FAIL because `scripts/run-redfish` is missing.
+
+- [ ] **Step 3: Implement run-redfish**
+
+  Create `scripts/run-redfish` with:
+
+  ```bash
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+
+  run_redfish() {
+    local tmpdir
+    [ -f "${STATE_DIR}/sushy-emulator.conf.py" ] ||
+      fail "missing ${STATE_DIR}/sushy-emulator.conf.py: run make create first"
+    tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
+    export TMPDIR="$tmpdir"
+    exec uv run sushy-emulator --config "${STATE_DIR}/sushy-emulator.conf.py"
+  }
+
+  with_lifecycle_lock "$LIFECYCLE_LOCK" run_redfish
+  ```
+
+- [ ] **Step 4: Run service wrapper guardrails and commit**
+
+  Run:
+
+  ```bash
+  shfmt -i 2 -w scripts/run-redfish tests/render-config.bats
+  shellcheck scripts/run-redfish
+  bats tests/render-config.bats
+  make test
+  ```
+
+  Expected: all commands exit 0. Commit:
+
+  ```bash
+  git add scripts/run-redfish tests/render-config.bats
+  git commit -m "feat: run Redfish service"
+  ```
+
+## Task 8: Owner-Gated Destruction and Media Cleanup
+
+**Files:**
+- Create: `scripts/destroy-vm`
+- Create: `tests/destroy-vm.bats`
+- Modify: `scripts/lib/common`
+- Modify: `README.md`
+
+**Interfaces:**
+- Consumes project metadata, recorded UUID, root volume name, and lifecycle lock.
+- Removes only matching project-owned domain, NVRAM, root volume, UUID-scoped media volumes,
+  and validated `.state/tmp` temporary files.
+
+- [ ] **Step 1: Write destruction safety tests**
+
+  Create `tests/destroy-vm.bats` with:
+
+  ```bash
+  #!/usr/bin/env bats
+
+  load "helpers/test-helper"
+
+  setup() {
+    mkdir -p .state
+  }
+
+  @test "destroy-vm refuses domain with mismatched ownership" {
+    printf '11111111-2222-3333-4444-555555555555\n' >.state/domain-uuid
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dumpxml vm-x86-redfish")
+      printf "<domain><name>vm-x86-redfish</name></domain>\n"
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/destroy-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"refusing to destroy unowned domain vm-x86-redfish"* ]]
+  }
+
+  @test "destroy-vm deletes only root and anchored uuid media volumes" {
+    printf '11111111-2222-3333-4444-555555555555\n' >.state/domain-uuid
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dumpxml vm-x86-redfish")
+      cat <<XML
+  <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+    <uuid>11111111-2222-3333-4444-555555555555</uuid>
+    <metadata><rp:project>vm-x86-redfish</rp:project></metadata>
+  </domain>
+  XML
+      ;;
+    *"domstate vm-x86-redfish")
+      printf "shut off\n"
+      ;;
+    *"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 0
+      ;;
+    *"vol-list --pool default --name")
+      printf "vm-x86-redfish.qcow2\n"
+      printf "fedora-iso-11111111-2222-3333-4444-555555555555.img\n"
+      printf "unrelated-22222222-2222-3333-4444-555555555555.img\n"
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/destroy-vm
+    [ "$status" -eq 0 ]
+    grep -F "vol-delete --pool default vm-x86-redfish.qcow2" "$BATS_TEST_TMPDIR/commands.log"
+    grep -F "vol-delete --pool default fedora-iso-11111111-2222-3333-4444-555555555555.img" \
+      "$BATS_TEST_TMPDIR/commands.log"
+    run grep -F "unrelated-22222222" "$BATS_TEST_TMPDIR/commands.log"
+    [ "$status" -ne 0 ]
+  }
+  ```
+
+- [ ] **Step 2: Run destruction tests and verify they fail**
+
+  Run:
+
+  ```bash
+  bats tests/destroy-vm.bats
+  ```
+
+  Expected: FAIL because `scripts/destroy-vm` is missing.
+
+- [ ] **Step 3: Implement owner-gated destruction**
+
+  Create `scripts/destroy-vm` with functions:
+
+  ```bash
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+
+  media_volume_matches_uuid() {
+    local name="$1"
+    local uuid="$2"
+    [[ "$name" =~ ^[^/]+-"$uuid"\\.img$ ]]
+  }
+
+  destroy_transaction() {
+    local uuid xml_path
+    uuid="$(read_domain_uuid)"
+    xml_path="${STATE_DIR}/destroy-domain.xml"
+    virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_path" ||
+      fail "domain $DEFAULT_DOMAIN_NAME is not defined"
+    domain_is_project_owned "$xml_path" ||
+      fail "refusing to destroy unowned domain $DEFAULT_DOMAIN_NAME"
+    domain_uuid_matches_state "$xml_path" ||
+      fail "refusing to destroy $DEFAULT_DOMAIN_NAME with mismatched UUID"
+
+    if virsh -c "$LIBVIRT_URI" domstate "$DEFAULT_DOMAIN_NAME" | grep -F running >/dev/null; then
+      virsh -c "$LIBVIRT_URI" destroy "$DEFAULT_DOMAIN_NAME"
+    fi
+    virsh -c "$LIBVIRT_URI" undefine "$DEFAULT_DOMAIN_NAME" --nvram
+    if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+      >/dev/null 2>&1; then
+      virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
+    fi
+    while IFS= read -r volume; do
+      if media_volume_matches_uuid "$volume" "$uuid"; then
+        virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$volume"
+      fi
+    done < <(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)
+  }
+
+  with_lifecycle_lock "$LIFECYCLE_LOCK" destroy_transaction
+  ```
+
+- [ ] **Step 4: Add checked `.state/tmp` cleanup**
+
+  Extend destruction to canonicalize `.state/tmp`, reject symlinks, enumerate known temporary
+  files beneath it, remove only those files, then remove the directory only if empty:
+
+  ```bash
+  cleanup_tmpdir() {
+    local path tmpdir uuid
+    uuid="$(read_domain_uuid)"
+    tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
+    while IFS= read -r -d '' path; do
+      case "$(basename "$path")" in
+        *"$uuid"*) rm -- "$path" ;;
+      esac
+    done < <(find "$tmpdir" -maxdepth 1 -type f -print0)
+    if ! rmdir "$tmpdir" 2>/dev/null; then
+      [ -d "$tmpdir" ] || fail "temporary directory disappeared during cleanup: $tmpdir"
+    fi
+  }
+  ```
+
+- [ ] **Step 5: Run destruction guardrails and commit**
+
+  Run:
+
+  ```bash
+  shfmt -i 2 -w scripts/destroy-vm scripts/lib/common tests/destroy-vm.bats
+  shellcheck scripts/destroy-vm scripts/lib/common
+  bats tests/destroy-vm.bats
+  make test
+  ```
+
+  Expected: all commands exit 0. Commit:
+
+  ```bash
+  git add scripts/destroy-vm scripts/lib/common tests/destroy-vm.bats README.md
+  git commit -m "feat: destroy managed libvirt VM"
+  ```
+
+## Task 9: Redfish Power-Control Integration Proof
+
+**Files:**
+- Create: `tests/redfish-integration.bats`
+- Modify: `scripts/create-vm`
+- Modify: `scripts/destroy-vm`
+- Modify: `README.md`
+
+**Interfaces:**
+- Consumes integration-test overrides guarded by `VM_X86_REDFISH_INTEGRATION_TEST=1`.
+- Produces isolated test domain, disk, UUID, state directory, and bounded child-process
+  cleanup for Sushy and Redfish clients.
+
+- [ ] **Step 1: Write the integration harness skeleton**
+
+  Create `tests/redfish-integration.bats` with:
+
+  ```bash
+  #!/usr/bin/env bats
+
+  load "helpers/test-helper"
+
+  setup() {
+    export TEST_ID="redfish-${BATS_TEST_NUMBER}-$$"
+    export VM_X86_REDFISH_INTEGRATION_TEST=1
+    export VM_X86_REDFISH_DOMAIN_NAME="vm-x86-redfish-${TEST_ID}"
+    export VM_X86_REDFISH_ROOT_VOLUME_NAME="vm-x86-redfish-${TEST_ID}.qcow2"
+    export VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state"
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR"
+  }
+
+  teardown() {
+    cleanup_log="$BATS_TEST_TMPDIR/destroy.log"
+    cleanup_status=0
+    ./scripts/destroy-vm >"$cleanup_log" 2>&1 || cleanup_status="$?"
+    if [ "$cleanup_status" -ne 0 ]; then
+      printf 'destroy-vm cleanup failed with status %s; see %s\n' \
+        "$cleanup_status" "$cleanup_log" >&2
+    fi
+  }
+
+  @test "Redfish discovery is public and Systems requires credentials" {
+    ./scripts/create-vm
+    ./scripts/run-redfish >"$BATS_TEST_TMPDIR/sushy.log" 2>&1 &
+    sushy_pid="$!"
+    wait_for_url "https://127.0.0.1:8000/redfish/v1"
+    run curl --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
+      https://127.0.0.1:8000/redfish/v1
+    [ "$status" -eq 0 ]
+    run curl --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
+      https://127.0.0.1:8000/redfish/v1/Systems
+    [ "$status" -ne 0 ]
+    stop_child "$sushy_pid"
+  }
+  ```
+
+- [ ] **Step 2: Run integration test and verify it fails until host prerequisites pass**
+
+  Run:
+
+  ```bash
+  make doctor
+  make test-integration
+  ```
+
+  Expected before implementation: `make doctor` either reports missing Fedora 44 host
+  prerequisites or exits 0; `make test-integration` fails because polling helpers and
+  authenticated Redfish operations are incomplete.
+
+- [ ] **Step 3: Implement bounded process helpers**
+
+  Add to `tests/helpers/test-helper.bash`:
+
+  ```bash
+  wait_for_url() {
+    local url="$1"
+    local deadline=$((SECONDS + 30))
+    until curl --silent --fail --insecure "$url" >/dev/null; do
+      [ "$SECONDS" -lt "$deadline" ] || return 1
+      sleep 1
+    done
+  }
+
+  stop_child() {
+    local pid="$1"
+    if ! kill "$pid" 2>/dev/null; then
+      return 0
+    fi
+    local deadline=$((SECONDS + 10))
+    while kill -0 "$pid" 2>/dev/null; do
+      [ "$SECONDS" -lt "$deadline" ] || break
+      sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid"
+    fi
+    if wait "$pid" 2>/dev/null; then
+      return 0
+    fi
+    return 0
+  }
+  ```
+
+- [ ] **Step 4: Add authenticated Systems and power reset checks**
+
+  Extend the test to source `.state/credentials.env`, query
+  `/redfish/v1/Systems`, use the returned UUID URL, and POST reset actions:
+
+  ```bash
+  curl --fail --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
+    --user "${REDFISH_USERNAME}:${REDFISH_PASSWORD}" \
+    -H 'Content-Type: application/json' \
+    -d '{"ResetType":"On"}' \
+    "https://127.0.0.1:8000/redfish/v1/Systems/${domain_uuid}/Actions/ComputerSystem.Reset"
+  ```
+
+  Verify `On`, `ForceRestart`, and `ForceOff` by polling `virsh domstate` for the expected
+  state after each operation.
+
+- [ ] **Step 5: Run integration checkpoint and commit**
+
+  Run on a Fedora 44 x86_64 host with libvirt access:
+
+  ```bash
+  make doctor
+  make test
+  make test-integration
+  ```
+
+  Expected: all commands exit 0. Commit:
+
+  ```bash
+  git add tests/redfish-integration.bats tests/helpers/test-helper.bash scripts README.md
+  git commit -m "test: verify Redfish power control"
+  ```
+
+## Task 10: UEFI Serial Sentinel, Boot Overrides, and Virtual Media
+
+**Files:**
+- Create: `tests/fixtures/grub.cfg.in`
+- Modify: `tests/redfish-integration.bats`
+- Modify: `scripts/destroy-vm`
+- Modify: `README.md`
+
+**Interfaces:**
+- Consumes Sushy virtual media device `Cd`, libvirt COM1 `serial0`, and integration harness
+  child PID tracking.
+- Produces the first implementation checkpoint proof required by the spec.
+
+- [ ] **Step 1: Add the GRUB serial sentinel fixture**
+
+  Create `tests/fixtures/grub.cfg.in` with:
+
+  ```cfg
+  serial --unit=0 --speed=115200
+  terminal_output serial
+  set timeout=10
+
+  menuentry 'vm-x86-redfish sentinel' {
+    echo '@SENTINEL@'
+    halt
+  }
+  ```
+
+- [ ] **Step 2: Add ISO build and loopback media-server helpers**
+
+  Extend `tests/redfish-integration.bats` with helpers that render the sentinel, run
+  `grub2-mkrescue -o "$iso_path" "$iso_root"`, start `python3 -m http.server 0 --bind
+  127.0.0.1`, and record the exact media-server PID for teardown.
+
+- [ ] **Step 3: Insert media and select Cd boot override**
+
+  Add an integration test that POSTs:
+
+  ```json
+  {"Image":"http://127.0.0.1:${media_port}/${iso_name}","Inserted":true}
+  ```
+
+  to:
+
+  ```text
+  /redfish/v1/Systems/${domain_uuid}/VirtualMedia/Cd/Actions/VirtualMedia.InsertMedia
+  ```
+
+  Then PATCH the system boot override to:
+
+  ```json
+  {"Boot":{"BootSourceOverrideTarget":"Cd","BootSourceOverrideEnabled":"Once"}}
+  ```
+
+  Assert inactive domain XML contains the CD device and that its first boot device is CD.
+
+- [ ] **Step 4: Boot and prove serial sentinel output**
+
+  Power on through Redfish, poll until `virsh domstate` reports `running`, then run:
+
+  ```bash
+  timeout 60 virsh -c "$LIBVIRT_URI" console "$VM_X86_REDFISH_DOMAIN_NAME" \
+    --devname serial0 --force
+  ```
+
+  Capture output to `.artifacts/${TEST_ID}/serial.log` on failure. The test passes only
+  when the exact rendered sentinel appears in the captured output.
+
+- [ ] **Step 5: Eject media and exercise Hdd/Pxe boot overrides**
+
+  Force off the VM, POST EjectMedia for `Cd`, assert the CD device is absent from inactive
+  XML, then PATCH `Hdd` and `Pxe` boot overrides and verify inactive XML boot order for each.
+
+- [ ] **Step 6: Simulate interrupted insertion cleanup**
+
+  Start a throttled HTTP response, begin an InsertMedia request asynchronously, record the
+  client PID, wait for a file to appear beneath the test `TMPDIR`, terminate only the Sushy
+  child, wait boundedly for the client, run `scripts/destroy-vm`, and prove the temporary
+  file plus every anchored `-${domain_uuid}.img` volume is absent.
+
+- [ ] **Step 7: Stop if the serial-sentinel checkpoint fails**
+
+  If `make test-integration` cannot prove the sentinel with Sushy 2.2.0, system libvirt
+  pool upload, Fedora 44 q35/UEFI, and enforcing SELinux, stop implementation. Do not add a
+  second backend. Revise `docs/specs/redfish-vm.md` to select either session libvirt or a
+  dedicated service identity before continuing.
+
+- [ ] **Step 8: Run integration checkpoint and commit**
+
+  Run:
+
+  ```bash
+  make doctor
+  make test
+  make test-integration
+  ```
+
+  Expected: all commands exit 0 on the target host. Commit:
+
+  ```bash
+  git add tests/redfish-integration.bats tests/fixtures/grub.cfg.in scripts README.md
+  git commit -m "test: prove virtual media boot"
+  ```
+
+## Task 11: Final Documentation and Operator Workflow
+
+**Files:**
+- Modify: `README.md`
+- Modify: `AGENTS.md`
+- Modify: `docs/specs/redfish-vm.md`
+
+**Interfaces:**
+- Consumes behavior verified by Tasks 1-10.
+- Produces user-facing setup, operation, troubleshooting, and limitation docs that describe
+  only implemented commands.
+
+- [ ] **Step 1: Write README verification examples**
+
+  Document the exact operator workflow:
+
+  ```bash
+  make doctor
+  make create
+  source .state/connection.env
+  source "$REDFISH_CREDENTIALS_FILE"
+  make redfish
+  make destroy
+  ```
+
+  Include a separate terminal example for authenticated Redfish:
+
+  ```bash
+  curl --cacert "$REDFISH_CA_CERT" \
+    --user "${REDFISH_USERNAME}:${REDFISH_PASSWORD}" \
+    "$REDFISH_ENDPOINT/redfish/v1/Systems"
+  ```
+
+- [ ] **Step 2: Document limitations and security boundaries**
+
+  Include:
+
+  ```markdown
+  The Redfish service listens only on `127.0.0.1:8000`. Treat virtual-media URLs as trusted
+  local test inputs because authenticated users can cause the service to fetch them.
+  Discovery at `/redfish/v1` is intentionally unauthenticated; system resources and mutation
+  actions require Basic authentication.
+  ```
+
+- [ ] **Step 3: Reconcile spec with proven implementation**
+
+  Re-read `docs/specs/redfish-vm.md` against the final diff. If integration proved a changed
+  libvirt setting, Sushy setting name, or host requirement, update the spec in the same commit
+  with the verified value and no unimplemented claims.
+
+- [ ] **Step 4: Run final guardrails and commit**
+
+  Run:
+
+  ```bash
+  make doctor
+  make test
+  make test-integration
+  git diff --check
+  ```
+
+  Expected: all commands exit 0 on the target host. Commit:
+
+  ```bash
+  git add README.md AGENTS.md docs/specs/redfish-vm.md
+  git commit -m "docs: document Redfish VM workflow"
+  ```
+
+## Self-Review
+
+- Spec coverage: Tasks 1-2 establish the command surface, generated-state exclusions, and
+  shared lifecycle controls. Tasks 3-8 cover host checks, VM definition, ownership,
+  credentials, TLS, Sushy configuration, locking, and safe cleanup. Tasks 9-10 cover the
+  opt-in live Redfish proof, power actions, serial sentinel, boot overrides, virtual media,
+  and interrupted-insertion cleanup. Task 11 covers README and spec reconciliation.
+- Replacement-token scan: The plan uses concrete CI SHAs and dependency pins looked up on
+  2026-07-31. It also tells implementers to re-run the lookup commands immediately before
+  committing dependency or CI changes, which satisfies the repo rule for current versions.
+- Type and interface consistency: Shared shell functions are named once in Task 2 and reused
+  by later tasks. Public command names match the Make targets and accepted spec.
+- Known workflow gap: No GitHub issue exists yet. Before running `$work-issue` build/review
+  steps, create or select the tracking issue, post `WORK:SCOPE`, and set it to
+  `status:in-progress`.
