@@ -429,6 +429,8 @@ operator workflows rather than wrapping Redfish itself.
 
   load_runtime_config() {
     reject_unguarded_override VM_X86_REDFISH_DOMAIN_NAME
+    reject_unguarded_override VM_X86_REDFISH_LIBVIRT_URI
+    reject_unguarded_override VM_X86_REDFISH_STORAGE_POOL
     reject_unguarded_override VM_X86_REDFISH_ROOT_VOLUME_NAME
     reject_unguarded_override VM_X86_REDFISH_STATE_DIR
     reject_unguarded_override VM_X86_REDFISH_ARTIFACTS_DIR
@@ -681,19 +683,28 @@ operator workflows rather than wrapping Redfish itself.
     [ -d "$ovmf_dir" ] || fail "missing UEFI firmware: install edk2-ovmf"
   }
 
+  python_313() {
+    UV_PYTHON_DOWNLOADS=never uv python find 3.13 2>/dev/null ||
+      fail "uv must find Python 3.13 without downloading"
+  }
+
   check_uv_python() {
-    uv run python - <<'PY' || fail "uv must provide Python 3.13"
+    local python_bin
+    python_bin="$(python_313)"
+    "$python_bin" - <<'PY' || fail "uv must provide Python 3.13"
   import sys
   raise SystemExit(0 if sys.version_info[:2] == (3, 13) else 1)
   PY
   }
 
   check_loopback_port() {
+    local python_bin
     if integration_override_enabled &&
       [ "${VM_X86_REDFISH_PORT_CHECK_RESULT:-}" = "busy" ]; then
       fail "127.0.0.1:8000 is already in use"
     fi
-    uv run python - <<'PY' || fail "127.0.0.1:8000 is already in use"
+    python_bin="$(python_313)"
+    "$python_bin" - <<'PY' || fail "127.0.0.1:8000 is already in use"
   import socket
   with socket.socket() as sock:
       sock.bind(("127.0.0.1", 8000))
@@ -736,9 +747,17 @@ operator workflows rather than wrapping Redfish itself.
       ;;
   esac
   '
+    install_mock_command python313 'exit 0'
     install_mock_command uv '
   printf "uv %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
-  exit 0
+  case "$*" in
+    "python find 3.13")
+      printf "%s/python313\n" "$BATS_TEST_TMPDIR/bin"
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
   '
     for command in qemu-system-x86_64 qemu-img curl openssl htpasswd bats shellcheck shfmt \
       grub2-mkrescue xorriso; do
@@ -773,7 +792,13 @@ operator workflows rather than wrapping Redfish itself.
     *) exit 0 ;;
   esac
   '
-    install_mock_command uv 'exit 0'
+    install_mock_command python313 'exit 0'
+    install_mock_command uv '
+  case "$*" in
+    "python find 3.13") printf "%s/python313\n" "$BATS_TEST_TMPDIR/bin" ;;
+    *) exit 2 ;;
+  esac
+  '
     for command in uname qemu-system-x86_64 qemu-img curl openssl htpasswd bats shellcheck \
       shfmt grub2-mkrescue xorriso; do
       install_recording_noop "$command"
@@ -783,6 +808,18 @@ operator workflows rather than wrapping Redfish itself.
     touch "$BATS_TEST_TMPDIR/dev/kvm"
     export VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm"
     export VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
+  }
+  ```
+
+  Add one more test to prove the read-only contract:
+
+  ```bash
+  @test "doctor does not create uv project state" {
+    install_all_doctor_success_mocks
+    run ./scripts/doctor
+    [ "$status" -eq 0 ]
+    [ ! -e .venv ]
+    [ ! -e uv.lock ]
   }
   ```
 
@@ -1096,6 +1133,27 @@ operator workflows rather than wrapping Redfish itself.
       "$BATS_TEST_TMPDIR/commands.log"
     [ "$status" -eq 0 ]
   }
+
+  @test "create-vm refuses existing root volume without a validated owned domain" {
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dominfo vm-x86-redfish")
+      exit 1
+      ;;
+    *"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 0
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    run ./scripts/create-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"existing root volume vm-x86-redfish.qcow2 is not adopted"* ]]
+  }
+
   ```
 
 - [ ] **Step 2: Run create tests and verify they fail**
@@ -1153,40 +1211,44 @@ operator workflows rather than wrapping Redfish itself.
         fail "existing domain $DEFAULT_DOMAIN_NAME is not owned by this project"
       domain_uuid_matches_state "$xml_path" ||
         fail "existing domain $DEFAULT_DOMAIN_NAME UUID does not match $DOMAIN_UUID_FILE"
+      grep -F "<rp:root-volume>${ROOT_VOLUME_NAME}</rp:root-volume>" "$xml_path" \
+        >/dev/null ||
+        fail "existing domain $DEFAULT_DOMAIN_NAME does not reference $ROOT_VOLUME_NAME"
       return 0
     fi
     return 1
   }
 
-  create_root_volume() {
+  reject_root_volume_collision() {
     if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
       >/dev/null 2>&1; then
-      return 1
+      fail "existing root volume $ROOT_VOLUME_NAME is not adopted without matching domain"
     fi
+  }
+
+  create_root_volume() {
+    reject_root_volume_collision
     virsh -c "$LIBVIRT_URI" vol-create-as "$STORAGE_POOL" "$ROOT_VOLUME_NAME" 40G \
       --format qcow2
-    return 0
+  }
+
+  create_redfish_runtime_state() {
+    :
   }
 
   create_vm_transaction() {
     create_domain_uuid_once
-    if validate_or_reject_existing_domain; then
-      return 0
-    fi
-
-    local created_volume=0
-    if create_root_volume; then
-      created_volume=1
-    fi
-    local root_path
-    root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
-    VM_X86_REDFISH_ROOT_VOLUME_PATH="$root_path" ./scripts/render-config domain
-    if ! virsh -c "$LIBVIRT_URI" define "${STATE_DIR}/domain.xml"; then
-      if [ "$created_volume" -eq 1 ]; then
+    if ! validate_or_reject_existing_domain; then
+      create_root_volume
+      local root_path
+      root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
+      VM_X86_REDFISH_ROOT_VOLUME_PATH="$root_path" ./scripts/render-config domain
+      if ! virsh -c "$LIBVIRT_URI" define "${STATE_DIR}/domain.xml"; then
         virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
+        fail "failed to define libvirt domain $DEFAULT_DOMAIN_NAME"
       fi
-      fail "failed to define libvirt domain $DEFAULT_DOMAIN_NAME"
     fi
+    create_redfish_runtime_state
   }
 
   with_lifecycle_lock "$LIFECYCLE_LOCK" create_vm_transaction
@@ -1204,11 +1266,22 @@ operator workflows rather than wrapping Redfish itself.
 
   Add matching tests to `tests/destroy-vm.bats` in Task 8 and `tests/render-config.bats` in
   Task 7 so `scripts/destroy-vm` and `scripts/run-redfish` fail with the same message when
-  any of those override variables is set without the guard. The implementation belongs in
-  `scripts/lib/common` from Task 2, not in `scripts/create-vm`, so every entry point gets
-  the same boundary by sourcing the library. Because `setup_test_workspace` sets
-  `VM_X86_REDFISH_INTEGRATION_TEST=1` for ordinary tests, these guard tests must invoke the
-  target through `env -u VM_X86_REDFISH_INTEGRATION_TEST`.
+  any of these variables is set without the guard:
+
+  ```text
+  VM_X86_REDFISH_DOMAIN_NAME
+  VM_X86_REDFISH_LIBVIRT_URI
+  VM_X86_REDFISH_STORAGE_POOL
+  VM_X86_REDFISH_ROOT_VOLUME_NAME
+  VM_X86_REDFISH_STATE_DIR
+  VM_X86_REDFISH_ARTIFACTS_DIR
+  ```
+
+  The implementation belongs in `scripts/lib/common` from Task 2, not in
+  `scripts/create-vm`, so every entry point gets the same boundary by sourcing the
+  library. Because `setup_test_workspace` sets `VM_X86_REDFISH_INTEGRATION_TEST=1` for
+  ordinary tests, these guard tests must invoke the target through
+  `env -u VM_X86_REDFISH_INTEGRATION_TEST`.
 
 - [ ] **Step 6: Run create guardrails and commit**
 
@@ -1261,6 +1334,36 @@ operator workflows rather than wrapping Redfish itself.
     grep -F "REDFISH_CREDENTIALS_FILE=$VM_X86_REDFISH_STATE_DIR/credentials.env" \
       "$VM_X86_REDFISH_STATE_DIR/connection.env"
   }
+
+  @test "create-vm repairs missing Redfish state for valid existing domain" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    install_mock_command virsh '
+  case "$*" in
+    *"dominfo vm-x86-redfish")
+      exit 0
+      ;;
+    *"dumpxml vm-x86-redfish")
+      cat <<XML
+  <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+    <uuid>11111111-2222-3333-4444-555555555555</uuid>
+    <metadata>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
+    </metadata>
+  </domain>
+  XML
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/create-vm
+    [ "$status" -eq 0 ]
+    [ -f "$VM_X86_REDFISH_STATE_DIR/credentials.env" ]
+    [ -f "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py" ]
+  }
   ```
 
 - [ ] **Step 2: Run tests and verify they fail**
@@ -1295,11 +1398,18 @@ operator workflows rather than wrapping Redfish itself.
   during implementation. If a setting name differs, update this template and tests in the
   same commit.
 
-- [ ] **Step 4: Generate credentials and TLS material**
+- [ ] **Step 4: Replace the runtime-state hook with credentials and TLS generation**
 
-  Extend `scripts/create-vm` with:
+  Replace Task 5's no-op `create_redfish_runtime_state` in `scripts/create-vm` with:
 
   ```bash
+  create_redfish_runtime_state() {
+    create_redfish_credentials_once
+    create_tls_once
+    write_connection_metadata
+    ./scripts/render-config sushy
+  }
+
   create_redfish_credentials_once() {
     local password
     if [ ! -f "${STATE_DIR}/credentials.env" ]; then
@@ -1655,9 +1765,11 @@ operator workflows rather than wrapping Redfish itself.
     export VM_X86_REDFISH_INTEGRATION_TEST=1
     export VM_X86_REDFISH_DOMAIN_NAME="vm-x86-redfish-${TEST_ID}"
     export VM_X86_REDFISH_ROOT_VOLUME_NAME="vm-x86-redfish-${TEST_ID}.qcow2"
+    TRACKED_CHILDREN=()
   }
 
   teardown() {
+    stop_tracked_children
     cleanup_log="$BATS_TEST_TMPDIR/destroy.log"
     cleanup_status=0
     ./scripts/destroy-vm >"$cleanup_log" 2>&1 || cleanup_status="$?"
@@ -1671,6 +1783,7 @@ operator workflows rather than wrapping Redfish itself.
     ./scripts/create-vm
     ./scripts/run-redfish >"$BATS_TEST_TMPDIR/sushy.log" 2>&1 &
     sushy_pid="$!"
+    track_child "$sushy_pid"
     wait_for_url "https://127.0.0.1:8000/redfish/v1"
     run curl --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
       https://127.0.0.1:8000/redfish/v1
@@ -1678,7 +1791,7 @@ operator workflows rather than wrapping Redfish itself.
     run curl --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
       https://127.0.0.1:8000/redfish/v1/Systems
     [ "$status" -ne 0 ]
-    stop_child "$sushy_pid"
+    stop_tracked_children
   }
   ```
 
@@ -1709,6 +1822,18 @@ operator workflows rather than wrapping Redfish itself.
     done
   }
 
+  track_child() {
+    TRACKED_CHILDREN+=("$1")
+  }
+
+  stop_tracked_children() {
+    local pid
+    for pid in "${TRACKED_CHILDREN[@]:-}"; do
+      stop_child "$pid"
+    done
+    TRACKED_CHILDREN=()
+  }
+
   stop_child() {
     local pid="$1"
     if ! kill "$pid" 2>/dev/null; then
@@ -1728,6 +1853,11 @@ operator workflows rather than wrapping Redfish itself.
     return 0
   }
   ```
+
+  Add a harness regression test that proves cleanup order. Start a long-running mock command,
+  `track_child` its PID, hold a mock lifecycle lock, call `stop_tracked_children`, and assert
+  the process is gone before invoking `scripts/destroy-vm`. This test lives in
+  `tests/redfish-integration.bats` and runs only under `make test-integration`.
 
 - [ ] **Step 4: Add authenticated Systems and power reset checks**
 
