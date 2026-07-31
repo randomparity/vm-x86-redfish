@@ -4,7 +4,10 @@
 install_mock_command() {
   local name="$1"
   local body="$2"
+  local bash_bin
+  bash_bin="$BASH"
   mkdir -p "$BATS_TEST_TMPDIR/bin"
+  ln -sf "$bash_bin" "$BATS_TEST_TMPDIR/bin/bash"
   cat >"$BATS_TEST_TMPDIR/bin/$name" <<SH
 #!/usr/bin/env bash
 set -euo pipefail
