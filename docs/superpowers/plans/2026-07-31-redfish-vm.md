@@ -27,7 +27,7 @@ operator workflows rather than wrapping Redfish itself.
   and `.artifacts/`.
 - Shell scripts must start with `#!/usr/bin/env bash` and `set -euo pipefail`.
 - Use two-space indentation in shell and YAML files, with a 100-character line limit.
-- Format changed shell files with `shfmt -i 2 -w path...` and lint them with `shellcheck`.
+- Format changed shell files with `shfmt -i 2 -w path...` and lint them with `shellcheck -x`.
 - Python runtime is 3.13 through `uv`; use exact pins in `pyproject.toml` and `uv.lock`.
 - Use `ruff check`, `ruff format`, `ty check`, and `pytest -q` for Python only if Python
   project code or Python tests are added beyond Sushy configuration validation.
@@ -164,6 +164,7 @@ operator workflows rather than wrapping Redfish itself.
   OFFLINE_BATS_TESTS += $(wildcard tests/destroy-vm.bats)
   SHELL_SCRIPTS := $(wildcard scripts/doctor scripts/create-vm scripts/destroy-vm)
   SHELL_SCRIPTS += $(wildcard scripts/render-config scripts/run-redfish scripts/lib/common)
+  SHELLCHECK_FILES := $(SHELL_SCRIPTS) $(wildcard tests/helpers/test-helper.bash)
   EXECUTABLE_SCRIPTS := $(filter-out scripts/lib/common,$(SHELL_SCRIPTS))
   PYTHON_313 := $(shell UV_PYTHON_DOWNLOADS=never uv python find 3.13 2>/dev/null)
   PYTHON_FILES := $(wildcard tests/helpers/*.py)
@@ -171,7 +172,7 @@ operator workflows rather than wrapping Redfish itself.
 
   test:
   >@if [ -n "$(OFFLINE_BATS_TESTS)" ]; then bats $(OFFLINE_BATS_TESTS); fi
-  >@if [ -n "$(SHELL_SCRIPTS)" ]; then shellcheck $(SHELL_SCRIPTS); fi
+  >@if [ -n "$(SHELLCHECK_FILES)" ]; then shellcheck -x $(SHELLCHECK_FILES); fi
   >@for script in $(EXECUTABLE_SCRIPTS); do test -x "$$script"; done
   >@if [ -n "$(SHFMT_PATHS)" ]; then shfmt -i 2 -d $(SHFMT_PATHS); fi
   >@if [ -n "$(PYTHON_FILES)" ]; then \
@@ -562,6 +563,9 @@ operator workflows rather than wrapping Redfish itself.
   Create `tests/helpers/test-helper.bash` with:
 
   ```bash
+  #!/usr/bin/env bash
+  # shellcheck disable=SC2154 # Bats provides BATS_TEST_* variables.
+
   install_mock_command() {
     local name="$1"
     local body="$2"
@@ -624,7 +628,7 @@ operator workflows rather than wrapping Redfish itself.
 
   ```bash
   shfmt -i 2 -w scripts/lib/common tests/helpers/test-helper.bash tests/render-config.bats
-  shellcheck scripts/lib/common tests/helpers/test-helper.bash
+  shellcheck -x scripts/lib/common tests/helpers/test-helper.bash
   bats tests/render-config.bats
   make test
   ```
@@ -694,6 +698,7 @@ operator workflows rather than wrapping Redfish itself.
   set -euo pipefail
 
   script_dir="${BASH_SOURCE[0]%/*}"
+  # shellcheck source=scripts/lib/common
   source "${script_dir}/lib/common"
 
   check_architecture() {
@@ -988,7 +993,7 @@ operator workflows rather than wrapping Redfish itself.
   ```bash
   chmod +x scripts/doctor
   shfmt -i 2 -w scripts/doctor tests/doctor.bats
-  shellcheck scripts/doctor
+  shellcheck -x scripts/doctor
   bats tests/doctor.bats
   make test
   ```
@@ -1123,6 +1128,7 @@ operator workflows rather than wrapping Redfish itself.
   set -euo pipefail
 
   script_dir="${BASH_SOURCE[0]%/*}"
+  # shellcheck source=scripts/lib/common
   source "${script_dir}/lib/common"
 
   render_template() {
@@ -1174,7 +1180,7 @@ operator workflows rather than wrapping Redfish itself.
   ```bash
   chmod +x scripts/render-config
   shfmt -i 2 -w scripts/render-config
-  shellcheck scripts/render-config
+  shellcheck -x scripts/render-config
   bats tests/render-config.bats
   make test
   ```
@@ -1263,6 +1269,7 @@ operator workflows rather than wrapping Redfish itself.
     run ./scripts/create-vm
     [ "$status" -ne 0 ]
     [[ "$output" == *"existing domain vm-x86-redfish is not owned by this project"* ]]
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
   }
 
   @test "create-vm accepts owned domain with alternate metadata prefix and escaped text" {
@@ -1484,6 +1491,7 @@ operator workflows rather than wrapping Redfish itself.
     run ./scripts/create-vm
     [ "$status" -ne 0 ]
     [[ "$output" == *"existing root volume vm-x86-redfish.qcow2 is not adopted"* ]]
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
   }
 
   ```
@@ -1581,6 +1589,7 @@ operator workflows rather than wrapping Redfish itself.
   set -euo pipefail
 
   script_dir="${BASH_SOURCE[0]%/*}"
+  # shellcheck source=scripts/lib/common
   source "${script_dir}/lib/common"
 
   create_domain_uuid_once() {
@@ -1594,6 +1603,7 @@ operator workflows rather than wrapping Redfish itself.
     local xml_path="${STATE_DIR}/existing-domain.xml"
     local root_path
     if virsh -c "$LIBVIRT_URI" dominfo "$DEFAULT_DOMAIN_NAME" >/dev/null 2>&1; then
+      ensure_private_dir "$STATE_DIR"
       virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_path"
       domain_is_project_owned "$xml_path" ||
         fail "existing domain $DEFAULT_DOMAIN_NAME is not owned by this project"
@@ -1653,10 +1663,13 @@ operator workflows rather than wrapping Redfish itself.
   }
 
   create_vm_transaction() {
-    create_domain_uuid_once
-    if ! validate_or_reject_existing_domain; then
-      create_new_domain
+    if validate_or_reject_existing_domain; then
+      create_redfish_runtime_state
+      return 0
     fi
+    reject_root_volume_collision
+    create_domain_uuid_once
+    create_new_domain
     create_redfish_runtime_state
   }
 
@@ -1699,7 +1712,7 @@ operator workflows rather than wrapping Redfish itself.
   ```bash
   chmod +x scripts/create-vm
   shfmt -i 2 -w scripts/create-vm scripts/lib/common tests/create-vm.bats
-  shellcheck scripts/create-vm scripts/lib/common
+  shellcheck -x scripts/create-vm scripts/lib/common
   bats tests/create-vm.bats
   make test
   ```
@@ -1970,7 +1983,7 @@ operator workflows rather than wrapping Redfish itself.
   ```bash
   shfmt -i 2 -w scripts/create-vm scripts/render-config scripts/lib/common \
     tests/create-vm.bats tests/render-config.bats
-  shellcheck scripts/create-vm scripts/render-config scripts/lib/common
+  shellcheck -x scripts/create-vm scripts/render-config scripts/lib/common
   python_bin="$(UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
   "$python_bin" -m py_compile config/sushy-emulator.conf.py.in
   bats tests/create-vm.bats tests/render-config.bats
@@ -2055,6 +2068,7 @@ operator workflows rather than wrapping Redfish itself.
   set -euo pipefail
 
   script_dir="${BASH_SOURCE[0]%/*}"
+  # shellcheck source=scripts/lib/common
   source "${script_dir}/lib/common"
 
   run_redfish() {
@@ -2077,7 +2091,7 @@ operator workflows rather than wrapping Redfish itself.
   ```bash
   chmod +x scripts/run-redfish
   shfmt -i 2 -w scripts/run-redfish tests/render-config.bats
-  shellcheck scripts/run-redfish
+  shellcheck -x scripts/run-redfish
   UV_PYTHON_DOWNLOADS=never uv run --locked --no-dev python -c 'import libvirt'
   UV_PYTHON_DOWNLOADS=never uv run --locked --no-dev sushy-emulator --help
   bats tests/render-config.bats
@@ -2313,6 +2327,52 @@ operator workflows rather than wrapping Redfish itself.
     [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
   }
 
+  @test "destroy-vm force destroys active non-running domain states" {
+    for state in paused crashed; do
+      printf '11111111-2222-3333-4444-555555555555\n' \
+        >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+      printf '%s\n' "$state" >"$BATS_TEST_TMPDIR/domstate"
+      install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dumpxml vm-x86-redfish")
+      cat <<XML
+  <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+    <uuid>11111111-2222-3333-4444-555555555555</uuid>
+    <metadata>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
+    </metadata>
+    <devices>
+      <disk type="file" device="disk">
+        <source file="/var/lib/libvirt/images/vm-x86-redfish.qcow2"/>
+      </disk>
+    </devices>
+  </domain>
+  XML
+      ;;
+    *"domstate vm-x86-redfish")
+      cat "$BATS_TEST_TMPDIR/domstate"
+      ;;
+    *"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+      ;;
+    *"vol-list --pool default --name")
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+      run ./scripts/destroy-vm
+      [ "$status" -eq 0 ]
+      grep -F "destroy vm-x86-redfish" "$BATS_TEST_TMPDIR/commands.log"
+    done
+  }
+
   @test "destroy-vm removes uuid media volumes when domain and root are absent" {
     printf '11111111-2222-3333-4444-555555555555\n' \
       >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
@@ -2434,6 +2494,7 @@ operator workflows rather than wrapping Redfish itself.
   set -euo pipefail
 
   script_dir="${BASH_SOURCE[0]%/*}"
+  # shellcheck source=scripts/lib/common
   source "${script_dir}/lib/common"
 
   media_volume_matches_uuid() {
@@ -2502,6 +2563,15 @@ operator workflows rather than wrapping Redfish itself.
     cleanup_project_state_files
   }
 
+  destroy_domain_if_active() {
+    local state
+    state="$(virsh -c "$LIBVIRT_URI" domstate "$DEFAULT_DOMAIN_NAME")"
+    case "$state" in
+      "shut off") return 0 ;;
+      *) virsh -c "$LIBVIRT_URI" destroy "$DEFAULT_DOMAIN_NAME" ;;
+    esac
+  }
+
   destroy_transaction() {
     local root_path uuid xml_path xml_probe
     if [ ! -f "$DOMAIN_UUID_FILE" ]; then
@@ -2529,9 +2599,7 @@ operator workflows rather than wrapping Redfish itself.
     domain_disk_source_matches "$xml_path" "$root_path" ||
       fail "refusing to destroy $DEFAULT_DOMAIN_NAME with unexpected disk source"
 
-    if virsh -c "$LIBVIRT_URI" domstate "$DEFAULT_DOMAIN_NAME" | grep -F running >/dev/null; then
-      virsh -c "$LIBVIRT_URI" destroy "$DEFAULT_DOMAIN_NAME"
-    fi
+    destroy_domain_if_active
     virsh -c "$LIBVIRT_URI" undefine "$DEFAULT_DOMAIN_NAME" --nvram
     if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
       >/dev/null 2>&1; then
@@ -2613,7 +2681,7 @@ operator workflows rather than wrapping Redfish itself.
   ```bash
   chmod +x scripts/destroy-vm
   shfmt -i 2 -w scripts/destroy-vm scripts/lib/common tests/destroy-vm.bats
-  shellcheck scripts/destroy-vm scripts/lib/common
+  shellcheck -x scripts/destroy-vm scripts/lib/common
   bats tests/destroy-vm.bats
   make test
   ```
@@ -2669,38 +2737,9 @@ operator workflows rather than wrapping Redfish itself.
     TRACKED_CHILDREN=()
   }
 
-  teardown() {
-    stop_tracked_children
-    cleanup_log="$VM_X86_REDFISH_ARTIFACTS_DIR/destroy.log"
-    cleanup_status=0
-    ./scripts/destroy-vm >"$cleanup_log" 2>&1 || cleanup_status="$?"
-    if [ "$cleanup_status" -ne 0 ]; then
-      if ! virsh -c "$LIBVIRT_URI" dumpxml "$VM_X86_REDFISH_DOMAIN_NAME" \
-        >"$VM_X86_REDFISH_ARTIFACTS_DIR/domain.xml" 2>&1; then
-        printf 'domain XML unavailable after cleanup failure\n' \
-          >>"$VM_X86_REDFISH_ARTIFACTS_DIR/domain.xml"
-      fi
-      printf 'destroy-vm cleanup failed with status %s; see %s\n' \
-        "$cleanup_status" "$cleanup_log" >&2
-      return "$cleanup_status"
-    fi
-  }
-
-  @test "Redfish discovery is public and Systems requires credentials" {
-    ./scripts/create-vm
-    ./scripts/run-redfish >"$BATS_TEST_TMPDIR/sushy.log" 2>&1 &
-    sushy_pid="$!"
-    track_child "$sushy_pid"
-    wait_for_url "https://127.0.0.1:8000/redfish/v1"
-    run curl --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
-      https://127.0.0.1:8000/redfish/v1
+  @test "integration harness installs cleanup helpers before live mutation" {
+    run declare -F stop_tracked_children
     [ "$status" -eq 0 ]
-    run curl --silent --output /dev/null --write-out "%{http_code}" \
-      --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
-      https://127.0.0.1:8000/redfish/v1/Systems
-    [ "$status" -eq 0 ]
-    [ "$output" = "401" ]
-    stop_tracked_children
   }
   ```
 
@@ -2714,8 +2753,8 @@ operator workflows rather than wrapping Redfish itself.
   ```
 
   Expected before implementation: `make doctor` either reports missing Fedora 44 host
-  prerequisites or exits 0; `make test-integration` fails because polling helpers and
-  authenticated Redfish operations are incomplete.
+  prerequisites or exits 0; `make test-integration` fails on the missing
+  `stop_tracked_children` helper before any host mutation begins.
 
 - [ ] **Step 3: Implement bounded process helpers**
 
@@ -2763,6 +2802,27 @@ operator workflows rather than wrapping Redfish itself.
   }
   ```
 
+  Add this teardown to `tests/redfish-integration.bats` after the helpers exist:
+
+  ```bash
+  teardown() {
+    stop_tracked_children
+    cleanup_log="$VM_X86_REDFISH_ARTIFACTS_DIR/destroy.log"
+    cleanup_status=0
+    ./scripts/destroy-vm >"$cleanup_log" 2>&1 || cleanup_status="$?"
+    if [ "$cleanup_status" -ne 0 ]; then
+      if ! virsh -c "$LIBVIRT_URI" dumpxml "$VM_X86_REDFISH_DOMAIN_NAME" \
+        >"$VM_X86_REDFISH_ARTIFACTS_DIR/domain.xml" 2>&1; then
+        printf 'domain XML unavailable after cleanup failure\n' \
+          >>"$VM_X86_REDFISH_ARTIFACTS_DIR/domain.xml"
+      fi
+      printf 'destroy-vm cleanup failed with status %s; see %s\n' \
+        "$cleanup_status" "$cleanup_log" >&2
+      return "$cleanup_status"
+    fi
+  }
+  ```
+
   Add a harness regression test that proves cleanup order. Start a long-running mock command,
   `track_child` its PID, hold a mock lifecycle lock, call `stop_tracked_children`, and assert
   the process is gone before invoking `scripts/destroy-vm`. This test lives in
@@ -2770,8 +2830,12 @@ operator workflows rather than wrapping Redfish itself.
 
 - [ ] **Step 4: Add authenticated Systems and power reset checks**
 
-  Extend the test to source `$VM_X86_REDFISH_STATE_DIR/credentials.env`, query
-  `/redfish/v1/Systems`, use the returned UUID URL, and POST reset actions:
+  Add the first live mutation test now that teardown and child tracking exist. The test must
+  run `./scripts/create-vm`, start `./scripts/run-redfish` in the background, immediately
+  `track_child "$sushy_pid"`, wait for discovery, assert `/redfish/v1` is public, assert
+  unauthenticated `/redfish/v1/Systems` returns `401`, source
+  `$VM_X86_REDFISH_STATE_DIR/credentials.env`, query `/redfish/v1/Systems`, use the returned
+  UUID URL, and POST reset actions:
 
   ```bash
   curl --fail --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
@@ -3047,14 +3111,19 @@ operator workflows rather than wrapping Redfish itself.
 
   - push branch `feat/redfish-vm-plan`;
   - create or update a pull request whose body includes `Closes #1`;
-  - post the required `WORK:REVIEW` annotation on the PR after adversarial branch review;
+  - run a diff-scoped `$threat-scan` over auth, TLS secret files, lifecycle cleanup, and
+    virtual-media URL fetch boundaries;
+  - fix or explicitly disposition every threat-scan finding;
+  - post the required `WORK:REVIEW` annotation on the PR after adversarial branch review,
+    including the threat-scan status;
   - post `WORK:TRAJECTORY` on issue #1 if the branch parks before merge; and
   - move issue #1 out of `status:in-progress` only after the corresponding workflow edge
     succeeds.
 
   The issue moves to `status:in-review` when branch review is running and to
-  `status:awaiting-merge` only when the PR is green, mergeable, and ready for a human merge.
-  Do not close issue #1 directly; the merged PR with `Closes #1` is the closure mechanism.
+  `status:awaiting-merge` only when the PR is green, mergeable, threat-scanned, and ready
+  for a human merge. Do not close issue #1 directly; the merged PR with `Closes #1` is the
+  closure mechanism.
 
 ## Self-Review
 
