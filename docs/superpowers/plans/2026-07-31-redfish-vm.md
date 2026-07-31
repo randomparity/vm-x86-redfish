@@ -156,17 +156,19 @@ operator workflows rather than wrapping Redfish itself.
   destroy:
   >./scripts/destroy-vm
 
-  BATS_TESTS := $(wildcard tests/*.bats)
+  OFFLINE_BATS_TESTS := $(wildcard tests/command-surface.bats tests/doctor.bats)
+  OFFLINE_BATS_TESTS += $(wildcard tests/render-config.bats tests/create-vm.bats)
+  OFFLINE_BATS_TESTS += $(wildcard tests/destroy-vm.bats)
   SHELL_SCRIPTS := $(wildcard scripts/doctor scripts/create-vm scripts/destroy-vm)
   SHELL_SCRIPTS += $(wildcard scripts/render-config scripts/run-redfish scripts/lib/common)
   SHFMT_PATHS := $(wildcard scripts tests)
 
   test:
-  >@if [ -n "$(BATS_TESTS)" ]; then bats $(BATS_TESTS); fi
+  >@if [ -n "$(OFFLINE_BATS_TESTS)" ]; then bats $(OFFLINE_BATS_TESTS); fi
   >@if [ -n "$(SHELL_SCRIPTS)" ]; then shellcheck $(SHELL_SCRIPTS); fi
   >@if [ -n "$(SHFMT_PATHS)" ]; then shfmt -i 2 -d $(SHFMT_PATHS); fi
   >@if [ -f config/sushy-emulator.conf.py.in ]; then \
-  >  uv run python -m py_compile config/sushy-emulator.conf.py.in; \
+  >  python3 -m py_compile config/sushy-emulator.conf.py.in; \
   >fi
 
   test-integration:
@@ -241,7 +243,7 @@ operator workflows rather than wrapping Redfish itself.
         - name: Install uv
           uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         - name: Install host test tools
-          run: sudo apt-get update && sudo apt-get install -y bats shellcheck shfmt
+          run: sudo apt-get update && sudo apt-get install -y bats python3 shellcheck shfmt
         - name: Run offline guardrails
           run: make test
   ```
@@ -969,7 +971,7 @@ operator workflows rather than wrapping Redfish itself.
   render_template() {
     local input="$1"
     local output="$2"
-    uv run python - "$input" "$output" <<'PY'
+    python3 - "$input" "$output" <<'PY'
   import os
   import pathlib
   import sys
@@ -1329,9 +1331,9 @@ operator workflows rather than wrapping Redfish itself.
     [ "$(stat -c "%a" "$VM_X86_REDFISH_STATE_DIR/credentials.env")" = "600" ]
     [ "$(stat -c "%a" "$VM_X86_REDFISH_STATE_DIR/htpasswd")" = "600" ]
     [ "$(stat -c "%a" "$VM_X86_REDFISH_STATE_DIR/tls.key")" = "600" ]
-    grep -F "REDFISH_ENDPOINT=https://127.0.0.1:8000" \
+    grep -F "REDFISH_ENDPOINT='https://127.0.0.1:8000'" \
       "$VM_X86_REDFISH_STATE_DIR/connection.env"
-    grep -F "REDFISH_CREDENTIALS_FILE=$VM_X86_REDFISH_STATE_DIR/credentials.env" \
+    grep -F "REDFISH_CREDENTIALS_FILE='$VM_X86_REDFISH_STATE_DIR/credentials.env'" \
       "$VM_X86_REDFISH_STATE_DIR/connection.env"
   }
 
@@ -1458,7 +1460,7 @@ operator workflows rather than wrapping Redfish itself.
   shfmt -i 2 -w scripts/create-vm scripts/render-config scripts/lib/common \
     tests/create-vm.bats tests/render-config.bats
   shellcheck scripts/create-vm scripts/render-config scripts/lib/common
-  uv run python -m py_compile config/sushy-emulator.conf.py.in
+  python3 -m py_compile config/sushy-emulator.conf.py.in
   bats tests/create-vm.bats tests/render-config.bats
   make test
   ```
@@ -1583,6 +1585,19 @@ operator workflows rather than wrapping Redfish itself.
     setup_test_workspace
   }
 
+  @test "destroy-vm is a no-op before create" {
+    run ./scripts/destroy-vm
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"destroy: no project state found"* ]]
+  }
+
+  @test "destroy-vm is a no-op after prior cleanup removed state" {
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+    run ./scripts/destroy-vm
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"destroy: no project state found"* ]]
+  }
+
   @test "destroy-vm refuses domain with mismatched ownership" {
     printf '11111111-2222-3333-4444-555555555555\n' \
       >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
@@ -1639,6 +1654,7 @@ operator workflows rather than wrapping Redfish itself.
       "$BATS_TEST_TMPDIR/commands.log"
     run grep -F "unrelated-22222222" "$BATS_TEST_TMPDIR/commands.log"
     [ "$status" -ne 0 ]
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
   }
   ```
 
@@ -1669,12 +1685,31 @@ operator workflows rather than wrapping Redfish itself.
     [[ "$name" =~ ^[^/]+-"$uuid"\\.img$ ]]
   }
 
+  cleanup_project_state_files() {
+    local file
+    for file in domain.xml destroy-domain.xml existing-domain.xml domain-uuid \
+      credentials.env htpasswd tls.crt tls.key connection.env sushy-emulator.conf.py; do
+      [ -e "${STATE_DIR}/${file}" ] && rm -- "${STATE_DIR}/${file}"
+    done
+  }
+
   destroy_transaction() {
     local uuid xml_path
+    if [ ! -f "$DOMAIN_UUID_FILE" ]; then
+      printf 'destroy: no project state found\n'
+      return 0
+    fi
     uuid="$(read_domain_uuid)"
     xml_path="${STATE_DIR}/destroy-domain.xml"
-    virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_path" ||
-      fail "domain $DEFAULT_DOMAIN_NAME is not defined"
+    if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_path"; then
+      if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+        >/dev/null 2>&1; then
+        fail "cannot prove ownership of $ROOT_VOLUME_NAME without domain metadata"
+      fi
+      printf 'destroy: domain %s is already absent\n' "$DEFAULT_DOMAIN_NAME"
+      cleanup_project_state_files
+      return 0
+    fi
     domain_is_project_owned "$xml_path" ||
       fail "refusing to destroy unowned domain $DEFAULT_DOMAIN_NAME"
     domain_uuid_matches_state "$xml_path" ||
@@ -1693,6 +1728,7 @@ operator workflows rather than wrapping Redfish itself.
         virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$volume"
       fi
     done < <(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)
+    cleanup_project_state_files
   }
 
   with_lifecycle_lock "$LIFECYCLE_LOCK" destroy_transaction
@@ -1717,6 +1753,13 @@ operator workflows rather than wrapping Redfish itself.
       [ -d "$tmpdir" ] || fail "temporary directory disappeared during cleanup: $tmpdir"
     fi
   }
+  ```
+
+  Update the end of `destroy_transaction` so temporary media is removed before state files:
+
+  ```bash
+    cleanup_tmpdir
+    cleanup_project_state_files
   ```
 
 - [ ] **Step 5: Run destruction guardrails and commit**
@@ -1788,9 +1831,11 @@ operator workflows rather than wrapping Redfish itself.
     run curl --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
       https://127.0.0.1:8000/redfish/v1
     [ "$status" -eq 0 ]
-    run curl --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
+    run curl --silent --output /dev/null --write-out "%{http_code}" \
+      --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
       https://127.0.0.1:8000/redfish/v1/Systems
-    [ "$status" -ne 0 ]
+    [ "$status" -eq 0 ]
+    [ "$output" = "401" ]
     stop_tracked_children
   }
   ```
