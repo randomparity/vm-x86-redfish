@@ -4,7 +4,7 @@ load "helpers/test-helper"
 
 @test "render-config writes domain XML with UUID and owner metadata" {
   mkdir -p "$BATS_TEST_TMPDIR/state"
-  printf '11111111-2222-3333-4444-555555555555\n' \
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
     >"$BATS_TEST_TMPDIR/state/domain-uuid"
   VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
     VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
@@ -15,9 +15,89 @@ load "helpers/test-helper"
   run grep -F "<rp:project>vm-x86-redfish</rp:project>" \
     "$BATS_TEST_TMPDIR/state/domain.xml"
   [ "$status" -eq 0 ]
-  run grep -F "<uuid>11111111-2222-3333-4444-555555555555</uuid>" \
+  run grep -F "<uuid>123e4567-e89b-42d3-a456-426614174000</uuid>" \
     "$BATS_TEST_TMPDIR/state/domain.xml"
   [ "$status" -eq 0 ]
+}
+
+@test "render-config creates one COM1 serial console without virtio console targets" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    run ./scripts/render-config domain
+  [ "$status" -eq 0 ]
+
+  run grep -Fc "<serial type='pty'>" "$BATS_TEST_TMPDIR/state/domain.xml"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1" ]
+  run grep -Fc "<target type='isa-serial' port='0'>" "$BATS_TEST_TMPDIR/state/domain.xml"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1" ]
+  run grep -Fc "<model name='isa-serial'/>" "$BATS_TEST_TMPDIR/state/domain.xml"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1" ]
+  run grep -Fc "<console type='pty'>" "$BATS_TEST_TMPDIR/state/domain.xml"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1" ]
+  run grep -Fc "<target type='serial' port='0'/>" "$BATS_TEST_TMPDIR/state/domain.xml"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1" ]
+  run awk '/<console /,/<\/console>/' "$BATS_TEST_TMPDIR/state/domain.xml"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"<target type='virtio'"* ]]
+}
+
+@test "render-config rejects a missing root volume path without writing domain XML" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+
+  run env VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" ./scripts/render-config domain
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"missing root volume path"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/state/domain.xml" ]
+}
+
+@test "render-config rejects a missing domain UUID without writing domain XML" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    run ./scripts/render-config domain
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"missing domain UUID file"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/state/domain.xml" ]
+}
+
+@test "render-config rejects a malformed domain UUID without writing domain XML" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf 'not-a-uuid\n' >"$BATS_TEST_TMPDIR/state/domain-uuid"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    run ./scripts/render-config domain
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid domain UUID"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/state/domain.xml" ]
+}
+
+@test "render-config finds its domain template outside the repository root" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+
+  run bash -c 'cd / && VM_X86_REDFISH_STATE_DIR="$1" \
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" "$2" domain' \
+    -- "$BATS_TEST_TMPDIR/state" "$BATS_TEST_DIRNAME/../scripts/render-config"
+
+  [ "$status" -eq 0 ]
+  [ -f "$BATS_TEST_TMPDIR/state/domain.xml" ]
 }
 
 @test "ensure_private_dir creates mode 0700 directory" {

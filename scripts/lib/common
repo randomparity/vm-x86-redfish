@@ -101,8 +101,12 @@ write_secret_file() {
 }
 
 read_domain_uuid() {
+  local domain_uuid
   [ -f "$DOMAIN_UUID_FILE" ] || fail "missing domain UUID file: $DOMAIN_UUID_FILE"
-  tr -d '\n' <"$DOMAIN_UUID_FILE"
+  domain_uuid="$(<"$DOMAIN_UUID_FILE")"
+  [[ "$domain_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]] ||
+    fail "invalid domain UUID in $DOMAIN_UUID_FILE: expected RFC 4122 UUID"
+  printf '%s\n' "$domain_uuid"
 }
 
 with_lifecycle_lock() {

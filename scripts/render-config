@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir="${BASH_SOURCE[0]%/*}"
+repo_dir="$(cd -- "${script_dir}/.." && pwd -P)"
 # shellcheck source=scripts/lib/common
 source "${script_dir}/lib/common"
 
@@ -38,7 +39,7 @@ render_domain() {
   export ROOT_VOLUME_PATH="${VM_X86_REDFISH_ROOT_VOLUME_PATH:?missing root volume path}"
   export STATE_DIR
   DOMAIN_UUID="$(read_domain_uuid)"
-  render_template config/domain.xml "${STATE_DIR}/domain.xml"
+  render_template "${repo_dir}/config/domain.xml" "${STATE_DIR}/domain.xml"
 }
 
 case "${1:-}" in
