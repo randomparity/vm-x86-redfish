@@ -161,6 +161,11 @@ for metadata in root.findall("metadata"):
     for elem in metadata.findall(target):
         if (elem.text or "") == expected:
             raise SystemExit(0)
+    container = f"{{{namespace}}}vm-x86-redfish"
+    for project_metadata in metadata.findall(container):
+        for elem in project_metadata.findall(target):
+            if (elem.text or "") == expected:
+                raise SystemExit(0)
 raise SystemExit(1)
 PY
 }

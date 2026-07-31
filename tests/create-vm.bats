@@ -33,17 +33,7 @@ esac
 printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
   *"dominfo vm-x86-redfish") exit 0 ;;
-  *"dumpxml vm-x86-redfish") cat <<XML
-<domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
-  <uuid>11111111-2222-3333-8444-555555555555</uuid>
-  <metadata><rp:project>vm-x86-redfish</rp:project>
-    <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume></metadata>
-  <devices><disk type="file" device="disk">
-    <source file="/var/lib/libvirt/images/vm-x86-redfish.qcow2"/>
-  </disk></devices>
-</domain>
-XML
-    ;;
+  *"dumpxml vm-x86-redfish") cat "$VM_X86_REDFISH_STATE_DIR/domain.xml" ;;
   *"vol-info --pool default vm-x86-redfish.qcow2") exit 0 ;;
   *"vol-path --pool default vm-x86-redfish.qcow2")
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\\n" ;;
