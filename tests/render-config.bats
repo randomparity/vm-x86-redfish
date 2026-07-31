@@ -94,17 +94,30 @@ load "helpers/test-helper"
   [[ "$output" == *"refusing symlink"* ]]
 }
 
-@test "with_lifecycle_lock rejects a non-private parent directory" {
+@test "with_lifecycle_lock creates a missing private parent directory" {
+  run bash -c '
+    source scripts/lib/common
+    with_lifecycle_lock "$BATS_TEST_TMPDIR/new-state/lifecycle.lock" true
+    stat -c "%a %F" "$BATS_TEST_TMPDIR/new-state"
+    test -f "$BATS_TEST_TMPDIR/new-state/lifecycle.lock"
+  '
+
+  [ "$status" -eq 0 ]
+  [ "$output" = "700 directory" ]
+}
+
+@test "with_lifecycle_lock normalizes an existing parent directory" {
   mkdir -m 755 "$BATS_TEST_TMPDIR/loose"
 
   run bash -c '
     source scripts/lib/common
     with_lifecycle_lock "$BATS_TEST_TMPDIR/loose/lifecycle.lock" true
+    stat -c "%a %F" "$BATS_TEST_TMPDIR/loose"
+    test -f "$BATS_TEST_TMPDIR/loose/lifecycle.lock"
   '
 
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"directory must be mode 0700"* ]]
-  [ ! -e "$BATS_TEST_TMPDIR/loose/lifecycle.lock" ]
+  [ "$status" -eq 0 ]
+  [ "$output" = "700 directory" ]
 }
 
 @test "media volume name strips signed URL query before basename" {

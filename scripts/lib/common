@@ -109,7 +109,7 @@ with_lifecycle_lock() {
   local lock_path="$1"
   shift
   reject_symlink "$lock_path"
-  require_private_dir "$(dirname "$lock_path")"
+  ensure_private_dir "$(dirname "$lock_path")"
   exec 9>"$lock_path"
   flock -n 9 || fail "lifecycle lock is held: $lock_path"
   "$@"
