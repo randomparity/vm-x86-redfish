@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034 # Sourced lifecycle scripts consume these shared globals.
+set -euo pipefail
+
+PROJECT_NAME="vm-x86-redfish"
+DEFAULT_DOMAIN_NAME="vm-x86-redfish"
+LIBVIRT_URI="qemu:///system"
+STORAGE_POOL="default"
+STATE_DIR=".state"
+ARTIFACTS_DIR=".artifacts"
+ROOT_VOLUME_NAME="vm-x86-redfish.qcow2"
+DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
+LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing command '$1': install $2"
+}
+
+python_313() {
+  UV_PYTHON_DOWNLOADS=never uv python find 3.13 2>/dev/null ||
+    fail "uv must find Python 3.13 without downloading"
+}
+
+integration_override_enabled() {
+  [ "${VM_X86_REDFISH_INTEGRATION_TEST:-}" = "1" ]
+}
+
+reject_unguarded_override() {
+  local name="$1"
+  if [ -n "${!name:-}" ] && ! integration_override_enabled; then
+    fail "test-only overrides require VM_X86_REDFISH_INTEGRATION_TEST=1"
+  fi
+}
+
+load_runtime_config() {
+  reject_unguarded_override VM_X86_REDFISH_DOMAIN_NAME
+  reject_unguarded_override VM_X86_REDFISH_LIBVIRT_URI
+  reject_unguarded_override VM_X86_REDFISH_STORAGE_POOL
+  reject_unguarded_override VM_X86_REDFISH_ROOT_VOLUME_NAME
+  reject_unguarded_override VM_X86_REDFISH_STATE_DIR
+  reject_unguarded_override VM_X86_REDFISH_ARTIFACTS_DIR
+  DEFAULT_DOMAIN_NAME="${VM_X86_REDFISH_DOMAIN_NAME:-vm-x86-redfish}"
+  LIBVIRT_URI="${VM_X86_REDFISH_LIBVIRT_URI:-qemu:///system}"
+  STORAGE_POOL="${VM_X86_REDFISH_STORAGE_POOL:-default}"
+  STATE_DIR="${VM_X86_REDFISH_STATE_DIR:-.state}"
+  ARTIFACTS_DIR="${VM_X86_REDFISH_ARTIFACTS_DIR:-.artifacts}"
+  ROOT_VOLUME_NAME="${VM_X86_REDFISH_ROOT_VOLUME_NAME:-${DEFAULT_DOMAIN_NAME}.qcow2}"
+  DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
+  LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
+}
+
+load_runtime_config
+
+reject_symlink() {
+  local path="$1"
+  [ ! -L "$path" ] || fail "refusing symlink: $path"
+}
+
+ensure_private_dir() {
+  local path="$1"
+  reject_symlink "$path"
+  mkdir -p "$path"
+  chmod 700 "$path"
+  [ -d "$path" ] || fail "not a directory: $path"
+  [ "$(stat -c '%a' "$path")" = "700" ] || fail "directory must be mode 0700: $path"
+}
+
+require_private_dir() {
+  local path="$1"
+  reject_symlink "$path"
+  [ -d "$path" ] || fail "missing private directory: $path"
+  [ "$(stat -c '%u' "$path")" = "$(id -u)" ] ||
+    fail "directory must be owned by the current user: $path"
+  [ "$(stat -c '%a' "$path")" = "700" ] || fail "directory must be mode 0700: $path"
+}
+
+canonical_dir() {
+  local path="$1"
+  reject_symlink "$path"
+  [ -d "$path" ] || fail "missing directory: $path"
+  realpath -e "$path"
+}
+
+write_secret_file() {
+  local path="$1"
+  local content="$2"
+  umask 077
+  printf '%s\n' "$content" >"$path"
+  chmod 600 "$path"
+}
+
+read_domain_uuid() {
+  [ -f "$DOMAIN_UUID_FILE" ] || fail "missing domain UUID file: $DOMAIN_UUID_FILE"
+  tr -d '\n' <"$DOMAIN_UUID_FILE"
+}
+
+with_lifecycle_lock() {
+  local lock_path="$1"
+  shift
+  ensure_private_dir "$(dirname "$lock_path")"
+  exec 9>"$lock_path"
+  flock -n 9 || fail "lifecycle lock is held: $lock_path"
+  "$@"
+}
+
+volume_name_for_media() {
+  local image_url="$1"
+  local domain_uuid="$2"
+  local base
+  base="${image_url##*/}"
+  base="${base%%\?*}"
+  base="${base//./-}"
+  printf '%s-%s.img\n' "$base" "$domain_uuid"
+}
