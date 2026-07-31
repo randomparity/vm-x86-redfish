@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="${BASH_SOURCE[0]%/*}"
+# shellcheck source=scripts/lib/common
+source "${script_dir}/lib/common"
+
+create_domain_uuid_once() {
+  ensure_private_dir "$STATE_DIR"
+  if [ ! -f "$DOMAIN_UUID_FILE" ]; then
+    write_secret_file "$DOMAIN_UUID_FILE" "$(uuidgen)"
+  fi
+}
+
+validate_or_reject_existing_domain() {
+  local xml_path="${STATE_DIR}/existing-domain.xml"
+  local root_path
+  if virsh -c "$LIBVIRT_URI" dominfo "$DEFAULT_DOMAIN_NAME" >/dev/null 2>&1; then
+    ensure_private_dir "$STATE_DIR"
+    virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_path"
+    domain_is_project_owned "$xml_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME is not owned by this project"
+    domain_uuid_matches_state "$xml_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME UUID does not match $DOMAIN_UUID_FILE"
+    domain_root_volume_matches_state "$xml_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME does not reference $ROOT_VOLUME_NAME"
+    if ! virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+      >/dev/null 2>&1; then
+      fail "existing domain $DEFAULT_DOMAIN_NAME root volume $ROOT_VOLUME_NAME is missing"
+    fi
+    root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
+    domain_disk_source_matches "$xml_path" "$root_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME does not use root volume path $root_path"
+    return 0
+  fi
+  return 1
+}
+
+reject_root_volume_collision() {
+  if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+    >/dev/null 2>&1; then
+    fail "existing root volume $ROOT_VOLUME_NAME is not adopted without matching domain"
+  fi
+}
+
+create_root_volume() {
+  reject_root_volume_collision
+  virsh -c "$LIBVIRT_URI" vol-create-as "$STORAGE_POOL" "$ROOT_VOLUME_NAME" 40G \
+    --format qcow2
+}
+
+create_redfish_runtime_state() {
+  :
+}
+
+rollback_new_root_volume() {
+  virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
+}
+
+create_new_domain() {
+  local root_path
+  create_root_volume
+  if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
+    "$ROOT_VOLUME_NAME")"; then
+    rollback_new_root_volume
+    fail "failed to resolve root volume path for $ROOT_VOLUME_NAME"
+  fi
+  if ! VM_X86_REDFISH_ROOT_VOLUME_PATH="$root_path" ./scripts/render-config domain; then
+    rollback_new_root_volume
+    fail "failed to render domain XML for $DEFAULT_DOMAIN_NAME"
+  fi
+  if ! virsh -c "$LIBVIRT_URI" define "${STATE_DIR}/domain.xml"; then
+    rollback_new_root_volume
+    fail "failed to define libvirt domain $DEFAULT_DOMAIN_NAME"
+  fi
+}
+
+create_vm_transaction() {
+  if validate_or_reject_existing_domain; then
+    create_redfish_runtime_state
+    return 0
+  fi
+  reject_root_volume_collision
+  create_domain_uuid_once
+  create_new_domain
+  create_redfish_runtime_state
+}
+
+with_lifecycle_lock "$LIFECYCLE_LOCK" create_vm_transaction

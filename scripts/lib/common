@@ -122,6 +122,73 @@ with_lifecycle_lock() {
   "$@"
 }
 
+xml_text_equals() {
+  local xml="$1"
+  local namespace="$2"
+  local name="$3"
+  local expected="$4"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$xml" "$namespace" "$name" "$expected" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, namespace, name, expected = sys.argv[1:]
+target = f"{{{namespace}}}{name}" if namespace else name
+root = ET.parse(xml_path).getroot()
+for elem in root.iter(target):
+    if (elem.text or "") == expected:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+xml_disk_source_equals() {
+  local xml="$1"
+  local expected="$2"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$xml" "$expected" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, expected = sys.argv[1:]
+root = ET.parse(xml_path).getroot()
+for disk in root.findall(".//disk"):
+    if disk.get("device") != "disk":
+        continue
+    source = disk.find("source")
+    if source is not None and source.get("file") == expected:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+domain_is_project_owned() {
+  local xml="$1"
+  xml_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+    "project" "vm-x86-redfish"
+}
+
+domain_uuid_matches_state() {
+  local xml="$1"
+  local uuid
+  uuid="$(read_domain_uuid)"
+  xml_text_equals "$xml" "" "uuid" "$uuid"
+}
+
+domain_root_volume_matches_state() {
+  local xml="$1"
+  xml_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+    "root-volume" "$ROOT_VOLUME_NAME"
+}
+
+domain_disk_source_matches() {
+  local xml="$1"
+  local root_path="$2"
+  xml_disk_source_equals "$xml" "$root_path"
+}
+
 volume_name_for_media() {
   local image_url="$1"
   local domain_uuid="$2"
