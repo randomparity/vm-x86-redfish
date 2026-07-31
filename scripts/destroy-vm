@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="${BASH_SOURCE[0]%/*}"
+# shellcheck source=scripts/lib/common
+source "${script_dir}/lib/common"
+
+media_volume_matches_uuid() {
+  local name="$1"
+  local uuid="$2"
+  [[ "$name" =~ ^[^/]+-"$uuid"\.img$ ]]
+}
+
+cleanup_project_state_files() {
+  local file path
+  for file in domain.xml destroy-domain.xml destroy-domain.current.xml \
+    existing-domain.xml domain-uuid credentials.env htpasswd tls.crt tls.key \
+    connection.env sushy-emulator.conf.py; do
+    path="${STATE_DIR}/${file}"
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+      fail "unexpected project state file: $path"
+    fi
+    [ -f "$path" ] && rm -- "$path"
+  done
+  return 0
+}
+
+cleanup_tmp_child_dir() {
+  local child="$1"
+  local entry
+  reject_symlink "$child"
+  while IFS= read -r -d '' entry; do
+    if [ -f "$entry" ] && [ ! -L "$entry" ]; then
+      rm -- "$entry"
+    else
+      fail "unexpected entry in Sushy temporary directory: $entry"
+    fi
+  done < <(find "$child" -mindepth 1 -maxdepth 1 -print0)
+  rmdir "$child" || fail "Sushy temporary directory is not empty: $child"
+}
+
+cleanup_tmpdir() {
+  local entry tmpdir
+  [ -e "${STATE_DIR}/tmp" ] || return 0
+  require_private_dir "${STATE_DIR}/tmp"
+  tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
+  while IFS= read -r -d '' entry; do
+    if [ -f "$entry" ] && [ ! -L "$entry" ]; then
+      rm -- "$entry"
+    elif [ -d "$entry" ] && [ ! -L "$entry" ]; then
+      cleanup_tmp_child_dir "$entry"
+    else
+      fail "unexpected entry in temporary directory: $entry"
+    fi
+  done < <(find "$tmpdir" -mindepth 1 -maxdepth 1 -print0)
+  rmdir "$tmpdir" || fail "temporary directory is not empty after cleanup: $tmpdir"
+}
+
+delete_uuid_media_volumes() {
+  local uuid="$1"
+  local volume
+  local volumes
+  if ! volumes="$(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)"; then
+    fail "failed to list volumes in libvirt pool $STORAGE_POOL"
+  fi
+  while IFS= read -r volume; do
+    [ -n "$volume" ] || continue
+    if media_volume_matches_uuid "$volume" "$uuid"; then
+      virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$volume"
+    fi
+  done <<<"$volumes"
+}
+
+validate_destroy_proof() {
+  local proof_path="$1"
+  local root_path
+  domain_is_project_owned "$proof_path" ||
+    fail "stored destroy proof is not owned by this project"
+  domain_uuid_matches_state "$proof_path" ||
+    fail "stored destroy proof UUID does not match $DOMAIN_UUID_FILE"
+  domain_root_volume_matches_state "$proof_path" ||
+    fail "stored destroy proof does not reference $ROOT_VOLUME_NAME"
+  if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+    >/dev/null 2>&1; then
+    if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
+      "$ROOT_VOLUME_NAME")"; then
+      fail "cannot resolve root volume path for $ROOT_VOLUME_NAME"
+    fi
+    domain_disk_source_matches "$proof_path" "$root_path" ||
+      fail "stored destroy proof has unexpected disk source"
+  fi
+}
+
+cleanup_absent_domain() {
+  local proof_path="$1"
+  local uuid="$2"
+  if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+    >/dev/null 2>&1; then
+    [ -f "$proof_path" ] ||
+      fail "cannot prove ownership of $ROOT_VOLUME_NAME without domain metadata"
+    validate_destroy_proof "$proof_path"
+    virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
+  fi
+  delete_uuid_media_volumes "$uuid"
+  cleanup_tmpdir
+  printf 'destroy: domain %s is already absent\n' "$DEFAULT_DOMAIN_NAME"
+  cleanup_project_state_files
+}
+
+destroy_domain_if_active() {
+  local state
+  state="$(virsh -c "$LIBVIRT_URI" domstate "$DEFAULT_DOMAIN_NAME")"
+  case "$state" in
+  "shut off") return 0 ;;
+  *) virsh -c "$LIBVIRT_URI" destroy "$DEFAULT_DOMAIN_NAME" ;;
+  esac
+}
+
+destroy_transaction() {
+  local root_path uuid xml_path xml_probe
+  if [ ! -f "$DOMAIN_UUID_FILE" ]; then
+    printf 'destroy: no project state found\n'
+    return 0
+  fi
+  uuid="$(read_domain_uuid)"
+  xml_path="${STATE_DIR}/destroy-domain.xml"
+  xml_probe="${STATE_DIR}/destroy-domain.current.xml"
+  if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_probe"; then
+    cleanup_absent_domain "$xml_path" "$uuid"
+    return 0
+  fi
+  mv -- "$xml_probe" "$xml_path"
+  domain_is_project_owned "$xml_path" ||
+    fail "refusing to destroy unowned domain $DEFAULT_DOMAIN_NAME"
+  domain_uuid_matches_state "$xml_path" ||
+    fail "refusing to destroy $DEFAULT_DOMAIN_NAME with mismatched UUID"
+  domain_root_volume_matches_state "$xml_path" ||
+    fail "existing domain $DEFAULT_DOMAIN_NAME does not reference $ROOT_VOLUME_NAME"
+  if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
+    "$ROOT_VOLUME_NAME")"; then
+    fail "cannot resolve root volume path for $ROOT_VOLUME_NAME"
+  fi
+  domain_disk_source_matches "$xml_path" "$root_path" ||
+    fail "refusing to destroy $DEFAULT_DOMAIN_NAME with unexpected disk source"
+
+  destroy_domain_if_active
+  virsh -c "$LIBVIRT_URI" undefine "$DEFAULT_DOMAIN_NAME" --nvram
+  if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+    >/dev/null 2>&1; then
+    virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
+  fi
+  delete_uuid_media_volumes "$uuid"
+  cleanup_tmpdir
+  cleanup_project_state_files
+}
+
+with_lifecycle_lock "$LIFECYCLE_LOCK" destroy_transaction

@@ -13,5 +13,5 @@ which create non-x86 architecture VMs for testing.
 - `make redfish`: run the loopback Redfish service in the foreground.
 - `make test`: run offline tests and static checks.
 - `make test-integration`: run opt-in host integration tests.
-- `make destroy`: remove only project-owned VM resources.
+- `make destroy`: owner-gated, idempotent cleanup of project VM state, media, and temp files.
 - `make clean`: alias for `make destroy`.
