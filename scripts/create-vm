@@ -50,7 +50,43 @@ create_root_volume() {
 }
 
 create_redfish_runtime_state() {
-  :
+  create_redfish_credentials_once
+  create_tls_once
+  write_connection_metadata
+  ./scripts/render-config sushy
+}
+
+create_redfish_credentials_once() {
+  local password
+  if [ ! -f "${STATE_DIR}/credentials.env" ]; then
+    password="$(openssl rand -base64 30)"
+    write_secret_file "${STATE_DIR}/credentials.env" \
+      "REDFISH_USERNAME='admin'
+REDFISH_PASSWORD='${password}'"
+  fi
+  # shellcheck disable=SC1091
+  source "${STATE_DIR}/credentials.env"
+  printf '%s\n' "$REDFISH_PASSWORD" |
+    htpasswd -iB -c "${STATE_DIR}/htpasswd" "$REDFISH_USERNAME" >/dev/null
+  chmod 600 "${STATE_DIR}/htpasswd"
+}
+
+create_tls_once() {
+  if [ ! -f "${STATE_DIR}/tls.crt" ] || [ ! -f "${STATE_DIR}/tls.key" ]; then
+    openssl req -x509 -newkey rsa:3072 -sha256 -days 365 -nodes \
+      -subj "/CN=localhost" \
+      -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+      -keyout "${STATE_DIR}/tls.key" \
+      -out "${STATE_DIR}/tls.crt"
+    chmod 600 "${STATE_DIR}/tls.key" "${STATE_DIR}/tls.crt"
+  fi
+}
+
+write_connection_metadata() {
+  write_secret_file "${STATE_DIR}/connection.env" \
+    "REDFISH_ENDPOINT='https://127.0.0.1:8000'
+REDFISH_CA_CERT='${STATE_DIR}/tls.crt'
+REDFISH_CREDENTIALS_FILE='${STATE_DIR}/credentials.env'"
 }
 
 rollback_new_root_volume() {

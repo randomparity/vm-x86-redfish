@@ -18,15 +18,16 @@ import sys
 
 source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 replacements = {
-    "@DOMAIN_NAME@": os.environ["DOMAIN_NAME"],
-    "@DOMAIN_UUID@": os.environ["DOMAIN_UUID"],
-    "@ROOT_VOLUME_NAME@": os.environ["ROOT_VOLUME_NAME"],
-    "@ROOT_VOLUME_PATH@": os.environ["ROOT_VOLUME_PATH"],
-    "@STATE_DIR@": os.environ["STATE_DIR"],
+    "@DOMAIN_NAME@": os.environ.get("DOMAIN_NAME"),
+    "@DOMAIN_UUID@": os.environ.get("DOMAIN_UUID"),
+    "@ROOT_VOLUME_NAME@": os.environ.get("ROOT_VOLUME_NAME"),
+    "@ROOT_VOLUME_PATH@": os.environ.get("ROOT_VOLUME_PATH"),
+    "@STATE_DIR@": os.environ.get("STATE_DIR"),
 }
 rendered = source
 for key, value in replacements.items():
-    rendered = rendered.replace(key, value)
+    if value is not None:
+        rendered = rendered.replace(key, value)
 pathlib.Path(sys.argv[2]).write_text(rendered, encoding="utf-8")
 PY
 }
@@ -42,7 +43,19 @@ render_domain() {
   render_template "${repo_dir}/config/domain.xml" "${STATE_DIR}/domain.xml"
 }
 
+render_sushy() {
+  ensure_private_dir "$STATE_DIR"
+  ensure_private_dir "${STATE_DIR}/sushy"
+  ensure_private_dir "${STATE_DIR}/tmp"
+  export DOMAIN_UUID
+  export STATE_DIR
+  DOMAIN_UUID="$(read_domain_uuid)"
+  render_template "${repo_dir}/config/sushy-emulator.conf.py.in" \
+    "${STATE_DIR}/sushy-emulator.conf.py"
+}
+
 case "${1:-}" in
 domain) render_domain ;;
-*) fail "usage: scripts/render-config domain" ;;
+sushy) render_sushy ;;
+*) fail "usage: scripts/render-config domain|sushy" ;;
 esac

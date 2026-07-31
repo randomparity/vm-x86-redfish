@@ -100,6 +100,24 @@ load "helpers/test-helper"
   [ -f "$BATS_TEST_TMPDIR/state/domain.xml" ]
 }
 
+@test "render-config writes Sushy config with private runtime directories" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" run ./scripts/render-config sushy
+
+  [ "$status" -eq 0 ]
+  [ "$(stat -c "%a" "$BATS_TEST_TMPDIR/state/sushy")" = "700" ]
+  [ "$(stat -c "%a" "$BATS_TEST_TMPDIR/state/tmp")" = "700" ]
+  run grep -F 'SUSHY_EMULATOR_ALLOWED_INSTANCES = ["123e4567-e89b-42d3-a456-426614174000"]' \
+    "$BATS_TEST_TMPDIR/state/sushy-emulator.conf.py"
+  [ "$status" -eq 0 ]
+  run grep -F "SUSHY_EMULATOR_STATE_DIR = \"$BATS_TEST_TMPDIR/state/sushy\"" \
+    "$BATS_TEST_TMPDIR/state/sushy-emulator.conf.py"
+  [ "$status" -eq 0 ]
+}
+
 @test "ensure_private_dir creates mode 0700 directory" {
   run bash -c '
     source scripts/lib/common
