@@ -157,12 +157,14 @@ operator workflows rather than wrapping Redfish itself.
   >./scripts/destroy-vm
 
   BATS_TESTS := $(wildcard tests/*.bats)
-  SHELL_PATHS := $(wildcard scripts/* scripts/lib/*)
+  SHELL_SCRIPTS := $(wildcard scripts/doctor scripts/create-vm scripts/destroy-vm)
+  SHELL_SCRIPTS += $(wildcard scripts/render-config scripts/run-redfish scripts/lib/common)
+  SHFMT_PATHS := $(wildcard scripts tests)
 
   test:
   >@if [ -n "$(BATS_TESTS)" ]; then bats $(BATS_TESTS); fi
-  >@if [ -n "$(SHELL_PATHS)" ]; then shellcheck $(SHELL_PATHS); fi
-  >@if [ -d scripts ] || [ -d tests ]; then shfmt -i 2 -d scripts tests; fi
+  >@if [ -n "$(SHELL_SCRIPTS)" ]; then shellcheck $(SHELL_SCRIPTS); fi
+  >@if [ -n "$(SHFMT_PATHS)" ]; then shfmt -i 2 -d $(SHFMT_PATHS); fi
   >@if [ -f config/sushy-emulator.conf.py.in ]; then \
   >  uv run python -m py_compile config/sushy-emulator.conf.py.in; \
   >fi
@@ -325,9 +327,11 @@ operator workflows rather than wrapping Redfish itself.
 - Produces shell constants: `PROJECT_NAME`, `DEFAULT_DOMAIN_NAME`, `LIBVIRT_URI`,
   `STATE_DIR`, `ARTIFACTS_DIR`, `ROOT_VOLUME_NAME`, `DOMAIN_UUID_FILE`, and
   `LIFECYCLE_LOCK`.
-- Produces functions: `repo_root`, `state_path`, `artifact_path`, `fail`, `need_command`,
-  `canonical_dir`, `ensure_private_dir`, `reject_symlink`, `with_lifecycle_lock`,
-  `read_domain_uuid`, `write_secret_file`, and `volume_name_for_media`.
+- Produces functions: `repo_root`, `fail`, `need_command`, `canonical_dir`,
+  `ensure_private_dir`, `reject_symlink`, `with_lifecycle_lock`, `read_domain_uuid`,
+  `write_secret_file`, `volume_name_for_media`, and `load_runtime_config`.
+- Rejects test-only override variables from every lifecycle entry point unless
+  `VM_X86_REDFISH_INTEGRATION_TEST=1`.
 
 - [ ] **Step 1: Write tests for private state validation and media volume names**
 
@@ -390,12 +394,12 @@ operator workflows rather than wrapping Redfish itself.
   set -euo pipefail
 
   PROJECT_NAME="vm-x86-redfish"
-  DEFAULT_DOMAIN_NAME="${VM_X86_REDFISH_DOMAIN_NAME:-vm-x86-redfish}"
-  LIBVIRT_URI="${VM_X86_REDFISH_LIBVIRT_URI:-qemu:///system}"
-  STORAGE_POOL="${VM_X86_REDFISH_STORAGE_POOL:-default}"
-  STATE_DIR="${VM_X86_REDFISH_STATE_DIR:-.state}"
-  ARTIFACTS_DIR="${VM_X86_REDFISH_ARTIFACTS_DIR:-.artifacts}"
-  ROOT_VOLUME_NAME="${VM_X86_REDFISH_ROOT_VOLUME_NAME:-${DEFAULT_DOMAIN_NAME}.qcow2}"
+  DEFAULT_DOMAIN_NAME="vm-x86-redfish"
+  LIBVIRT_URI="qemu:///system"
+  STORAGE_POOL="default"
+  STATE_DIR=".state"
+  ARTIFACTS_DIR=".artifacts"
+  ROOT_VOLUME_NAME="vm-x86-redfish.qcow2"
   DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
   LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
 
@@ -411,6 +415,34 @@ operator workflows rather than wrapping Redfish itself.
   need_command() {
     command -v "$1" >/dev/null 2>&1 || fail "missing command '$1': install $2"
   }
+
+  integration_override_enabled() {
+    [ "${VM_X86_REDFISH_INTEGRATION_TEST:-}" = "1" ]
+  }
+
+  reject_unguarded_override() {
+    local name="$1"
+    if [ -n "${!name:-}" ] && ! integration_override_enabled; then
+      fail "test-only overrides require VM_X86_REDFISH_INTEGRATION_TEST=1"
+    fi
+  }
+
+  load_runtime_config() {
+    reject_unguarded_override VM_X86_REDFISH_DOMAIN_NAME
+    reject_unguarded_override VM_X86_REDFISH_ROOT_VOLUME_NAME
+    reject_unguarded_override VM_X86_REDFISH_STATE_DIR
+    reject_unguarded_override VM_X86_REDFISH_ARTIFACTS_DIR
+    DEFAULT_DOMAIN_NAME="${VM_X86_REDFISH_DOMAIN_NAME:-vm-x86-redfish}"
+    LIBVIRT_URI="${VM_X86_REDFISH_LIBVIRT_URI:-qemu:///system}"
+    STORAGE_POOL="${VM_X86_REDFISH_STORAGE_POOL:-default}"
+    STATE_DIR="${VM_X86_REDFISH_STATE_DIR:-.state}"
+    ARTIFACTS_DIR="${VM_X86_REDFISH_ARTIFACTS_DIR:-.artifacts}"
+    ROOT_VOLUME_NAME="${VM_X86_REDFISH_ROOT_VOLUME_NAME:-${DEFAULT_DOMAIN_NAME}.qcow2}"
+    DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
+    LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
+  }
+
+  load_runtime_config
 
   reject_symlink() {
     local path="$1"
@@ -490,10 +522,18 @@ operator workflows rather than wrapping Redfish itself.
       'printf "%s %s\n" "$(basename "$0")" "$*" >>"$BATS_TEST_TMPDIR/commands.log"'
   }
 
-  setup() {
+  setup_test_workspace() {
     export REPO_ROOT
     REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
     cd "$REPO_ROOT"
+    export VM_X86_REDFISH_INTEGRATION_TEST=1
+    export VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state"
+    export VM_X86_REDFISH_ARTIFACTS_DIR="$BATS_TEST_TMPDIR/artifacts"
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_ARTIFACTS_DIR"
+  }
+
+  setup() {
+    setup_test_workspace
   }
   ```
 
@@ -537,25 +577,18 @@ operator workflows rather than wrapping Redfish itself.
   load "helpers/test-helper"
 
   @test "doctor reports missing qemu-img with Fedora package hint" {
-    mkdir -p "$BATS_TEST_TMPDIR/bin"
-    cat >"$BATS_TEST_TMPDIR/bin/uname" <<'SH'
-  #!/usr/bin/env bash
-  printf 'x86_64\n'
-  SH
-    chmod +x "$BATS_TEST_TMPDIR/bin/uname"
-    PATH="$BATS_TEST_TMPDIR/bin" run ./scripts/doctor
+    bash_bin="$(command -v bash)"
+    install_mock_command uname 'printf "x86_64\n"'
+    install_mock_command virsh 'exit 0'
+    install_mock_command qemu-system-x86_64 'exit 0'
+    PATH="$BATS_TEST_TMPDIR/bin" run "$bash_bin" ./scripts/doctor
     [ "$status" -ne 0 ]
     [[ "$output" == *"missing command 'qemu-img': install qemu-img"* ]]
   }
 
   @test "doctor rejects non-x86_64 hosts" {
-    mkdir -p "$BATS_TEST_TMPDIR/bin"
-    cat >"$BATS_TEST_TMPDIR/bin/uname" <<'SH'
-  #!/usr/bin/env bash
-  printf 'aarch64\n'
-  SH
-    chmod +x "$BATS_TEST_TMPDIR/bin/uname"
-    PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" run ./scripts/doctor
+    install_mock_command uname 'printf "aarch64\n"'
+    PATH="$BATS_TEST_TMPDIR/bin:$PATH" run ./scripts/doctor
     [ "$status" -ne 0 ]
     [[ "$output" == *"unsupported architecture aarch64; expected x86_64"* ]]
   }
@@ -579,7 +612,8 @@ operator workflows rather than wrapping Redfish itself.
   #!/usr/bin/env bash
   set -euo pipefail
 
-  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+  script_dir="${BASH_SOURCE[0]%/*}"
+  source "${script_dir}/lib/common"
 
   check_architecture() {
     local arch
@@ -589,6 +623,7 @@ operator workflows rather than wrapping Redfish itself.
 
   check_commands() {
     need_command virsh "libvirt-client"
+    need_command qemu-system-x86_64 "qemu-system-x86-core"
     need_command qemu-img "qemu-img"
     need_command uv "uv"
     need_command curl "curl"
@@ -602,26 +637,85 @@ operator workflows rather than wrapping Redfish itself.
   }
 
   check_libvirt() {
+    local version
     virsh -c "$LIBVIRT_URI" uri >/dev/null ||
       fail "cannot connect to $LIBVIRT_URI: enable libvirtd and grant access"
+    version="$(virsh -c "$LIBVIRT_URI" version)"
+    printf '%s\n' "$version" | grep -F "Using library: libvirt 12.0." >/dev/null ||
+      fail "unsupported libvirt version: expected 12.0.x"
     virsh -c "$LIBVIRT_URI" net-info default >/dev/null ||
       fail "libvirt default network is unavailable: start it with virsh net-start default"
     virsh -c "$LIBVIRT_URI" pool-info "$STORAGE_POOL" >/dev/null ||
       fail "libvirt storage pool '$STORAGE_POOL' is unavailable"
   }
 
+  kvm_device_path() {
+    if integration_override_enabled && [ -n "${VM_X86_REDFISH_DEV_KVM:-}" ]; then
+      printf '%s\n' "$VM_X86_REDFISH_DEV_KVM"
+    else
+      printf '/dev/kvm\n'
+    fi
+  }
+
+  ovmf_dir_path() {
+    if integration_override_enabled && [ -n "${VM_X86_REDFISH_OVMF_DIR:-}" ]; then
+      printf '%s\n' "$VM_X86_REDFISH_OVMF_DIR"
+    elif [ -d /usr/share/edk2/ovmf ]; then
+      printf '/usr/share/edk2/ovmf\n'
+    else
+      printf '/usr/share/OVMF\n'
+    fi
+  }
+
+  check_kvm() {
+    local kvm_path
+    kvm_path="$(kvm_device_path)"
+    [ -e "$kvm_path" ] || fail "missing $kvm_path: enable KVM virtualization"
+    [ -r "$kvm_path" ] && [ -w "$kvm_path" ] ||
+      fail "cannot read and write $kvm_path: add the user to the kvm group"
+  }
+
+  check_uefi_firmware() {
+    local ovmf_dir
+    ovmf_dir="$(ovmf_dir_path)"
+    [ -d "$ovmf_dir" ] || fail "missing UEFI firmware: install edk2-ovmf"
+  }
+
+  check_uv_python() {
+    uv run python - <<'PY' || fail "uv must provide Python 3.13"
+  import sys
+  raise SystemExit(0 if sys.version_info[:2] == (3, 13) else 1)
+  PY
+  }
+
+  check_loopback_port() {
+    if integration_override_enabled &&
+      [ "${VM_X86_REDFISH_PORT_CHECK_RESULT:-}" = "busy" ]; then
+      fail "127.0.0.1:8000 is already in use"
+    fi
+    uv run python - <<'PY' || fail "127.0.0.1:8000 is already in use"
+  import socket
+  with socket.socket() as sock:
+      sock.bind(("127.0.0.1", 8000))
+  PY
+  }
+
   check_architecture
   check_commands
+  check_kvm
+  check_uefi_firmware
+  check_uv_python
+  check_loopback_port
   check_libvirt
   printf 'doctor: host prerequisites are available\n'
   ```
 
-- [ ] **Step 4: Add libvirt mock-boundary tests**
+- [ ] **Step 4: Add full Host Contract mock-boundary tests**
 
   Extend `tests/doctor.bats` with:
 
   ```bash
-  @test "doctor checks libvirt URI, default network, and default pool" {
+  @test "doctor checks KVM, Python 3.13, port 8000, libvirt, network, and pool" {
     install_mock_command virsh '
   printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
   case "$*" in
@@ -634,20 +728,61 @@ operator workflows rather than wrapping Redfish itself.
     "-c qemu:///system pool-info default")
       exit 0
       ;;
+    "-c qemu:///system version")
+      printf "Using library: libvirt 12.0.0\n"
+      ;;
     *)
       exit 2
       ;;
   esac
   '
-    for command in qemu-img uv curl openssl htpasswd bats shellcheck shfmt \
+    install_mock_command uv '
+  printf "uv %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  exit 0
+  '
+    for command in qemu-system-x86_64 qemu-img curl openssl htpasswd bats shellcheck shfmt \
       grub2-mkrescue xorriso; do
       install_recording_noop "$command"
     done
-    run ./scripts/doctor
+    mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
+    touch "$BATS_TEST_TMPDIR/dev/kvm"
+    VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm" \
+      VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf" \
+      run ./scripts/doctor
     [ "$status" -eq 0 ]
     [[ "$output" == *"doctor: host prerequisites are available"* ]]
-    run grep -F "virsh -c qemu:///system uri" "$BATS_TEST_TMPDIR/commands.log"
+    run grep -F "virsh -c qemu:///system version" "$BATS_TEST_TMPDIR/commands.log"
     [ "$status" -eq 0 ]
+  }
+
+  @test "doctor rejects unavailable loopback port 8000" {
+    install_all_doctor_success_mocks
+    VM_X86_REDFISH_PORT_CHECK_RESULT=busy run ./scripts/doctor
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"127.0.0.1:8000 is already in use"* ]]
+  }
+  ```
+
+  Add this helper to `tests/doctor.bats` before the unavailable-port test:
+
+  ```bash
+  install_all_doctor_success_mocks() {
+    install_mock_command virsh '
+  case "$*" in
+    *"version") printf "Using library: libvirt 12.0.0\n" ;;
+    *) exit 0 ;;
+  esac
+  '
+    install_mock_command uv 'exit 0'
+    for command in uname qemu-system-x86_64 qemu-img curl openssl htpasswd bats shellcheck \
+      shfmt grub2-mkrescue xorriso; do
+      install_recording_noop "$command"
+    done
+    install_mock_command uname 'printf "x86_64\n"'
+    mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
+    touch "$BATS_TEST_TMPDIR/dev/kvm"
+    export VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm"
+    export VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
   }
   ```
 
@@ -791,7 +926,8 @@ operator workflows rather than wrapping Redfish itself.
   #!/usr/bin/env bash
   set -euo pipefail
 
-  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+  script_dir="${BASH_SOURCE[0]%/*}"
+  source "${script_dir}/lib/common"
 
   render_template() {
     local input="$1"
@@ -875,7 +1011,7 @@ operator workflows rather than wrapping Redfish itself.
   load "helpers/test-helper"
 
   setup() {
-    mkdir -p .state
+    setup_test_workspace
     install_mock_command uuidgen \
       'printf "11111111-2222-3333-4444-555555555555\n"'
   }
@@ -887,7 +1023,10 @@ operator workflows rather than wrapping Redfish itself.
     *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
       exit 1
       ;;
-    *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2"|*"define .state/domain.xml")
+    *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2")
+      exit 0
+      ;;
+    *"define "*"/domain.xml")
       exit 0
       ;;
     *"vol-path --pool default vm-x86-redfish.qcow2")
@@ -900,7 +1039,8 @@ operator workflows rather than wrapping Redfish itself.
   '
     run ./scripts/create-vm
     [ "$status" -eq 0 ]
-    [ "$(cat .state/domain-uuid)" = "11111111-2222-3333-4444-555555555555" ]
+    [ "$(cat "$VM_X86_REDFISH_STATE_DIR/domain-uuid")" = \
+      "11111111-2222-3333-4444-555555555555" ]
     run grep -F "vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2" \
       "$BATS_TEST_TMPDIR/commands.log"
     [ "$status" -eq 0 ]
@@ -939,7 +1079,7 @@ operator workflows rather than wrapping Redfish itself.
     *"vol-path --pool default vm-x86-redfish.qcow2")
       printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
       ;;
-    *"define .state/domain.xml")
+    *"define "*"/domain.xml")
       exit 1
       ;;
     *"vol-delete --pool default vm-x86-redfish.qcow2")
@@ -985,9 +1125,6 @@ operator workflows rather than wrapping Redfish itself.
     grep -F "<uuid>${uuid}</uuid>" "$xml" >/dev/null
   }
 
-  integration_override_enabled() {
-    [ "${VM_X86_REDFISH_INTEGRATION_TEST:-}" = "1" ]
-  }
   ```
 
 - [ ] **Step 4: Implement create-vm transaction**
@@ -998,7 +1135,8 @@ operator workflows rather than wrapping Redfish itself.
   #!/usr/bin/env bash
   set -euo pipefail
 
-  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+  script_dir="${BASH_SOURCE[0]%/*}"
+  source "${script_dir}/lib/common"
 
   create_domain_uuid_once() {
     ensure_private_dir "$STATE_DIR"
@@ -1064,6 +1202,14 @@ operator workflows rather than wrapping Redfish itself.
   error: test-only overrides require VM_X86_REDFISH_INTEGRATION_TEST=1
   ```
 
+  Add matching tests to `tests/destroy-vm.bats` in Task 8 and `tests/render-config.bats` in
+  Task 7 so `scripts/destroy-vm` and `scripts/run-redfish` fail with the same message when
+  any of those override variables is set without the guard. The implementation belongs in
+  `scripts/lib/common` from Task 2, not in `scripts/create-vm`, so every entry point gets
+  the same boundary by sourcing the library. Because `setup_test_workspace` sets
+  `VM_X86_REDFISH_INTEGRATION_TEST=1` for ordinary tests, these guard tests must invoke the
+  target through `env -u VM_X86_REDFISH_INTEGRATION_TEST`.
+
 - [ ] **Step 6: Run create guardrails and commit**
 
   Run:
@@ -1107,11 +1253,13 @@ operator workflows rather than wrapping Redfish itself.
   @test "create-vm writes private Redfish credentials and connection metadata" {
     run ./scripts/create-vm
     [ "$status" -eq 0 ]
-    [ "$(stat -c "%a" .state/credentials.env)" = "600" ]
-    [ "$(stat -c "%a" .state/htpasswd)" = "600" ]
-    [ "$(stat -c "%a" .state/tls.key)" = "600" ]
-    grep -F "REDFISH_ENDPOINT=https://127.0.0.1:8000" .state/connection.env
-    grep -F "REDFISH_CREDENTIALS_FILE=.state/credentials.env" .state/connection.env
+    [ "$(stat -c "%a" "$VM_X86_REDFISH_STATE_DIR/credentials.env")" = "600" ]
+    [ "$(stat -c "%a" "$VM_X86_REDFISH_STATE_DIR/htpasswd")" = "600" ]
+    [ "$(stat -c "%a" "$VM_X86_REDFISH_STATE_DIR/tls.key")" = "600" ]
+    grep -F "REDFISH_ENDPOINT=https://127.0.0.1:8000" \
+      "$VM_X86_REDFISH_STATE_DIR/connection.env"
+    grep -F "REDFISH_CREDENTIALS_FILE=$VM_X86_REDFISH_STATE_DIR/credentials.env" \
+      "$VM_X86_REDFISH_STATE_DIR/connection.env"
   }
   ```
 
@@ -1228,8 +1376,8 @@ operator workflows rather than wrapping Redfish itself.
 
   ```bash
   @test "run-redfish refuses when lifecycle lock is held" {
-    mkdir -p .state
-    exec 8>.state/lifecycle.lock
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR"
+    exec 8>"$VM_X86_REDFISH_STATE_DIR/lifecycle.lock"
     flock -n 8
     run ./scripts/run-redfish
     [ "$status" -ne 0 ]
@@ -1237,14 +1385,14 @@ operator workflows rather than wrapping Redfish itself.
   }
 
   @test "run-redfish sets TMPDIR and execs sushy-emulator" {
-    mkdir -p .state/tmp
-    touch .state/sushy-emulator.conf.py
-    chmod 700 .state .state/tmp
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
+    touch "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+    chmod 700 "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_STATE_DIR/tmp"
     install_mock_command uv 'printf "TMPDIR=%s\nCONFIG=%s\n" "$TMPDIR" "$*"'
     run ./scripts/run-redfish
     [ "$status" -eq 0 ]
-    [[ "$output" == *"TMPDIR="*"/.state/tmp"* ]]
-    [[ "$output" == *"run sushy-emulator --config .state/sushy-emulator.conf.py"* ]]
+    [[ "$output" == *"TMPDIR=$VM_X86_REDFISH_STATE_DIR/tmp"* ]]
+    [[ "$output" == *"run sushy-emulator --config "*"/sushy-emulator.conf.py"* ]]
   }
   ```
 
@@ -1266,7 +1414,8 @@ operator workflows rather than wrapping Redfish itself.
   #!/usr/bin/env bash
   set -euo pipefail
 
-  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+  script_dir="${BASH_SOURCE[0]%/*}"
+  source "${script_dir}/lib/common"
 
   run_redfish() {
     local tmpdir
@@ -1321,11 +1470,12 @@ operator workflows rather than wrapping Redfish itself.
   load "helpers/test-helper"
 
   setup() {
-    mkdir -p .state
+    setup_test_workspace
   }
 
   @test "destroy-vm refuses domain with mismatched ownership" {
-    printf '11111111-2222-3333-4444-555555555555\n' >.state/domain-uuid
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
     install_mock_command virsh '
   printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
   case "$*" in
@@ -1343,7 +1493,8 @@ operator workflows rather than wrapping Redfish itself.
   }
 
   @test "destroy-vm deletes only root and anchored uuid media volumes" {
-    printf '11111111-2222-3333-4444-555555555555\n' >.state/domain-uuid
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
     install_mock_command virsh '
   printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
   case "$*" in
@@ -1399,7 +1550,8 @@ operator workflows rather than wrapping Redfish itself.
   #!/usr/bin/env bash
   set -euo pipefail
 
-  source "$(dirname "${BASH_SOURCE[0]}")/lib/common"
+  script_dir="${BASH_SOURCE[0]%/*}"
+  source "${script_dir}/lib/common"
 
   media_volume_matches_uuid() {
     local name="$1"
@@ -1498,12 +1650,11 @@ operator workflows rather than wrapping Redfish itself.
   load "helpers/test-helper"
 
   setup() {
+    setup_test_workspace
     export TEST_ID="redfish-${BATS_TEST_NUMBER}-$$"
     export VM_X86_REDFISH_INTEGRATION_TEST=1
     export VM_X86_REDFISH_DOMAIN_NAME="vm-x86-redfish-${TEST_ID}"
     export VM_X86_REDFISH_ROOT_VOLUME_NAME="vm-x86-redfish-${TEST_ID}.qcow2"
-    export VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state"
-    mkdir -p "$VM_X86_REDFISH_STATE_DIR"
   }
 
   teardown() {
@@ -1580,7 +1731,7 @@ operator workflows rather than wrapping Redfish itself.
 
 - [ ] **Step 4: Add authenticated Systems and power reset checks**
 
-  Extend the test to source `.state/credentials.env`, query
+  Extend the test to source `$VM_X86_REDFISH_STATE_DIR/credentials.env`, query
   `/redfish/v1/Systems`, use the returned UUID URL, and POST reset actions:
 
   ```bash
