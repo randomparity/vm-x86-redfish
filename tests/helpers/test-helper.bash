@@ -56,6 +56,46 @@ setup_integration_workspace() {
   mkdir -p "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_ARTIFACTS_DIR"
 }
 
+wait_for_url() {
+  local url="$1"
+  local deadline=$((SECONDS + 30))
+  until curl --silent --fail --insecure "$url" >/dev/null; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+track_child() {
+  TRACKED_CHILDREN+=("$1")
+}
+
+stop_tracked_children() {
+  local pid
+  for pid in "${TRACKED_CHILDREN[@]:-}"; do
+    stop_child "$pid"
+  done
+  TRACKED_CHILDREN=()
+}
+
+stop_child() {
+  local pid="$1"
+  if ! kill "$pid" 2>/dev/null; then
+    return 0
+  fi
+  local deadline=$((SECONDS + 10))
+  while kill -0 "$pid" 2>/dev/null; do
+    [ "$SECONDS" -lt "$deadline" ] || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid"
+  fi
+  if wait "$pid" 2>/dev/null; then
+    return 0
+  fi
+  return 0
+}
+
 setup() {
   setup_test_workspace
 }

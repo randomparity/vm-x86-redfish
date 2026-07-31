@@ -123,10 +123,10 @@ XML
   *"vol-path --pool default vm-x86-redfish.qcow2")
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
     ;;
-  *"vol-list --pool default --name")
-    printf "vm-x86-redfish.qcow2\n"
-    printf "fedora-iso-11111111-2222-4333-8444-555555555555.img\n"
-    printf "unrelated-22222222-2222-4333-8444-555555555555.img\n"
+  *"vol-list --pool default")
+    printf "vm-x86-redfish.qcow2 /var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+    printf "fedora-iso-11111111-2222-4333-8444-555555555555.img /var/lib/libvirt/images/fedora\n"
+    printf "unrelated-22222222-2222-4333-8444-555555555555.img /var/lib/libvirt/images/other\n"
     ;;
   *)
     exit 0
@@ -248,7 +248,7 @@ XML
     fi
     touch "$BATS_TEST_TMPDIR/root-delete-complete"
     ;;
-  *"vol-list --pool default --name")
+  *"vol-list --pool default")
     if [ ! -f "$BATS_TEST_TMPDIR/root-delete-complete" ]; then
       printf "vm-x86-redfish.qcow2\n"
     fi
@@ -373,7 +373,7 @@ XML
   *"vol-path --pool default vm-x86-redfish.qcow2")
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
     ;;
-  *"vol-list --pool default --name")
+  *"vol-list --pool default")
     ;;
   *)
     exit 0
@@ -398,7 +398,7 @@ case "$*" in
   *"dumpxml vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
     exit 1
     ;;
-  *"vol-list --pool default --name")
+  *"vol-list --pool default")
     printf "partial-11111111-2222-4333-8444-555555555555.img\n"
     ;;
   *)
@@ -424,7 +424,7 @@ case "$*" in
   *"dumpxml vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
     exit 1
     ;;
-  *"vol-list --pool default --name")
+  *"vol-list --pool default")
     ;;
   *)
     exit 0
@@ -448,7 +448,7 @@ case "$*" in
   *"dumpxml vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
     exit 1
     ;;
-  *"vol-list --pool default --name")
+  *"vol-list --pool default")
     ;;
   *)
     exit 0
@@ -472,7 +472,7 @@ case "$*" in
   *"dumpxml vm-x86-redfish")
     exit 1
     ;;
-  *"vol-list --pool default --name")
+  *"vol-list --pool default")
     if [ -f "$BATS_TEST_TMPDIR/root-inventory-complete" ]; then
       exit 1
     fi
@@ -500,7 +500,7 @@ case "$*" in
     ;;
   *"list --all --name")
     ;;
-  *"vol-list --pool default --name")
+  *"vol-list --pool default")
     exit 1
     ;;
   *)
@@ -523,7 +523,7 @@ case "$*" in
   *"dumpxml vm-x86-redfish")
     exit 1
     ;;
-  *"list --all --name"|*"vol-list --pool default --name")
+  *"list --all --name"|*"vol-list --pool default")
     ;;
   *)
     exit 0
@@ -547,7 +547,7 @@ case "$*" in
   *"dumpxml vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
     exit 1
     ;;
-  *"vol-list --pool default --name")
+  *"vol-list --pool default")
     ;;
   *)
     exit 0

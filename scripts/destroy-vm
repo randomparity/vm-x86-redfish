@@ -84,10 +84,10 @@ domain_exists() {
 
 volume_exists() {
   local volume volumes
-  if ! volumes="$(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)"; then
+  if ! volumes="$(virsh --quiet -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL")"; then
     fail "failed to list volumes in libvirt pool $STORAGE_POOL"
   fi
-  while IFS= read -r volume; do
+  while read -r volume _; do
     [ "$volume" = "$ROOT_VOLUME_NAME" ] && return 0
   done <<<"$volumes"
   return 1
@@ -130,10 +130,10 @@ delete_uuid_media_volumes() {
   local uuid="$1"
   local volume
   local volumes
-  if ! volumes="$(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)"; then
+  if ! volumes="$(virsh --quiet -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL")"; then
     fail "failed to list volumes in libvirt pool $STORAGE_POOL"
   fi
-  while IFS= read -r volume; do
+  while read -r volume _; do
     [ -n "$volume" ] || continue
     if media_volume_matches_uuid "$volume" "$uuid"; then
       virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$volume"
