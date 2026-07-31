@@ -330,8 +330,9 @@ operator workflows rather than wrapping Redfish itself.
   `STATE_DIR`, `ARTIFACTS_DIR`, `ROOT_VOLUME_NAME`, `DOMAIN_UUID_FILE`, and
   `LIFECYCLE_LOCK`.
 - Produces functions: `repo_root`, `fail`, `need_command`, `canonical_dir`,
-  `ensure_private_dir`, `reject_symlink`, `with_lifecycle_lock`, `read_domain_uuid`,
-  `write_secret_file`, `volume_name_for_media`, and `load_runtime_config`.
+  `ensure_private_dir`, `require_private_dir`, `reject_symlink`, `with_lifecycle_lock`,
+  `read_domain_uuid`, `write_secret_file`, `volume_name_for_media`, and
+  `load_runtime_config`.
 - Rejects test-only override variables from every lifecycle entry point unless
   `VM_X86_REDFISH_INTEGRATION_TEST=1`.
 
@@ -364,6 +365,24 @@ operator workflows rather than wrapping Redfish itself.
     '
     [ "$status" -ne 0 ]
     [[ "$output" == *"refusing symlink"* ]]
+  }
+
+  @test "require_private_dir rejects missing or loose tmp directories" {
+    run bash -c '
+      source scripts/lib/common
+      require_private_dir "$BATS_TEST_TMPDIR/missing"
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"missing private directory"* ]]
+
+    mkdir -p "$BATS_TEST_TMPDIR/tmp"
+    chmod 755 "$BATS_TEST_TMPDIR/tmp"
+    run bash -c '
+      source scripts/lib/common
+      require_private_dir "$BATS_TEST_TMPDIR/tmp"
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"directory must be mode 0700"* ]]
   }
 
   @test "media volume name replaces dots and appends domain uuid" {
@@ -462,10 +481,19 @@ operator workflows rather than wrapping Redfish itself.
     [ "$(stat -c '%a' "$path")" = "700" ] || fail "directory must be mode 0700: $path"
   }
 
+  require_private_dir() {
+    local path="$1"
+    reject_symlink "$path"
+    [ -d "$path" ] || fail "missing private directory: $path"
+    [ "$(stat -c '%u' "$path")" = "$(id -u)" ] ||
+      fail "directory must be owned by the current user: $path"
+    [ "$(stat -c '%a' "$path")" = "700" ] || fail "directory must be mode 0700: $path"
+  }
+
   canonical_dir() {
     local path="$1"
     reject_symlink "$path"
-    mkdir -p "$path"
+    [ -d "$path" ] || fail "missing directory: $path"
     realpath -e "$path"
   }
 
@@ -818,10 +846,12 @@ operator workflows rather than wrapping Redfish itself.
   ```bash
   @test "doctor does not create uv project state" {
     install_all_doctor_success_mocks
+    before="$(git status --short uv.lock .venv)"
     run ./scripts/doctor
     [ "$status" -eq 0 ]
+    after="$(git status --short uv.lock .venv)"
+    [ "$after" = "$before" ]
     [ ! -e .venv ]
-    [ ! -e uv.lock ]
   }
   ```
 
@@ -1185,6 +1215,11 @@ operator workflows rather than wrapping Redfish itself.
     grep -F "<uuid>${uuid}</uuid>" "$xml" >/dev/null
   }
 
+  domain_root_volume_matches_state() {
+    local xml="$1"
+    grep -F "<rp:root-volume>${ROOT_VOLUME_NAME}</rp:root-volume>" "$xml" >/dev/null
+  }
+
   ```
 
 - [ ] **Step 4: Implement create-vm transaction**
@@ -1213,8 +1248,7 @@ operator workflows rather than wrapping Redfish itself.
         fail "existing domain $DEFAULT_DOMAIN_NAME is not owned by this project"
       domain_uuid_matches_state "$xml_path" ||
         fail "existing domain $DEFAULT_DOMAIN_NAME UUID does not match $DOMAIN_UUID_FILE"
-      grep -F "<rp:root-volume>${ROOT_VOLUME_NAME}</rp:root-volume>" "$xml_path" \
-        >/dev/null ||
+      domain_root_volume_matches_state "$xml_path" ||
         fail "existing domain $DEFAULT_DOMAIN_NAME does not reference $ROOT_VOLUME_NAME"
       return 0
     fi
@@ -1496,6 +1530,22 @@ operator workflows rather than wrapping Redfish itself.
     [[ "$output" == *"lifecycle lock is held"* ]]
   }
 
+  @test "run-redfish rejects missing private tmp directory" {
+    touch "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+    run ./scripts/run-redfish
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"missing private directory"* ]]
+  }
+
+  @test "run-redfish rejects loose private tmp directory" {
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
+    chmod 755 "$VM_X86_REDFISH_STATE_DIR/tmp"
+    touch "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+    run ./scripts/run-redfish
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"directory must be mode 0700"* ]]
+  }
+
   @test "run-redfish sets TMPDIR and execs sushy-emulator" {
     mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
     touch "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
@@ -1533,6 +1583,7 @@ operator workflows rather than wrapping Redfish itself.
     local tmpdir
     [ -f "${STATE_DIR}/sushy-emulator.conf.py" ] ||
       fail "missing ${STATE_DIR}/sushy-emulator.conf.py: run make create first"
+    require_private_dir "${STATE_DIR}/tmp"
     tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
     export TMPDIR="$tmpdir"
     exec uv run sushy-emulator --config "${STATE_DIR}/sushy-emulator.conf.py"
@@ -1627,7 +1678,10 @@ operator workflows rather than wrapping Redfish itself.
       cat <<XML
   <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
     <uuid>11111111-2222-3333-4444-555555555555</uuid>
-    <metadata><rp:project>vm-x86-redfish</rp:project></metadata>
+    <metadata>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
+    </metadata>
   </domain>
   XML
       ;;
@@ -1655,6 +1709,55 @@ operator workflows rather than wrapping Redfish itself.
     run grep -F "unrelated-22222222" "$BATS_TEST_TMPDIR/commands.log"
     [ "$status" -ne 0 ]
     [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  }
+
+  @test "destroy-vm refuses root volume metadata mismatch" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    install_mock_command virsh '
+  case "$*" in
+    *"dumpxml vm-x86-redfish")
+      cat <<XML
+  <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+    <uuid>11111111-2222-3333-4444-555555555555</uuid>
+    <metadata>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>different.qcow2</rp:root-volume>
+    </metadata>
+  </domain>
+  XML
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/destroy-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not reference vm-x86-redfish.qcow2"* ]]
+  }
+
+  @test "destroy-vm removes uuid media volumes when domain and root are absent" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dumpxml vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-list --pool default --name")
+      printf "partial-11111111-2222-3333-4444-555555555555.img\n"
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/destroy-vm
+    [ "$status" -eq 0 ]
+    grep -F "vol-delete --pool default partial-11111111-2222-3333-4444-555555555555.img" \
+      "$BATS_TEST_TMPDIR/commands.log"
   }
   ```
 
@@ -1693,6 +1796,16 @@ operator workflows rather than wrapping Redfish itself.
     done
   }
 
+  delete_uuid_media_volumes() {
+    local uuid="$1"
+    local volume
+    while IFS= read -r volume; do
+      if media_volume_matches_uuid "$volume" "$uuid"; then
+        virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$volume"
+      fi
+    done < <(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)
+  }
+
   destroy_transaction() {
     local uuid xml_path
     if [ ! -f "$DOMAIN_UUID_FILE" ]; then
@@ -1706,6 +1819,7 @@ operator workflows rather than wrapping Redfish itself.
         >/dev/null 2>&1; then
         fail "cannot prove ownership of $ROOT_VOLUME_NAME without domain metadata"
       fi
+      delete_uuid_media_volumes "$uuid"
       printf 'destroy: domain %s is already absent\n' "$DEFAULT_DOMAIN_NAME"
       cleanup_project_state_files
       return 0
@@ -1714,6 +1828,8 @@ operator workflows rather than wrapping Redfish itself.
       fail "refusing to destroy unowned domain $DEFAULT_DOMAIN_NAME"
     domain_uuid_matches_state "$xml_path" ||
       fail "refusing to destroy $DEFAULT_DOMAIN_NAME with mismatched UUID"
+    domain_root_volume_matches_state "$xml_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME does not reference $ROOT_VOLUME_NAME"
 
     if virsh -c "$LIBVIRT_URI" domstate "$DEFAULT_DOMAIN_NAME" | grep -F running >/dev/null; then
       virsh -c "$LIBVIRT_URI" destroy "$DEFAULT_DOMAIN_NAME"
@@ -1723,11 +1839,7 @@ operator workflows rather than wrapping Redfish itself.
       >/dev/null 2>&1; then
       virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
     fi
-    while IFS= read -r volume; do
-      if media_volume_matches_uuid "$volume" "$uuid"; then
-        virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$volume"
-      fi
-    done < <(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)
+    delete_uuid_media_volumes "$uuid"
     cleanup_project_state_files
   }
 
@@ -1736,19 +1848,25 @@ operator workflows rather than wrapping Redfish itself.
 
 - [ ] **Step 4: Add checked `.state/tmp` cleanup**
 
-  Extend destruction to canonicalize `.state/tmp`, reject symlinks, enumerate known temporary
-  files beneath it, remove only those files, then remove the directory only if empty:
+  Extend destruction to validate `.state/tmp` with `require_private_dir`, remove every
+  regular file directly under that project-owned private directory, fail on unexpected
+  non-file entries, then remove the directory only if empty. This intentionally does not
+  rely on Sushy temporary filenames containing the domain UUID, because the integration
+  test observes and records the actual interrupted-download path before destruction:
 
   ```bash
   cleanup_tmpdir() {
-    local path tmpdir uuid
-    uuid="$(read_domain_uuid)"
+    local entry tmpdir
+    [ -e "${STATE_DIR}/tmp" ] || return 0
+    require_private_dir "${STATE_DIR}/tmp"
     tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
-    while IFS= read -r -d '' path; do
-      case "$(basename "$path")" in
-        *"$uuid"*) rm -- "$path" ;;
-      esac
-    done < <(find "$tmpdir" -maxdepth 1 -type f -print0)
+    while IFS= read -r -d '' entry; do
+      if [ -f "$entry" ]; then
+        rm -- "$entry"
+      else
+        fail "unexpected entry in temporary directory: $entry"
+      fi
+    done < <(find "$tmpdir" -mindepth 1 -maxdepth 1 -print0)
     if ! rmdir "$tmpdir" 2>/dev/null; then
       [ -d "$tmpdir" ] || fail "temporary directory disappeared during cleanup: $tmpdir"
     fi
@@ -2014,8 +2132,9 @@ operator workflows rather than wrapping Redfish itself.
 
   Start a throttled HTTP response, begin an InsertMedia request asynchronously, record the
   client PID, wait for a file to appear beneath the test `TMPDIR`, terminate only the Sushy
-  child, wait boundedly for the client, run `scripts/destroy-vm`, and prove the temporary
-  file plus every anchored `-${domain_uuid}.img` volume is absent.
+  child, record the observed temporary file path, wait boundedly for the client, run
+  `scripts/destroy-vm`, and prove the observed temporary file plus every anchored
+  `-${domain_uuid}.img` volume is absent.
 
 - [ ] **Step 7: Stop if the serial-sentinel checkpoint fails**
 
