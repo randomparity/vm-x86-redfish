@@ -19,7 +19,7 @@ operator workflows rather than wrapping Redfish itself.
 
 - Source spec: `docs/specs/redfish-vm.md` with `Status: Accepted`.
 - Work branch: `feat/redfish-vm-plan`; `BASE_BRANCH=main`.
-- GitHub repo: `randomparity/vm-x86-redfish`; no issue number exists yet.
+- GitHub repo: `randomparity/vm-x86-redfish`; tracking issue: #1.
 - The first release targets Fedora 44 hosts and `qemu:///system`.
 - The fixed developer domain name is `vm-x86-redfish`.
 - Generated configuration, credentials, certificates, identifiers, logs, downloaded media,
@@ -1135,6 +1135,39 @@ operator workflows rather than wrapping Redfish itself.
     [[ "$output" == *"existing domain vm-x86-redfish is not owned by this project"* ]]
   }
 
+  @test "create-vm accepts owned domain with alternate metadata prefix and escaped text" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dominfo vm-x86-redfish")
+      exit 0
+      ;;
+    *"dumpxml vm-x86-redfish")
+      cat <<XML
+  <domain xmlns:owned="https://github.com/randomparity/vm-x86-redfish">
+    <uuid>11111111-2222-3333-4444-555555555555</uuid>
+    <metadata>
+      <owned:project>vm-x86-redfish</owned:project>
+      <owned:root-volume>vm-x86-redfish&amp;owned.qcow2</owned:root-volume>
+    </metadata>
+  </domain>
+  XML
+      ;;
+    *"vol-info --pool default vm-x86-redfish&owned.qcow2")
+      exit 0
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    VM_X86_REDFISH_ROOT_VOLUME_NAME="vm-x86-redfish&owned.qcow2" \
+      run ./scripts/create-vm
+    [ "$status" -eq 0 ]
+  }
+
   @test "create-vm deletes newly created disk when domain definition fails" {
     install_mock_command virsh '
   printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
@@ -1203,21 +1236,42 @@ operator workflows rather than wrapping Redfish itself.
   Extend `scripts/lib/common` with:
 
   ```bash
+  xml_text_equals() {
+    local xml="$1"
+    local namespace="$2"
+    local name="$3"
+    local expected="$4"
+    python3 - "$xml" "$namespace" "$name" "$expected" <<'PY'
+  import sys
+  import xml.etree.ElementTree as ET
+
+  xml_path, namespace, name, expected = sys.argv[1:]
+  target = f"{{{namespace}}}{name}" if namespace else name
+  root = ET.parse(xml_path).getroot()
+  for elem in root.iter(target):
+      if (elem.text or "") == expected:
+          raise SystemExit(0)
+  raise SystemExit(1)
+  PY
+  }
+
   domain_is_project_owned() {
     local xml="$1"
-    grep -F "<rp:project>vm-x86-redfish</rp:project>" "$xml" >/dev/null
+    xml_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+      "project" "vm-x86-redfish"
   }
 
   domain_uuid_matches_state() {
     local xml="$1"
     local uuid
     uuid="$(read_domain_uuid)"
-    grep -F "<uuid>${uuid}</uuid>" "$xml" >/dev/null
+    xml_text_equals "$xml" "" "uuid" "$uuid"
   }
 
   domain_root_volume_matches_state() {
     local xml="$1"
-    grep -F "<rp:root-volume>${ROOT_VOLUME_NAME}</rp:root-volume>" "$xml" >/dev/null
+    xml_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+      "root-volume" "$ROOT_VOLUME_NAME"
   }
 
   ```
@@ -1369,6 +1423,20 @@ operator workflows rather than wrapping Redfish itself.
       "$VM_X86_REDFISH_STATE_DIR/connection.env"
     grep -F "REDFISH_CREDENTIALS_FILE='$VM_X86_REDFISH_STATE_DIR/credentials.env'" \
       "$VM_X86_REDFISH_STATE_DIR/connection.env"
+    python3 - "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py" <<'PY'
+  import runpy
+  import sys
+
+  cfg = runpy.run_path(sys.argv[1])
+  assert cfg["SUSHY_EMULATOR_VMEDIA_DEVICES"] == {
+      "Cd": {
+          "Name": "Virtual CD",
+          "MediaTypes": ["CD", "DVD"],
+          "Verify": True,
+      }
+  }
+  assert cfg["SUSHY_EMULATOR_VMEDIA_VERIFY_SSL"] is True
+  PY
   }
 
   @test "create-vm repairs missing Redfish state for valid existing domain" {
@@ -1422,7 +1490,14 @@ operator workflows rather than wrapping Redfish itself.
   SUSHY_EMULATOR_LIBVIRT_URI = "qemu:///system"
   SUSHY_EMULATOR_FEATURE_SET = "vmedia"
   SUSHY_EMULATOR_ALLOWED_INSTANCES = ["@DOMAIN_UUID@"]
-  SUSHY_EMULATOR_VMEDIA_DEVICES = {"@DOMAIN_UUID@": ["Cd"]}
+  SUSHY_EMULATOR_VMEDIA_DEVICES = {
+      "Cd": {
+          "Name": "Virtual CD",
+          "MediaTypes": ["CD", "DVD"],
+          "Verify": True,
+      }
+  }
+  SUSHY_EMULATOR_VMEDIA_VERIFY_SSL = True
   SUSHY_EMULATOR_STORAGE_POOL = "default"
   SUSHY_EMULATOR_STATE_DIR = "@STATE_DIR@/sushy"
   SUSHY_EMULATOR_SSL_CERT = "@STATE_DIR@/tls.crt"
@@ -1430,9 +1505,9 @@ operator workflows rather than wrapping Redfish itself.
   SUSHY_EMULATOR_AUTH_FILE = "@STATE_DIR@/htpasswd"
   ```
 
-  Verify the exact Sushy setting names against the installed `sushy-tools==2.2.0` package
-  during implementation. If a setting name differs, update this template and tests in the
-  same commit.
+  This matches the `sushy-tools==2.2.0` static virtual-media schema: device identifiers key
+  `SUSHY_EMULATOR_VMEDIA_DEVICES`, and `SUSHY_EMULATOR_VMEDIA_VERIFY_SSL` is the global
+  fallback when a device does not carry a `Verify` value.
 
 - [ ] **Step 4: Replace the runtime-state hook with credentials and TLS generation**
 
@@ -2087,11 +2162,14 @@ operator workflows rather than wrapping Redfish itself.
 
   Extend `tests/redfish-integration.bats` with helpers that render the sentinel, run
   `grub2-mkrescue -o "$iso_path" "$iso_root"`, start `python3 -m http.server 0 --bind
-  127.0.0.1`, and record the exact media-server PID for teardown.
+  127.0.0.1`, start a separate local HTTPS media server with a self-signed certificate,
+  and record the exact media-server PIDs for teardown.
 
 - [ ] **Step 3: Insert media and select Cd boot override**
 
-  Add an integration test that POSTs:
+  First POST an untrusted local HTTPS image URL and assert Sushy rejects it, proving
+  `SUSHY_EMULATOR_VMEDIA_VERIFY_SSL = True` is active for downloads. Then POST the HTTP
+  sentinel ISO URL for the positive boot path:
 
   ```json
   {"Image":"http://127.0.0.1:${media_port}/${iso_name}","Inserted":true}
@@ -2103,7 +2181,7 @@ operator workflows rather than wrapping Redfish itself.
   /redfish/v1/Systems/${domain_uuid}/VirtualMedia/Cd/Actions/VirtualMedia.InsertMedia
   ```
 
-  Then PATCH the system boot override to:
+  PATCH the system boot override to:
 
   ```json
   {"Boot":{"BootSourceOverrideTarget":"Cd","BootSourceOverrideEnabled":"Once"}}
@@ -2182,15 +2260,32 @@ operator workflows rather than wrapping Redfish itself.
   source .state/connection.env
   source "$REDFISH_CREDENTIALS_FILE"
   make redfish
-  make destroy
   ```
 
-  Include a separate terminal example for authenticated Redfish:
+  Document Redfish requests from a second terminal while `make redfish` remains in the
+  foreground:
 
   ```bash
+  source .state/connection.env
+  source "$REDFISH_CREDENTIALS_FILE"
   curl --cacert "$REDFISH_CA_CERT" \
     --user "${REDFISH_USERNAME}:${REDFISH_PASSWORD}" \
     "$REDFISH_ENDPOINT/redfish/v1/Systems"
+  ```
+
+  Document cleanup only after the operator stops the foreground service and waits for it to
+  exit:
+
+  ```bash
+  # Press Ctrl-C in the terminal running make redfish, then run:
+  make destroy
+  ```
+
+  Include the lock behavior:
+
+  ```markdown
+  `make destroy` refuses while `make redfish` holds the lifecycle lock. Stop the foreground
+  Redfish process before destroying project-owned VM resources.
   ```
 
 - [ ] **Step 2: Document limitations and security boundaries**
@@ -2240,6 +2335,5 @@ operator workflows rather than wrapping Redfish itself.
   committing dependency or CI changes, which satisfies the repo rule for current versions.
 - Type and interface consistency: Shared shell functions are named once in Task 2 and reused
   by later tasks. Public command names match the Make targets and accepted spec.
-- Known workflow gap: No GitHub issue exists yet. Before running `$work-issue` build/review
-  steps, create or select the tracking issue, post `WORK:SCOPE`, and set it to
-  `status:in-progress`.
+- Tracking status: GitHub issue #1 exists, carries `status:in-progress`, and has a complete
+  `WORK:SCOPE` annotation for this branch.
