@@ -1413,7 +1413,74 @@ operator workflows rather than wrapping Redfish itself.
   Add tests asserting:
 
   ```bash
+  install_redfish_state_mocks() {
+    install_mock_command openssl '
+  printf "openssl %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    "rand -base64 30")
+      printf "redfish-test-password\n"
+      ;;
+    req*)
+      key=""
+      cert=""
+      while [ "$#" -gt 0 ]; do
+        arg="$1"
+        shift
+        case "$arg" in
+          -keyout)
+            key="$1"
+            shift
+            ;;
+          -out)
+            cert="$1"
+            shift
+            ;;
+        esac
+      done
+      printf "test-key\n" >"$key"
+      printf "test-cert\n" >"$cert"
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    install_mock_command htpasswd '
+  printf "htpasswd %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  [ "$1" = "-iB" ]
+  [ "$2" = "-c" ]
+  read -r password
+  [ "$password" = "redfish-test-password" ]
+  printf "admin:test-hash\n" >"$3"
+  '
+  }
+
+  install_create_success_mocks() {
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2")
+      exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+      ;;
+    *"define "*"/domain.xml")
+      exit 0
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    install_redfish_state_mocks
+  }
+
   @test "create-vm writes private Redfish credentials and connection metadata" {
+    install_create_success_mocks
     run ./scripts/create-vm
     [ "$status" -eq 0 ]
     [ "$(stat -c "%a" "$VM_X86_REDFISH_STATE_DIR/credentials.env")" = "600" ]
@@ -1437,11 +1504,14 @@ operator workflows rather than wrapping Redfish itself.
   }
   assert cfg["SUSHY_EMULATOR_VMEDIA_VERIFY_SSL"] is True
   PY
+    run grep -F "redfish-test-password" "$BATS_TEST_TMPDIR/commands.log"
+    [ "$status" -ne 0 ]
   }
 
   @test "create-vm repairs missing Redfish state for valid existing domain" {
     printf '11111111-2222-3333-4444-555555555555\n' \
       >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    install_redfish_state_mocks
     install_mock_command virsh '
   case "$*" in
     *"dominfo vm-x86-redfish")
@@ -1531,8 +1601,8 @@ operator workflows rather than wrapping Redfish itself.
     fi
     # shellcheck disable=SC1091
     source "${STATE_DIR}/credentials.env"
-    htpasswd -bB -c "${STATE_DIR}/htpasswd" "$REDFISH_USERNAME" "$REDFISH_PASSWORD" \
-      >/dev/null
+    printf '%s\n' "$REDFISH_PASSWORD" |
+      htpasswd -iB -c "${STATE_DIR}/htpasswd" "$REDFISH_USERNAME" >/dev/null
     chmod 600 "${STATE_DIR}/htpasswd"
   }
 
@@ -1815,6 +1885,9 @@ operator workflows rather than wrapping Redfish itself.
   @test "destroy-vm removes uuid media volumes when domain and root are absent" {
     printf '11111111-2222-3333-4444-555555555555\n' \
       >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
+    chmod 700 "$VM_X86_REDFISH_STATE_DIR/tmp"
+    touch "$VM_X86_REDFISH_STATE_DIR/tmp/interrupted-download"
     install_mock_command virsh '
   printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
   case "$*" in
@@ -1833,6 +1906,8 @@ operator workflows rather than wrapping Redfish itself.
     [ "$status" -eq 0 ]
     grep -F "vol-delete --pool default partial-11111111-2222-3333-4444-555555555555.img" \
       "$BATS_TEST_TMPDIR/commands.log"
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/tmp" ]
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
   }
   ```
 
@@ -1948,7 +2023,18 @@ operator workflows rather than wrapping Redfish itself.
   }
   ```
 
-  Update the end of `destroy_transaction` so temporary media is removed before state files:
+  Update every successful cleanup branch in `destroy_transaction` so temporary media is
+  removed before state files. The domain-absent branch becomes:
+
+  ```bash
+      delete_uuid_media_volumes "$uuid"
+      cleanup_tmpdir
+      printf 'destroy: domain %s is already absent\n' "$DEFAULT_DOMAIN_NAME"
+      cleanup_project_state_files
+      return 0
+  ```
+
+  The normal tail becomes:
 
   ```bash
     cleanup_tmpdir
