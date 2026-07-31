@@ -143,6 +143,28 @@ raise SystemExit(1)
 PY
 }
 
+xml_metadata_text_equals() {
+  local xml="$1"
+  local namespace="$2"
+  local name="$3"
+  local expected="$4"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$xml" "$namespace" "$name" "$expected" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, namespace, name, expected = sys.argv[1:]
+target = f"{{{namespace}}}{name}" if namespace else name
+root = ET.parse(xml_path).getroot()
+for metadata in root.findall("metadata"):
+    for elem in metadata.findall(target):
+        if (elem.text or "") == expected:
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 xml_disk_source_equals() {
   local xml="$1"
   local expected="$2"
@@ -166,7 +188,7 @@ PY
 
 domain_is_project_owned() {
   local xml="$1"
-  xml_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+  xml_metadata_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
     "project" "vm-x86-redfish"
 }
 
@@ -179,7 +201,7 @@ domain_uuid_matches_state() {
 
 domain_root_volume_matches_state() {
   local xml="$1"
-  xml_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+  xml_metadata_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
     "root-volume" "$ROOT_VOLUME_NAME"
 }
 
