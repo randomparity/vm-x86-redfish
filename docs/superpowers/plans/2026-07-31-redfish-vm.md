@@ -161,11 +161,13 @@ operator workflows rather than wrapping Redfish itself.
   OFFLINE_BATS_TESTS += $(wildcard tests/destroy-vm.bats)
   SHELL_SCRIPTS := $(wildcard scripts/doctor scripts/create-vm scripts/destroy-vm)
   SHELL_SCRIPTS += $(wildcard scripts/render-config scripts/run-redfish scripts/lib/common)
+  EXECUTABLE_SCRIPTS := $(filter-out scripts/lib/common,$(SHELL_SCRIPTS))
   SHFMT_PATHS := $(wildcard scripts tests)
 
   test:
   >@if [ -n "$(OFFLINE_BATS_TESTS)" ]; then bats $(OFFLINE_BATS_TESTS); fi
   >@if [ -n "$(SHELL_SCRIPTS)" ]; then shellcheck $(SHELL_SCRIPTS); fi
+  >@for script in $(EXECUTABLE_SCRIPTS); do test -x "$$script"; done
   >@if [ -n "$(SHFMT_PATHS)" ]; then shfmt -i 2 -d $(SHFMT_PATHS); fi
   >@if [ -f config/sushy-emulator.conf.py.in ]; then \
   >  python3 -m py_compile config/sushy-emulator.conf.py.in; \
@@ -860,6 +862,7 @@ operator workflows rather than wrapping Redfish itself.
   Run:
 
   ```bash
+  chmod +x scripts/doctor
   shfmt -i 2 -w scripts/doctor tests/doctor.bats
   shellcheck scripts/doctor
   bats tests/doctor.bats
@@ -1043,6 +1046,7 @@ operator workflows rather than wrapping Redfish itself.
   Run:
 
   ```bash
+  chmod +x scripts/render-config
   shfmt -i 2 -w scripts/render-config
   shellcheck scripts/render-config
   bats tests/render-config.bats
@@ -1248,6 +1252,63 @@ operator workflows rather than wrapping Redfish itself.
     [[ "$output" == *"does not use root volume path"* ]]
   }
 
+  @test "create-vm deletes newly created disk when vol-path fails" {
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2")
+      exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-delete --pool default vm-x86-redfish.qcow2")
+      exit 0
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    run ./scripts/create-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"failed to resolve root volume path"* ]]
+    grep -F "vol-delete --pool default vm-x86-redfish.qcow2" \
+      "$BATS_TEST_TMPDIR/commands.log"
+  }
+
+  @test "create-vm deletes newly created disk when domain rendering fails" {
+    mkdir "$VM_X86_REDFISH_STATE_DIR/domain.xml"
+    install_mock_command virsh '
+  printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+  case "$*" in
+    *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2")
+      exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+      ;;
+    *"vol-delete --pool default vm-x86-redfish.qcow2")
+      exit 0
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    run ./scripts/create-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"failed to render domain XML"* ]]
+    grep -F "vol-delete --pool default vm-x86-redfish.qcow2" \
+      "$BATS_TEST_TMPDIR/commands.log"
+  }
+
   @test "create-vm deletes newly created disk when domain definition fails" {
     install_mock_command virsh '
   printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
@@ -1439,17 +1500,32 @@ operator workflows rather than wrapping Redfish itself.
     :
   }
 
+  rollback_new_root_volume() {
+    virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
+  }
+
+  create_new_domain() {
+    local root_path
+    create_root_volume
+    if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
+      "$ROOT_VOLUME_NAME")"; then
+      rollback_new_root_volume
+      fail "failed to resolve root volume path for $ROOT_VOLUME_NAME"
+    fi
+    if ! VM_X86_REDFISH_ROOT_VOLUME_PATH="$root_path" ./scripts/render-config domain; then
+      rollback_new_root_volume
+      fail "failed to render domain XML for $DEFAULT_DOMAIN_NAME"
+    fi
+    if ! virsh -c "$LIBVIRT_URI" define "${STATE_DIR}/domain.xml"; then
+      rollback_new_root_volume
+      fail "failed to define libvirt domain $DEFAULT_DOMAIN_NAME"
+    fi
+  }
+
   create_vm_transaction() {
     create_domain_uuid_once
     if ! validate_or_reject_existing_domain; then
-      create_root_volume
-      local root_path
-      root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
-      VM_X86_REDFISH_ROOT_VOLUME_PATH="$root_path" ./scripts/render-config domain
-      if ! virsh -c "$LIBVIRT_URI" define "${STATE_DIR}/domain.xml"; then
-        virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
-        fail "failed to define libvirt domain $DEFAULT_DOMAIN_NAME"
-      fi
+      create_new_domain
     fi
     create_redfish_runtime_state
   }
@@ -1491,6 +1567,7 @@ operator workflows rather than wrapping Redfish itself.
   Run:
 
   ```bash
+  chmod +x scripts/create-vm
   shfmt -i 2 -w scripts/create-vm scripts/lib/common tests/create-vm.bats
   shellcheck scripts/create-vm scripts/lib/common
   bats tests/create-vm.bats
@@ -1866,6 +1943,7 @@ operator workflows rather than wrapping Redfish itself.
   Run:
 
   ```bash
+  chmod +x scripts/run-redfish
   shfmt -i 2 -w scripts/run-redfish tests/render-config.bats
   shellcheck scripts/run-redfish
   bats tests/render-config.bats
@@ -2201,6 +2279,7 @@ operator workflows rather than wrapping Redfish itself.
   Run:
 
   ```bash
+  chmod +x scripts/destroy-vm
   shfmt -i 2 -w scripts/destroy-vm scripts/lib/common tests/destroy-vm.bats
   shellcheck scripts/destroy-vm scripts/lib/common
   bats tests/destroy-vm.bats
@@ -2253,6 +2332,7 @@ operator workflows rather than wrapping Redfish itself.
     if [ "$cleanup_status" -ne 0 ]; then
       printf 'destroy-vm cleanup failed with status %s; see %s\n' \
         "$cleanup_status" "$cleanup_log" >&2
+      return "$cleanup_status"
     fi
   }
 
