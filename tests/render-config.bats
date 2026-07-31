@@ -144,6 +144,49 @@ load "helpers/test-helper"
   [ "$status" -eq 0 ]
 }
 
+@test "run-redfish refuses when lifecycle lock is held" {
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR"
+  exec 8>"$VM_X86_REDFISH_STATE_DIR/lifecycle.lock"
+  flock -n 8
+  run ./scripts/run-redfish
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"lifecycle lock is held"* ]]
+}
+
+@test "run-redfish rejects missing private tmp directory" {
+  touch "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+  run ./scripts/run-redfish
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"missing private directory"* ]]
+}
+
+@test "run-redfish rejects loose private tmp directory" {
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
+  chmod 755 "$VM_X86_REDFISH_STATE_DIR/tmp"
+  touch "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+  run ./scripts/run-redfish
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"directory must be mode 0700"* ]]
+}
+
+@test "run-redfish sets TMPDIR and execs sushy-emulator" {
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
+  touch "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+  chmod 700 "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_STATE_DIR/tmp"
+  install_mock_command uv 'printf "TMPDIR=%s\nCONFIG=%s\n" "$TMPDIR" "$*"'
+  run ./scripts/run-redfish
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"TMPDIR=$VM_X86_REDFISH_STATE_DIR/tmp"* ]]
+  [[ "$output" == *run\ --locked\ sushy-emulator\ --config\ */sushy-emulator.conf.py* ]]
+}
+
+@test "run-redfish rejects unguarded runtime overrides" {
+  run env -u VM_X86_REDFISH_INTEGRATION_TEST \
+    VM_X86_REDFISH_DOMAIN_NAME=test-domain ./scripts/run-redfish
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"test-only overrides require VM_X86_REDFISH_INTEGRATION_TEST=1"* ]]
+}
+
 @test "ensure_private_dir creates mode 0700 directory" {
   run bash -c '
     source scripts/lib/common
