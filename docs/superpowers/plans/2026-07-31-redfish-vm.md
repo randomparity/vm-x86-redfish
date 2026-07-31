@@ -67,6 +67,7 @@ operator workflows rather than wrapping Redfish itself.
 - `scripts/destroy-vm` validates ownership and removes only project-owned libvirt resources
   and checked state files.
 - `tests/helpers/test-helper.bash` creates per-test temporary workspaces and command mocks.
+- `tests/helpers/media-server.py` serves local integration media and records selected ports.
 - `tests/doctor.bats` covers read-only host checks and missing-dependency diagnostics.
 - `tests/render-config.bats` covers deterministic template rendering and secret file modes.
 - `tests/create-vm.bats` covers create idempotency, ownership rejection, and rollback.
@@ -163,6 +164,7 @@ operator workflows rather than wrapping Redfish itself.
   SHELL_SCRIPTS += $(wildcard scripts/render-config scripts/run-redfish scripts/lib/common)
   EXECUTABLE_SCRIPTS := $(filter-out scripts/lib/common,$(SHELL_SCRIPTS))
   PYTHON_313 := $(shell UV_PYTHON_DOWNLOADS=never uv python find 3.13 2>/dev/null)
+  PYTHON_FILES := $(wildcard tests/helpers/*.py)
   SHFMT_PATHS := $(wildcard scripts tests)
 
   test:
@@ -170,6 +172,9 @@ operator workflows rather than wrapping Redfish itself.
   >@if [ -n "$(SHELL_SCRIPTS)" ]; then shellcheck $(SHELL_SCRIPTS); fi
   >@for script in $(EXECUTABLE_SCRIPTS); do test -x "$$script"; done
   >@if [ -n "$(SHFMT_PATHS)" ]; then shfmt -i 2 -d $(SHFMT_PATHS); fi
+  >@if [ -n "$(PYTHON_FILES)" ]; then uv run --locked ruff check $(PYTHON_FILES); fi
+  >@if [ -n "$(PYTHON_FILES)" ]; then uv run --locked ruff format --check $(PYTHON_FILES); fi
+  >@if [ -n "$(PYTHON_FILES)" ]; then uv run --locked ty check $(PYTHON_FILES); fi
   >@if [ -f uv.lock ]; then uv lock --check; fi
   >@if [ -f config/sushy-emulator.conf.py.in ]; then \
   >  test -n "$(PYTHON_313)"; \
@@ -2166,6 +2171,40 @@ operator workflows rather than wrapping Redfish itself.
     [[ "$output" == *"does not reference vm-x86-redfish.qcow2"* ]]
   }
 
+  @test "destroy-vm refuses owned domain with wrong disk source" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    install_mock_command virsh '
+  case "$*" in
+    *"dumpxml vm-x86-redfish")
+      cat <<XML
+  <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+    <uuid>11111111-2222-3333-4444-555555555555</uuid>
+    <metadata>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
+    </metadata>
+    <devices>
+      <disk type="file" device="disk">
+        <source file="/var/lib/libvirt/images/other.qcow2"/>
+      </disk>
+    </devices>
+  </domain>
+  XML
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/destroy-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unexpected disk source"* ]]
+  }
+
   @test "destroy-vm removes uuid media volumes when domain and root are absent" {
     printf '11111111-2222-3333-4444-555555555555\n' \
       >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
@@ -2319,7 +2358,7 @@ operator workflows rather than wrapping Redfish itself.
   }
 
   destroy_transaction() {
-    local uuid xml_path
+    local root_path uuid xml_path
     if [ ! -f "$DOMAIN_UUID_FILE" ]; then
       printf 'destroy: no project state found\n'
       return 0
@@ -2342,6 +2381,12 @@ operator workflows rather than wrapping Redfish itself.
       fail "refusing to destroy $DEFAULT_DOMAIN_NAME with mismatched UUID"
     domain_root_volume_matches_state "$xml_path" ||
       fail "existing domain $DEFAULT_DOMAIN_NAME does not reference $ROOT_VOLUME_NAME"
+    if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
+      "$ROOT_VOLUME_NAME")"; then
+      fail "cannot resolve root volume path for $ROOT_VOLUME_NAME"
+    fi
+    domain_disk_source_matches "$xml_path" "$root_path" ||
+      fail "refusing to destroy $DEFAULT_DOMAIN_NAME with unexpected disk source"
 
     if virsh -c "$LIBVIRT_URI" domstate "$DEFAULT_DOMAIN_NAME" | grep -F running >/dev/null; then
       virsh -c "$LIBVIRT_URI" destroy "$DEFAULT_DOMAIN_NAME"
@@ -2613,7 +2658,9 @@ operator workflows rather than wrapping Redfish itself.
 
 **Files:**
 - Create: `tests/fixtures/grub.cfg.in`
+- Create: `tests/helpers/media-server.py`
 - Modify: `tests/redfish-integration.bats`
+- Modify: `tests/helpers/test-helper.bash`
 - Modify: `scripts/destroy-vm`
 - Modify: `README.md`
 
@@ -2639,11 +2686,54 @@ operator workflows rather than wrapping Redfish itself.
 
 - [ ] **Step 2: Add ISO build and loopback media-server helpers**
 
+  Create `tests/helpers/media-server.py` as a dependency-free Python 3.13 helper that:
+
+  - serves one configured directory on `127.0.0.1`;
+  - binds port `0` and writes the selected port to a caller-supplied port file using
+    write-then-rename before the test reads it;
+  - writes a caller-supplied ready file only after the server socket is bound;
+  - optionally wraps the socket with caller-supplied TLS certificate and key paths; and
+  - optionally throttles responses by chunk size and delay for interrupted-download tests.
+
+  Add this shell helper to `tests/helpers/test-helper.bash`:
+
+  ```bash
+  wait_for_file() {
+    local path="$1"
+    local deadline=$((SECONDS + 30))
+    until [ -f "$path" ]; do
+      [ "$SECONDS" -lt "$deadline" ] || return 1
+      sleep 1
+    done
+  }
+  ```
+
   Extend `tests/redfish-integration.bats` with helpers that render the sentinel, run
   `grub2-mkrescue -o "$iso_path" "$iso_root"`, resolve `python_bin="$(python_313)"`,
-  start `"$python_bin" -m http.server 0 --bind 127.0.0.1`, start a separate local HTTPS
-  media server with a self-signed certificate, and record the exact media-server PIDs for
-  teardown.
+  start `tests/helpers/media-server.py` for HTTP media, start a second instance with a
+  self-signed certificate for the untrusted local HTTPS rejection path, wait for each ready
+  file, read each selected port from its port file, and record the exact media-server PIDs
+  for teardown.
+
+  Add a harness regression before the Redfish mutation tests:
+
+  ```bash
+  @test "media server helper publishes selected port after binding" {
+    mkdir -p "$BATS_TEST_TMPDIR/media"
+    printf 'sentinel\n' >"$BATS_TEST_TMPDIR/media/sentinel.iso"
+    python_bin="$(python_313)"
+    "$python_bin" tests/helpers/media-server.py \
+      --directory "$BATS_TEST_TMPDIR/media" \
+      --port-file "$BATS_TEST_TMPDIR/media.port" \
+      --ready-file "$BATS_TEST_TMPDIR/media.ready" &
+    track_child "$!"
+    wait_for_file "$BATS_TEST_TMPDIR/media.ready"
+    media_port="$(<"$BATS_TEST_TMPDIR/media.port")"
+    run curl --silent --fail "http://127.0.0.1:${media_port}/sentinel.iso"
+    [ "$status" -eq 0 ]
+    [ "$output" = "sentinel" ]
+  }
+  ```
 
 - [ ] **Step 3: Insert media and select Cd boot override**
 
@@ -2688,11 +2778,11 @@ operator workflows rather than wrapping Redfish itself.
 
 - [ ] **Step 6: Simulate interrupted insertion cleanup**
 
-  Start a throttled HTTP response, begin an InsertMedia request asynchronously, record the
-  client PID, wait for a file to appear beneath the test `TMPDIR`, terminate only the Sushy
-  child, record the observed temporary file path, wait boundedly for the client, run
-  `scripts/destroy-vm`, and prove the observed temporary file plus every anchored
-  `-${domain_uuid}.img` volume is absent.
+  Start `tests/helpers/media-server.py` with throttling enabled, begin an InsertMedia request
+  asynchronously, record the client PID, wait for a file to appear beneath the test
+  `TMPDIR`, terminate only the Sushy child, record the observed temporary file path, wait
+  boundedly for the client, run `scripts/destroy-vm`, and prove the observed temporary file
+  plus every anchored `-${domain_uuid}.img` volume is absent.
 
 - [ ] **Step 7: Stop if the serial-sentinel checkpoint fails**
 
@@ -2803,6 +2893,22 @@ operator workflows rather than wrapping Redfish itself.
   git commit -m "docs: document Redfish VM workflow"
   ```
 
+- [ ] **Step 5: Hand off to the GitHub issue workflow**
+
+  After the final local commit, return control to the parent `$work-issue` shipping phase
+  or invoke `$ship-pr` for the finished branch. The handoff must:
+
+  - push branch `feat/redfish-vm-plan`;
+  - create or update a pull request whose body includes `Closes #1`;
+  - post the required `WORK:REVIEW` annotation on the PR after adversarial branch review;
+  - post `WORK:TRAJECTORY` on issue #1 if the branch parks before merge; and
+  - move issue #1 out of `status:in-progress` only after the corresponding workflow edge
+    succeeds.
+
+  The issue moves to `status:in-review` when branch review is running and to
+  `status:awaiting-merge` only when the PR is green, mergeable, and ready for a human merge.
+  Do not close issue #1 directly; the merged PR with `Closes #1` is the closure mechanism.
+
 ## Self-Review
 
 - Spec coverage: Tasks 1-2 establish the command surface, generated-state exclusions, and
@@ -2815,5 +2921,6 @@ operator workflows rather than wrapping Redfish itself.
   committing dependency or CI changes, which satisfies the repo rule for current versions.
 - Type and interface consistency: Shared shell functions are named once in Task 2 and reused
   by later tasks. Public command names match the Make targets and accepted spec.
-- Tracking status: GitHub issue #1 exists, carries `status:in-progress`, and has a complete
-  `WORK:SCOPE` annotation for this branch.
+- Tracking status: GitHub issue #1 exists, carries `status:in-progress`, has a complete
+  `WORK:SCOPE` annotation for this branch, and Task 11 hands the finished branch to the
+  PR/review/merge labels required by the GitHub tracking convention.
