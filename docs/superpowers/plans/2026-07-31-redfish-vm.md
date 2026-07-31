@@ -1152,11 +1152,19 @@ operator workflows rather than wrapping Redfish itself.
       <owned:project>vm-x86-redfish</owned:project>
       <owned:root-volume>vm-x86-redfish&amp;owned.qcow2</owned:root-volume>
     </metadata>
+    <devices>
+      <disk type="file" device="disk">
+        <source file="/var/lib/libvirt/images/vm-x86-redfish&amp;owned.qcow2"/>
+      </disk>
+    </devices>
   </domain>
   XML
       ;;
     *"vol-info --pool default vm-x86-redfish&owned.qcow2")
       exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish&owned.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish&owned.qcow2\n"
       ;;
     *)
       exit 2
@@ -1166,6 +1174,78 @@ operator workflows rather than wrapping Redfish itself.
     VM_X86_REDFISH_ROOT_VOLUME_NAME="vm-x86-redfish&owned.qcow2" \
       run ./scripts/create-vm
     [ "$status" -eq 0 ]
+  }
+
+  @test "create-vm refuses owned existing domain when root volume is missing" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    install_mock_command virsh '
+  case "$*" in
+    *"dominfo vm-x86-redfish")
+      exit 0
+      ;;
+    *"dumpxml vm-x86-redfish")
+      cat <<XML
+  <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+    <uuid>11111111-2222-3333-4444-555555555555</uuid>
+    <metadata>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
+    </metadata>
+  </domain>
+  XML
+      ;;
+    *"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    run ./scripts/create-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"root volume vm-x86-redfish.qcow2 is missing"* ]]
+  }
+
+  @test "create-vm refuses owned existing domain with wrong disk source" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    install_mock_command virsh '
+  case "$*" in
+    *"dominfo vm-x86-redfish")
+      exit 0
+      ;;
+    *"dumpxml vm-x86-redfish")
+      cat <<XML
+  <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+    <uuid>11111111-2222-3333-4444-555555555555</uuid>
+    <metadata>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
+    </metadata>
+    <devices>
+      <disk type="file" device="disk">
+        <source file="/var/lib/libvirt/images/other.qcow2"/>
+      </disk>
+    </devices>
+  </domain>
+  XML
+      ;;
+    *"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+  '
+    run ./scripts/create-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not use root volume path"* ]]
   }
 
   @test "create-vm deletes newly created disk when domain definition fails" {
@@ -1255,6 +1335,25 @@ operator workflows rather than wrapping Redfish itself.
   PY
   }
 
+  xml_disk_source_equals() {
+    local xml="$1"
+    local expected="$2"
+    python3 - "$xml" "$expected" <<'PY'
+  import sys
+  import xml.etree.ElementTree as ET
+
+  xml_path, expected = sys.argv[1:]
+  root = ET.parse(xml_path).getroot()
+  for disk in root.findall(".//disk"):
+      if disk.get("device") != "disk":
+          continue
+      source = disk.find("source")
+      if source is not None and source.get("file") == expected:
+          raise SystemExit(0)
+  raise SystemExit(1)
+  PY
+  }
+
   domain_is_project_owned() {
     local xml="$1"
     xml_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
@@ -1272,6 +1371,12 @@ operator workflows rather than wrapping Redfish itself.
     local xml="$1"
     xml_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
       "root-volume" "$ROOT_VOLUME_NAME"
+  }
+
+  domain_disk_source_matches() {
+    local xml="$1"
+    local root_path="$2"
+    xml_disk_source_equals "$xml" "$root_path"
   }
 
   ```
@@ -1296,6 +1401,7 @@ operator workflows rather than wrapping Redfish itself.
 
   validate_or_reject_existing_domain() {
     local xml_path="${STATE_DIR}/existing-domain.xml"
+    local root_path
     if virsh -c "$LIBVIRT_URI" dominfo "$DEFAULT_DOMAIN_NAME" >/dev/null 2>&1; then
       virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_path"
       domain_is_project_owned "$xml_path" ||
@@ -1304,6 +1410,13 @@ operator workflows rather than wrapping Redfish itself.
         fail "existing domain $DEFAULT_DOMAIN_NAME UUID does not match $DOMAIN_UUID_FILE"
       domain_root_volume_matches_state "$xml_path" ||
         fail "existing domain $DEFAULT_DOMAIN_NAME does not reference $ROOT_VOLUME_NAME"
+      if ! virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+        >/dev/null 2>&1; then
+        fail "existing domain $DEFAULT_DOMAIN_NAME root volume $ROOT_VOLUME_NAME is missing"
+      fi
+      root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
+      domain_disk_source_matches "$xml_path" "$root_path" ||
+        fail "existing domain $DEFAULT_DOMAIN_NAME does not use root volume path $root_path"
       return 0
     fi
     return 1
@@ -1525,8 +1638,19 @@ operator workflows rather than wrapping Redfish itself.
       <rp:project>vm-x86-redfish</rp:project>
       <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
     </metadata>
+    <devices>
+      <disk type="file" device="disk">
+        <source file="/var/lib/libvirt/images/vm-x86-redfish.qcow2"/>
+      </disk>
+    </devices>
   </domain>
   XML
+      ;;
+    *"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 0
+      ;;
+    *"vol-path --pool default vm-x86-redfish.qcow2")
+      printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
       ;;
     *)
       exit 0
@@ -1909,6 +2033,32 @@ operator workflows rather than wrapping Redfish itself.
     [ ! -e "$VM_X86_REDFISH_STATE_DIR/tmp" ]
     [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
   }
+
+  @test "destroy-vm preserves state when media volume listing fails" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
+    chmod 700 "$VM_X86_REDFISH_STATE_DIR/tmp"
+    touch "$VM_X86_REDFISH_STATE_DIR/tmp/interrupted-download"
+    install_mock_command virsh '
+  case "$*" in
+    *"dumpxml vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-list --pool default --name")
+      exit 1
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/destroy-vm
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"failed to list volumes in libvirt pool default"* ]]
+    [ -e "$VM_X86_REDFISH_STATE_DIR/tmp/interrupted-download" ]
+    [ -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  }
   ```
 
 - [ ] **Step 2: Run destruction tests and verify they fail**
@@ -1949,11 +2099,16 @@ operator workflows rather than wrapping Redfish itself.
   delete_uuid_media_volumes() {
     local uuid="$1"
     local volume
+    local volumes
+    if ! volumes="$(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)"; then
+      fail "failed to list volumes in libvirt pool $STORAGE_POOL"
+    fi
     while IFS= read -r volume; do
+      [ -n "$volume" ] || continue
       if media_volume_matches_uuid "$volume" "$uuid"; then
         virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$volume"
       fi
-    done < <(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)
+    done <<<"$volumes"
   }
 
   destroy_transaction() {
