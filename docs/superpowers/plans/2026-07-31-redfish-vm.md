@@ -162,6 +162,7 @@ operator workflows rather than wrapping Redfish itself.
   SHELL_SCRIPTS := $(wildcard scripts/doctor scripts/create-vm scripts/destroy-vm)
   SHELL_SCRIPTS += $(wildcard scripts/render-config scripts/run-redfish scripts/lib/common)
   EXECUTABLE_SCRIPTS := $(filter-out scripts/lib/common,$(SHELL_SCRIPTS))
+  PYTHON_313 := $(shell UV_PYTHON_DOWNLOADS=never uv python find 3.13 2>/dev/null)
   SHFMT_PATHS := $(wildcard scripts tests)
 
   test:
@@ -169,8 +170,10 @@ operator workflows rather than wrapping Redfish itself.
   >@if [ -n "$(SHELL_SCRIPTS)" ]; then shellcheck $(SHELL_SCRIPTS); fi
   >@for script in $(EXECUTABLE_SCRIPTS); do test -x "$$script"; done
   >@if [ -n "$(SHFMT_PATHS)" ]; then shfmt -i 2 -d $(SHFMT_PATHS); fi
+  >@if [ -f uv.lock ]; then uv lock --check; fi
   >@if [ -f config/sushy-emulator.conf.py.in ]; then \
-  >  python3 -m py_compile config/sushy-emulator.conf.py.in; \
+  >  test -n "$(PYTHON_313)"; \
+  >  "$(PYTHON_313)" -m py_compile config/sushy-emulator.conf.py.in; \
   >fi
 
   test-integration:
@@ -244,8 +247,10 @@ operator workflows rather than wrapping Redfish itself.
             persist-credentials: false
         - name: Install uv
           uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        - name: Install Python 3.13
+          run: uv python install 3.13
         - name: Install host test tools
-          run: sudo apt-get update && sudo apt-get install -y bats python3 shellcheck shfmt
+          run: sudo apt-get update && sudo apt-get install -y bats shellcheck shfmt
         - name: Run offline guardrails
           run: make test
   ```
@@ -439,6 +444,11 @@ operator workflows rather than wrapping Redfish itself.
     command -v "$1" >/dev/null 2>&1 || fail "missing command '$1': install $2"
   }
 
+  python_313() {
+    UV_PYTHON_DOWNLOADS=never uv python find 3.13 2>/dev/null ||
+      fail "uv must find Python 3.13 without downloading"
+  }
+
   integration_override_enabled() {
     [ "${VM_X86_REDFISH_INTEGRATION_TEST:-}" = "1" ]
   }
@@ -556,6 +566,17 @@ operator workflows rather than wrapping Redfish itself.
       'printf "%s %s\n" "$(basename "$0")" "$*" >>"$BATS_TEST_TMPDIR/commands.log"'
   }
 
+  install_uv_python_mock() {
+    local python_bin
+    python_bin="$(command -v python3)"
+    install_mock_command uv "
+  case \"\$*\" in
+    \"python find 3.13\") printf '%s\n' '$python_bin' ;;
+    *) exit 2 ;;
+  esac
+  "
+  }
+
   setup_test_workspace() {
     export REPO_ROOT
     REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
@@ -564,6 +585,7 @@ operator workflows rather than wrapping Redfish itself.
     export VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state"
     export VM_X86_REDFISH_ARTIFACTS_DIR="$BATS_TEST_TMPDIR/artifacts"
     mkdir -p "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_ARTIFACTS_DIR"
+    install_uv_python_mock
   }
 
   setup() {
@@ -659,6 +681,7 @@ operator workflows rather than wrapping Redfish itself.
     need_command virsh "libvirt-client"
     need_command qemu-system-x86_64 "qemu-system-x86-core"
     need_command qemu-img "qemu-img"
+    need_command uuidgen "util-linux-core"
     need_command uv "uv"
     need_command curl "curl"
     need_command openssl "openssl"
@@ -677,10 +700,24 @@ operator workflows rather than wrapping Redfish itself.
     version="$(virsh -c "$LIBVIRT_URI" version)"
     printf '%s\n' "$version" | grep -F "Using library: libvirt 12.0." >/dev/null ||
       fail "unsupported libvirt version: expected 12.0.x"
-    virsh -c "$LIBVIRT_URI" net-info default >/dev/null ||
-      fail "libvirt default network is unavailable: start it with virsh net-start default"
-    virsh -c "$LIBVIRT_URI" pool-info "$STORAGE_POOL" >/dev/null ||
+    require_active_network
+    require_running_pool
+  }
+
+  require_active_network() {
+    local info
+    info="$(virsh -c "$LIBVIRT_URI" net-info default)" ||
+      fail "libvirt default network is unavailable: define it before running create"
+    printf '%s\n' "$info" | grep -E '^Active:[[:space:]]+yes$' >/dev/null ||
+      fail "libvirt default network is inactive: start it with virsh net-start default"
+  }
+
+  require_running_pool() {
+    local info
+    info="$(virsh -c "$LIBVIRT_URI" pool-info "$STORAGE_POOL")" ||
       fail "libvirt storage pool '$STORAGE_POOL' is unavailable"
+    printf '%s\n' "$info" | grep -E '^State:[[:space:]]+running$' >/dev/null ||
+      fail "libvirt storage pool '$STORAGE_POOL' is not running"
   }
 
   kvm_device_path() {
@@ -713,11 +750,6 @@ operator workflows rather than wrapping Redfish itself.
     local ovmf_dir
     ovmf_dir="$(ovmf_dir_path)"
     [ -d "$ovmf_dir" ] || fail "missing UEFI firmware: install edk2-ovmf"
-  }
-
-  python_313() {
-    UV_PYTHON_DOWNLOADS=never uv python find 3.13 2>/dev/null ||
-      fail "uv must find Python 3.13 without downloading"
   }
 
   check_uv_python() {
@@ -766,9 +798,11 @@ operator workflows rather than wrapping Redfish itself.
       exit 0
       ;;
     "-c qemu:///system net-info default")
+      printf "Active: yes\n"
       exit 0
       ;;
     "-c qemu:///system pool-info default")
+      printf "State: running\n"
       exit 0
       ;;
     "-c qemu:///system version")
@@ -791,7 +825,7 @@ operator workflows rather than wrapping Redfish itself.
       ;;
   esac
   '
-    for command in qemu-system-x86_64 qemu-img curl openssl htpasswd bats shellcheck shfmt \
+    for command in qemu-system-x86_64 qemu-img uuidgen curl openssl htpasswd bats shellcheck shfmt \
       grub2-mkrescue xorriso; do
       install_recording_noop "$command"
     done
@@ -812,6 +846,44 @@ operator workflows rather than wrapping Redfish itself.
     [ "$status" -ne 0 ]
     [[ "$output" == *"127.0.0.1:8000 is already in use"* ]]
   }
+
+  @test "doctor reports missing uuidgen with Fedora package hint" {
+    install_all_doctor_success_mocks
+    rm "$BATS_TEST_TMPDIR/bin/uuidgen"
+    run ./scripts/doctor
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"missing command 'uuidgen': install util-linux-core"* ]]
+  }
+
+  @test "doctor rejects inactive default network" {
+    install_all_doctor_success_mocks
+    install_mock_command virsh '
+  case "$*" in
+    *"version") printf "Using library: libvirt 12.0.0\n" ;;
+    *"net-info default") printf "Active: no\n" ;;
+    *"pool-info default") printf "State: running\n" ;;
+    *) exit 0 ;;
+  esac
+  '
+    run ./scripts/doctor
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"libvirt default network is inactive"* ]]
+  }
+
+  @test "doctor rejects inactive default storage pool" {
+    install_all_doctor_success_mocks
+    install_mock_command virsh '
+  case "$*" in
+    *"version") printf "Using library: libvirt 12.0.0\n" ;;
+    *"net-info default") printf "Active: yes\n" ;;
+    *"pool-info default") printf "State: inactive\n" ;;
+    *) exit 0 ;;
+  esac
+  '
+    run ./scripts/doctor
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"libvirt storage pool 'default' is not running"* ]]
+  }
   ```
 
   Add this helper to `tests/doctor.bats` before the unavailable-port test:
@@ -821,6 +893,8 @@ operator workflows rather than wrapping Redfish itself.
     install_mock_command virsh '
   case "$*" in
     *"version") printf "Using library: libvirt 12.0.0\n" ;;
+    *"net-info default") printf "Active: yes\n" ;;
+    *"pool-info default") printf "State: running\n" ;;
     *) exit 0 ;;
   esac
   '
@@ -831,8 +905,8 @@ operator workflows rather than wrapping Redfish itself.
     *) exit 2 ;;
   esac
   '
-    for command in uname qemu-system-x86_64 qemu-img curl openssl htpasswd bats shellcheck \
-      shfmt grub2-mkrescue xorriso; do
+    for command in uname qemu-system-x86_64 qemu-img uuidgen curl openssl htpasswd bats \
+      shellcheck shfmt grub2-mkrescue xorriso; do
       install_recording_noop "$command"
     done
     install_mock_command uname 'printf "x86_64\n"'
@@ -1004,7 +1078,9 @@ operator workflows rather than wrapping Redfish itself.
   render_template() {
     local input="$1"
     local output="$2"
-    python3 - "$input" "$output" <<'PY'
+    local python_bin
+    python_bin="$(python_313)"
+    "$python_bin" - "$input" "$output" <<'PY'
   import os
   import pathlib
   import sys
@@ -1382,7 +1458,9 @@ operator workflows rather than wrapping Redfish itself.
     local namespace="$2"
     local name="$3"
     local expected="$4"
-    python3 - "$xml" "$namespace" "$name" "$expected" <<'PY'
+    local python_bin
+    python_bin="$(python_313)"
+    "$python_bin" - "$xml" "$namespace" "$name" "$expected" <<'PY'
   import sys
   import xml.etree.ElementTree as ET
 
@@ -1399,7 +1477,9 @@ operator workflows rather than wrapping Redfish itself.
   xml_disk_source_equals() {
     local xml="$1"
     local expected="$2"
-    python3 - "$xml" "$expected" <<'PY'
+    local python_bin
+    python_bin="$(python_313)"
+    "$python_bin" - "$xml" "$expected" <<'PY'
   import sys
   import xml.etree.ElementTree as ET
 
@@ -1680,7 +1760,8 @@ operator workflows rather than wrapping Redfish itself.
       "$VM_X86_REDFISH_STATE_DIR/connection.env"
     grep -F "REDFISH_CREDENTIALS_FILE='$VM_X86_REDFISH_STATE_DIR/credentials.env'" \
       "$VM_X86_REDFISH_STATE_DIR/connection.env"
-    python3 - "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py" <<'PY'
+    python_bin="$(UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+    "$python_bin" - "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py" <<'PY'
   import runpy
   import sys
 
@@ -1840,7 +1921,8 @@ operator workflows rather than wrapping Redfish itself.
   shfmt -i 2 -w scripts/create-vm scripts/render-config scripts/lib/common \
     tests/create-vm.bats tests/render-config.bats
   shellcheck scripts/create-vm scripts/render-config scripts/lib/common
-  python3 -m py_compile config/sushy-emulator.conf.py.in
+  python_bin="$(UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+  "$python_bin" -m py_compile config/sushy-emulator.conf.py.in
   bats tests/create-vm.bats tests/render-config.bats
   make test
   ```
@@ -1932,7 +2014,7 @@ operator workflows rather than wrapping Redfish itself.
     require_private_dir "${STATE_DIR}/tmp"
     tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
     export TMPDIR="$tmpdir"
-    exec uv run sushy-emulator --config "${STATE_DIR}/sushy-emulator.conf.py"
+    exec uv run --locked sushy-emulator --config "${STATE_DIR}/sushy-emulator.conf.py"
   }
 
   with_lifecycle_lock "$LIFECYCLE_LOCK" run_redfish
@@ -2321,15 +2403,22 @@ operator workflows rather than wrapping Redfish itself.
     export VM_X86_REDFISH_INTEGRATION_TEST=1
     export VM_X86_REDFISH_DOMAIN_NAME="vm-x86-redfish-${TEST_ID}"
     export VM_X86_REDFISH_ROOT_VOLUME_NAME="vm-x86-redfish-${TEST_ID}.qcow2"
+    export VM_X86_REDFISH_ARTIFACTS_DIR=".artifacts/${TEST_ID}"
+    mkdir -p "$VM_X86_REDFISH_ARTIFACTS_DIR"
     TRACKED_CHILDREN=()
   }
 
   teardown() {
     stop_tracked_children
-    cleanup_log="$BATS_TEST_TMPDIR/destroy.log"
+    cleanup_log="$VM_X86_REDFISH_ARTIFACTS_DIR/destroy.log"
     cleanup_status=0
     ./scripts/destroy-vm >"$cleanup_log" 2>&1 || cleanup_status="$?"
     if [ "$cleanup_status" -ne 0 ]; then
+      if ! virsh -c "$LIBVIRT_URI" dumpxml "$VM_X86_REDFISH_DOMAIN_NAME" \
+        >"$VM_X86_REDFISH_ARTIFACTS_DIR/domain.xml" 2>&1; then
+        printf 'domain XML unavailable after cleanup failure\n' \
+          >>"$VM_X86_REDFISH_ARTIFACTS_DIR/domain.xml"
+      fi
       printf 'destroy-vm cleanup failed with status %s; see %s\n' \
         "$cleanup_status" "$cleanup_log" >&2
       return "$cleanup_status"
@@ -2482,9 +2571,10 @@ operator workflows rather than wrapping Redfish itself.
 - [ ] **Step 2: Add ISO build and loopback media-server helpers**
 
   Extend `tests/redfish-integration.bats` with helpers that render the sentinel, run
-  `grub2-mkrescue -o "$iso_path" "$iso_root"`, start `python3 -m http.server 0 --bind
-  127.0.0.1`, start a separate local HTTPS media server with a self-signed certificate,
-  and record the exact media-server PIDs for teardown.
+  `grub2-mkrescue -o "$iso_path" "$iso_root"`, resolve `python_bin="$(python_313)"`,
+  start `"$python_bin" -m http.server 0 --bind 127.0.0.1`, start a separate local HTTPS
+  media server with a self-signed certificate, and record the exact media-server PIDs for
+  teardown.
 
 - [ ] **Step 3: Insert media and select Cd boot override**
 
