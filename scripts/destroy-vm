@@ -5,24 +5,79 @@ script_dir="${BASH_SOURCE[0]%/*}"
 # shellcheck source=scripts/lib/common
 source "${script_dir}/lib/common"
 
+destroy_probe_path=""
+
 media_volume_matches_uuid() {
   local name="$1"
   local uuid="$2"
   [[ "$name" =~ ^[^/]+-"$uuid"\.img$ ]]
 }
 
+state_path_is_safe_file_or_absent() {
+  local path="$1"
+  [ ! -L "$path" ] && { [ ! -e "$path" ] || [ -f "$path" ]; }
+}
+
+require_safe_state_file_or_absent() {
+  local path="$1"
+  state_path_is_safe_file_or_absent "$path" || fail "unexpected project state file: $path"
+}
+
 cleanup_project_state_files() {
   local file path
-  for file in domain.xml destroy-domain.xml destroy-domain.current.xml \
-    existing-domain.xml domain-uuid credentials.env htpasswd tls.crt tls.key \
-    connection.env sushy-emulator.conf.py; do
+  local state_files=(
+    domain.xml
+    destroy-domain.xml
+    destroy-domain.current.xml
+    existing-domain.xml
+    credentials.env
+    htpasswd
+    tls.crt
+    tls.key
+    connection.env
+    sushy-emulator.conf.py
+    domain-uuid
+  )
+  for file in "${state_files[@]}"; do
     path="${STATE_DIR}/${file}"
-    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
-      fail "unexpected project state file: $path"
-    fi
+    require_safe_state_file_or_absent "$path"
+  done
+  for file in "${state_files[@]}"; do
+    path="${STATE_DIR}/${file}"
     [ -f "$path" ] && rm -- "$path"
   done
   return 0
+}
+
+cleanup_destroy_probe() {
+  local path="$destroy_probe_path"
+  destroy_probe_path=""
+  [ -n "$path" ] || return 0
+  if [ -f "$path" ] && [ ! -L "$path" ]; then
+    rm -- "$path"
+  fi
+}
+
+domain_exists() {
+  local domain domains
+  if ! domains="$(virsh -c "$LIBVIRT_URI" list --all --name)"; then
+    fail "failed to list libvirt domains"
+  fi
+  while IFS= read -r domain; do
+    [ "$domain" = "$DEFAULT_DOMAIN_NAME" ] && return 0
+  done <<<"$domains"
+  return 1
+}
+
+volume_exists() {
+  local volume volumes
+  if ! volumes="$(virsh -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL" --name)"; then
+    fail "failed to list volumes in libvirt pool $STORAGE_POOL"
+  fi
+  while IFS= read -r volume; do
+    [ "$volume" = "$ROOT_VOLUME_NAME" ] && return 0
+  done <<<"$volumes"
+  return 1
 }
 
 cleanup_tmp_child_dir() {
@@ -80,8 +135,7 @@ validate_destroy_proof() {
     fail "stored destroy proof UUID does not match $DOMAIN_UUID_FILE"
   domain_root_volume_matches_state "$proof_path" ||
     fail "stored destroy proof does not reference $ROOT_VOLUME_NAME"
-  if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
-    >/dev/null 2>&1; then
+  if volume_exists; then
     if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
       "$ROOT_VOLUME_NAME")"; then
       fail "cannot resolve root volume path for $ROOT_VOLUME_NAME"
@@ -94,8 +148,7 @@ validate_destroy_proof() {
 cleanup_absent_domain() {
   local proof_path="$1"
   local uuid="$2"
-  if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
-    >/dev/null 2>&1; then
+  if volume_exists; then
     [ -f "$proof_path" ] ||
       fail "cannot prove ownership of $ROOT_VOLUME_NAME without domain metadata"
     validate_destroy_proof "$proof_path"
@@ -117,19 +170,28 @@ destroy_domain_if_active() {
 }
 
 destroy_transaction() {
-  local root_path uuid xml_path xml_probe
+  local current_probe_path root_path uuid xml_path
   if [ ! -f "$DOMAIN_UUID_FILE" ]; then
     printf 'destroy: no project state found\n'
     return 0
   fi
   uuid="$(read_domain_uuid)"
   xml_path="${STATE_DIR}/destroy-domain.xml"
-  xml_probe="${STATE_DIR}/destroy-domain.current.xml"
-  if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_probe"; then
+  current_probe_path="${STATE_DIR}/destroy-domain.current.xml"
+  require_safe_state_file_or_absent "$xml_path"
+  require_safe_state_file_or_absent "$current_probe_path"
+  destroy_probe_path="$(mktemp "${STATE_DIR}/.destroy-domain.current.xml.XXXXXX")" ||
+    fail "cannot create domain inventory probe in $STATE_DIR"
+  if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$destroy_probe_path"; then
+    cleanup_destroy_probe
+    if domain_exists; then
+      fail "failed to read domain XML: domain $DEFAULT_DOMAIN_NAME is still present"
+    fi
     cleanup_absent_domain "$xml_path" "$uuid"
     return 0
   fi
-  mv -- "$xml_probe" "$xml_path"
+  mv -- "$destroy_probe_path" "$xml_path"
+  destroy_probe_path=""
   domain_is_project_owned "$xml_path" ||
     fail "refusing to destroy unowned domain $DEFAULT_DOMAIN_NAME"
   domain_uuid_matches_state "$xml_path" ||
@@ -145,8 +207,7 @@ destroy_transaction() {
 
   destroy_domain_if_active
   virsh -c "$LIBVIRT_URI" undefine "$DEFAULT_DOMAIN_NAME" --nvram
-  if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
-    >/dev/null 2>&1; then
+  if volume_exists; then
     virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
   fi
   delete_uuid_media_volumes "$uuid"
@@ -154,4 +215,5 @@ destroy_transaction() {
   cleanup_project_state_files
 }
 
+trap cleanup_destroy_probe EXIT
 with_lifecycle_lock "$LIFECYCLE_LOCK" destroy_transaction

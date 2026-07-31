@@ -192,8 +192,12 @@ XML
       touch "$BATS_TEST_TMPDIR/root-delete-failed"
       exit 1
     fi
+    touch "$BATS_TEST_TMPDIR/root-delete-complete"
     ;;
   *"vol-list --pool default --name")
+    if [ ! -f "$BATS_TEST_TMPDIR/root-delete-complete" ]; then
+      printf "vm-x86-redfish.qcow2\n"
+    fi
     ;;
   *)
     exit 0
@@ -211,8 +215,79 @@ esac
   [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
 }
 
+@test "destroy-vm refuses an unsafe current domain probe without changing its target" {
+  printf '11111111-2222-4333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  printf 'outside state\n' >"$BATS_TEST_TMPDIR/outside-state"
+  ln -s "$BATS_TEST_TMPDIR/outside-state" \
+    "$VM_X86_REDFISH_STATE_DIR/destroy-domain.current.xml"
+  install_mock_command virsh '
+case "$*" in
+  *"dumpxml vm-x86-redfish")
+    printf "<domain><name>vm-x86-redfish</name></domain>\n"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected project state file"* ]]
+  run cat "$BATS_TEST_TMPDIR/outside-state"
+  [ "$status" -eq 0 ]
+  [ "$output" = "outside state" ]
+  [ -L "$VM_X86_REDFISH_STATE_DIR/destroy-domain.current.xml" ]
+  [ -f "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+}
+
+@test "destroy-vm preserves state when dumpxml fails for a listed domain" {
+  printf '11111111-2222-4333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  install_mock_command virsh '
+printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+case "$*" in
+  *"dumpxml vm-x86-redfish")
+    exit 1
+    ;;
+  *"list --all --name")
+    printf "vm-x86-redfish\n"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"domain vm-x86-redfish is still present"* ]]
+  [ -f "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  run grep -F "vol-delete" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "destroy-vm preserves state when domain inventory fails" {
+  printf '11111111-2222-4333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  install_mock_command virsh '
+case "$*" in
+  *"dumpxml vm-x86-redfish"|*"list --all --name")
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"failed to list libvirt domains"* ]]
+  [ -f "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+}
+
 @test "destroy-vm force destroys active non-running domain states" {
   for state in paused crashed; do
+    : >"$BATS_TEST_TMPDIR/commands.log"
     printf '11111111-2222-4333-8444-555555555555\n' \
       >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
     printf '%s\n' "$state" >"$BATS_TEST_TMPDIR/domstate"
@@ -340,8 +415,36 @@ esac
   touch "$VM_X86_REDFISH_STATE_DIR/tmp/interrupted-download"
   install_mock_command virsh '
 case "$*" in
-  *"dumpxml vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+  *"dumpxml vm-x86-redfish")
     exit 1
+    ;;
+  *"vol-list --pool default --name")
+    if [ -f "$BATS_TEST_TMPDIR/root-inventory-complete" ]; then
+      exit 1
+    fi
+    touch "$BATS_TEST_TMPDIR/root-inventory-complete"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"failed to list volumes in libvirt pool default"* ]]
+  [ -e "$VM_X86_REDFISH_STATE_DIR/tmp/interrupted-download" ]
+  [ -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+}
+
+@test "destroy-vm preserves state when root volume inventory fails" {
+  printf '11111111-2222-4333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  install_mock_command virsh '
+case "$*" in
+  *"dumpxml vm-x86-redfish")
+    exit 1
+    ;;
+  *"list --all --name")
     ;;
   *"vol-list --pool default --name")
     exit 1
@@ -354,8 +457,30 @@ esac
   run ./scripts/destroy-vm
   [ "$status" -ne 0 ]
   [[ "$output" == *"failed to list volumes in libvirt pool default"* ]]
-  [ -e "$VM_X86_REDFISH_STATE_DIR/tmp/interrupted-download" ]
-  [ -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  [ -f "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+}
+
+@test "destroy-vm validates all state paths before deleting the domain UUID" {
+  printf '11111111-2222-4333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  mkdir "$VM_X86_REDFISH_STATE_DIR/credentials.env"
+  install_mock_command virsh '
+case "$*" in
+  *"dumpxml vm-x86-redfish")
+    exit 1
+    ;;
+  *"list --all --name"|*"vol-list --pool default --name")
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected project state file"* ]]
+  [ -f "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  [ -d "$VM_X86_REDFISH_STATE_DIR/credentials.env" ]
 }
 
 @test "destroy-vm refuses to delete a symlink at an allowlisted state path" {
