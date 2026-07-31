@@ -2,6 +2,32 @@
 
 load "helpers/test-helper"
 
+@test "render-config rejects unset template values without writing output" {
+  template="$BATS_TEST_TMPDIR/template.in"
+  output_path="$BATS_TEST_TMPDIR/rendered.conf"
+  printf 'value=@ROOT_VOLUME_PATH@\n' >"$template"
+
+  run bash -c 'source ./scripts/render-config; unset ROOT_VOLUME_PATH; render_template "$1" "$2"' \
+    -- "$template" "$output_path"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unset template value: @ROOT_VOLUME_PATH@"* ]]
+  [ ! -e "$output_path" ]
+}
+
+@test "render-config rejects unresolved template tokens without writing output" {
+  template="$BATS_TEST_TMPDIR/template.in"
+  output_path="$BATS_TEST_TMPDIR/rendered.conf"
+  printf 'value=@MISSING_VALUE@\n' >"$template"
+
+  run bash -c 'source ./scripts/render-config; render_template "$1" "$2"' \
+    -- "$template" "$output_path"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unresolved template token: @MISSING_VALUE@"* ]]
+  [ ! -e "$output_path" ]
+}
+
 @test "render-config writes domain XML with UUID and owner metadata" {
   mkdir -p "$BATS_TEST_TMPDIR/state"
   printf '123e4567-e89b-42d3-a456-426614174000\n' \

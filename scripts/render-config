@@ -14,6 +14,7 @@ render_template() {
   "$python_bin" - "$input" "$output" <<'PY'
 import os
 import pathlib
+import re
 import sys
 
 source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
@@ -24,10 +25,21 @@ replacements = {
     "@ROOT_VOLUME_PATH@": os.environ.get("ROOT_VOLUME_PATH"),
     "@STATE_DIR@": os.environ.get("STATE_DIR"),
 }
+for token, value in replacements.items():
+    if token in source and value is None:
+        print(f"error: unset template value: {token}", file=sys.stderr)
+        sys.exit(1)
+
 rendered = source
 for key, value in replacements.items():
     if value is not None:
         rendered = rendered.replace(key, value)
+
+unresolved = re.search(r"@[^@\n]+@", rendered)
+if unresolved:
+    print(f"error: unresolved template token: {unresolved.group()}", file=sys.stderr)
+    sys.exit(1)
+
 pathlib.Path(sys.argv[2]).write_text(rendered, encoding="utf-8")
 PY
 }
@@ -54,8 +66,10 @@ render_sushy() {
     "${STATE_DIR}/sushy-emulator.conf.py"
 }
 
-case "${1:-}" in
-domain) render_domain ;;
-sushy) render_sushy ;;
-*) fail "usage: scripts/render-config domain|sushy" ;;
-esac
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+  domain) render_domain ;;
+  sushy) render_sushy ;;
+  *) fail "usage: scripts/render-config domain|sushy" ;;
+  esac
+fi

@@ -168,6 +168,7 @@ esac
   run grep -F "vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2" \
     "$BATS_TEST_TMPDIR/commands.log"
   [ "$status" -eq 0 ]
+  credentials="$(cat "$VM_X86_REDFISH_STATE_DIR/credentials.env")"
 
   : >"$BATS_TEST_TMPDIR/commands.log"
   install_mock_command virsh '
@@ -188,6 +189,13 @@ esac
   [ "$status" -ne 0 ]
   run grep -F "define " "$BATS_TEST_TMPDIR/commands.log"
   [ "$status" -ne 0 ]
+  [ "$(cat "$VM_X86_REDFISH_STATE_DIR/credentials.env")" = "$credentials" ]
+  run grep -F "openssl rand -base64 30" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+  run grep -F "openssl req" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+  run grep -F "htpasswd -iB -c" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -eq 0 ]
 }
 
 @test "create-vm refuses existing domain without project metadata" {
