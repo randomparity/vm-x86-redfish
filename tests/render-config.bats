@@ -2,6 +2,24 @@
 
 load "helpers/test-helper"
 
+@test "render-config writes domain XML with UUID and owner metadata" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '11111111-2222-3333-4444-555555555555\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    run ./scripts/render-config domain
+  [ "$status" -eq 0 ]
+  run grep -F "<name>vm-x86-redfish</name>" "$BATS_TEST_TMPDIR/state/domain.xml"
+  [ "$status" -eq 0 ]
+  run grep -F "<rp:project>vm-x86-redfish</rp:project>" \
+    "$BATS_TEST_TMPDIR/state/domain.xml"
+  [ "$status" -eq 0 ]
+  run grep -F "<uuid>11111111-2222-3333-4444-555555555555</uuid>" \
+    "$BATS_TEST_TMPDIR/state/domain.xml"
+  [ "$status" -eq 0 ]
+}
+
 @test "ensure_private_dir creates mode 0700 directory" {
   run bash -c '
     source scripts/lib/common
