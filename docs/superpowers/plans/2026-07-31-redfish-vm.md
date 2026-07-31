@@ -1982,7 +1982,7 @@ operator workflows rather than wrapping Redfish itself.
     run ./scripts/run-redfish
     [ "$status" -eq 0 ]
     [[ "$output" == *"TMPDIR=$VM_X86_REDFISH_STATE_DIR/tmp"* ]]
-    [[ "$output" == *"run sushy-emulator --config "*"/sushy-emulator.conf.py"* ]]
+    [[ "$output" == *"run --locked sushy-emulator --config "*"/sushy-emulator.conf.py"* ]]
   }
   ```
 
@@ -2050,7 +2050,7 @@ operator workflows rather than wrapping Redfish itself.
 **Interfaces:**
 - Consumes project metadata, recorded UUID, root volume name, and lifecycle lock.
 - Removes only matching project-owned domain, NVRAM, root volume, UUID-scoped media volumes,
-  and validated `.state/tmp` temporary files.
+  and validated `.state/tmp` temporary files or one-level Sushy child directories.
 
 - [ ] **Step 1: Write destruction safety tests**
 
@@ -2194,6 +2194,53 @@ operator workflows rather than wrapping Redfish itself.
     [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
   }
 
+  @test "destroy-vm removes empty Sushy tmp child directory after eject" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp/sushy-download"
+    chmod 700 "$VM_X86_REDFISH_STATE_DIR/tmp"
+    install_mock_command virsh '
+  case "$*" in
+    *"dumpxml vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-list --pool default --name")
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/destroy-vm
+    [ "$status" -eq 0 ]
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/tmp" ]
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  }
+
+  @test "destroy-vm removes interrupted Sushy tmp child file" {
+    printf '11111111-2222-3333-4444-555555555555\n' \
+      >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+    mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp/sushy-download"
+    chmod 700 "$VM_X86_REDFISH_STATE_DIR/tmp"
+    touch "$VM_X86_REDFISH_STATE_DIR/tmp/sushy-download/red.iso"
+    install_mock_command virsh '
+  case "$*" in
+    *"dumpxml vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2")
+      exit 1
+      ;;
+    *"vol-list --pool default --name")
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+  '
+    run ./scripts/destroy-vm
+    [ "$status" -eq 0 ]
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/tmp" ]
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+  }
+
   @test "destroy-vm preserves state when media volume listing fails" {
     printf '11111111-2222-3333-4444-555555555555\n' \
       >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
@@ -2313,11 +2360,14 @@ operator workflows rather than wrapping Redfish itself.
 
 - [ ] **Step 4: Add checked `.state/tmp` cleanup**
 
-  Extend destruction to validate `.state/tmp` with `require_private_dir`, remove every
-  regular file directly under that project-owned private directory, fail on unexpected
-  non-file entries, then remove the directory only if empty. This intentionally does not
-  rely on Sushy temporary filenames containing the domain UUID, because the integration
-  test observes and records the actual interrupted-download path before destruction:
+  Extend destruction to validate canonical `.state/tmp` with `require_private_dir`.
+  Remove only regular files directly under that project-owned private directory and
+  one-level, non-symlink Sushy child directories. For each child directory, remove only
+  regular files, fail on nested directories or other unexpected entries, `rmdir` the
+  now-empty child, and then fail if the top-level tmp directory is still non-empty.
+  This intentionally does not rely on Sushy temporary filenames containing the domain
+  UUID, because the integration test observes and records the actual interrupted-download
+  path before destruction:
 
   ```bash
   cleanup_tmpdir() {
@@ -2328,13 +2378,27 @@ operator workflows rather than wrapping Redfish itself.
     while IFS= read -r -d '' entry; do
       if [ -f "$entry" ]; then
         rm -- "$entry"
+      elif [ -d "$entry" ] && [ ! -L "$entry" ]; then
+        cleanup_tmp_child_dir "$entry"
       else
         fail "unexpected entry in temporary directory: $entry"
       fi
     done < <(find "$tmpdir" -mindepth 1 -maxdepth 1 -print0)
-    if ! rmdir "$tmpdir" 2>/dev/null; then
-      [ -d "$tmpdir" ] || fail "temporary directory disappeared during cleanup: $tmpdir"
-    fi
+    rmdir "$tmpdir" || fail "temporary directory is not empty after cleanup: $tmpdir"
+  }
+
+  cleanup_tmp_child_dir() {
+    local child="$1"
+    local entry
+    reject_symlink "$child"
+    while IFS= read -r -d '' entry; do
+      if [ -f "$entry" ]; then
+        rm -- "$entry"
+      else
+        fail "unexpected entry in Sushy temporary directory: $entry"
+      fi
+    done < <(find "$child" -mindepth 1 -maxdepth 1 -print0)
+    rmdir "$child" || fail "Sushy temporary directory is not empty: $child"
   }
   ```
 
@@ -2404,6 +2468,11 @@ operator workflows rather than wrapping Redfish itself.
     export VM_X86_REDFISH_DOMAIN_NAME="vm-x86-redfish-${TEST_ID}"
     export VM_X86_REDFISH_ROOT_VOLUME_NAME="vm-x86-redfish-${TEST_ID}.qcow2"
     export VM_X86_REDFISH_ARTIFACTS_DIR=".artifacts/${TEST_ID}"
+    source ./scripts/lib/common
+    load_runtime_config
+    [ "$LIBVIRT_URI" = "qemu:///system" ]
+    [ "$STORAGE_POOL" = "default" ]
+    python_313 >/dev/null
     mkdir -p "$VM_X86_REDFISH_ARTIFACTS_DIR"
     TRACKED_CHILDREN=()
   }
