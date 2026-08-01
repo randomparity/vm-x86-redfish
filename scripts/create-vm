@@ -7,9 +7,24 @@ source "${script_dir}/lib/common"
 
 create_domain_uuid_once() {
   ensure_private_dir "$STATE_DIR"
+  require_safe_project_file_or_absent "$DOMAIN_UUID_FILE"
   if [ ! -f "$DOMAIN_UUID_FILE" ]; then
     write_secret_file "$DOMAIN_UUID_FILE" "$(uuidgen)"
   fi
+}
+
+dump_existing_domain_xml() {
+  local tmp_path
+  local xml_path="$1"
+  require_safe_create_state_file_or_absent "$xml_path"
+  tmp_path="$(mktemp "${STATE_DIR}/.existing-domain.xml.XXXXXX")" ||
+    fail "cannot create temporary existing domain XML in $STATE_DIR"
+  if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$tmp_path"; then
+    rm -- "$tmp_path"
+    fail "failed to dump existing domain XML for $DEFAULT_DOMAIN_NAME"
+  fi
+  chmod 600 "$tmp_path"
+  mv -- "$tmp_path" "$xml_path"
 }
 
 validate_or_reject_existing_domain() {
@@ -17,7 +32,7 @@ validate_or_reject_existing_domain() {
   local root_path
   if virsh -c "$LIBVIRT_URI" dominfo "$DEFAULT_DOMAIN_NAME" >/dev/null 2>&1; then
     ensure_private_dir "$STATE_DIR"
-    virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$xml_path"
+    dump_existing_domain_xml "$xml_path"
     domain_is_project_owned "$xml_path" ||
       fail "existing domain $DEFAULT_DOMAIN_NAME is not owned by this project"
     domain_uuid_matches_state "$xml_path" ||

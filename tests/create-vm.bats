@@ -266,6 +266,41 @@ esac
   [ "$output" = "outside" ]
 }
 
+@test "create-vm rejects symlinked domain UUID before creating root volume" {
+  printf '11111111-2222-3333-8444-555555555555\n' \
+    >"$BATS_TEST_TMPDIR/outside-domain-uuid"
+  ln -s "$BATS_TEST_TMPDIR/outside-domain-uuid" \
+    "$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  install_mock_command virsh '
+printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+case "$*" in
+  *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2") exit 1 ;;
+  *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2") exit 0 ;;
+  *) exit 2 ;;
+esac
+'
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected project state file"* ]]
+  run grep -F "vol-create-as" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm rejects existing-domain dump symlinks before writing through them" {
+  install_existing_domain_mocks
+  printf 'outside\n' >"$BATS_TEST_TMPDIR/outside-existing-domain.xml"
+  ln -s "$BATS_TEST_TMPDIR/outside-existing-domain.xml" \
+    "$VM_X86_REDFISH_STATE_DIR/existing-domain.xml"
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected project state file"* ]]
+  [ "$(cat "$BATS_TEST_TMPDIR/outside-existing-domain.xml")" = "outside" ]
+}
+
 @test "create-vm rejects incomplete Redfish TLS state" {
   install_existing_domain_mocks
   touch "$VM_X86_REDFISH_STATE_DIR/tls.crt"

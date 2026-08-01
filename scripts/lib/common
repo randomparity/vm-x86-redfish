@@ -100,8 +100,16 @@ write_secret_file() {
   chmod 600 "$path"
 }
 
+require_safe_project_file_or_absent() {
+  local path="$1"
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+    fail "unexpected project state file: $path"
+  fi
+}
+
 read_domain_uuid() {
   local domain_uuid domain_uuid_regex
+  require_safe_project_file_or_absent "$DOMAIN_UUID_FILE"
   [ -f "$DOMAIN_UUID_FILE" ] || fail "missing domain UUID file: $DOMAIN_UUID_FILE"
   domain_uuid="$(<"$DOMAIN_UUID_FILE")"
   domain_uuid_regex='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'

@@ -47,12 +47,28 @@ def _project_media_volume_name(boot_image: str, identity: str) -> str:
     return f"{PROJECT_MEDIA_VOLUME_PREFIX}{base}-{identity}.img"
 
 
-def _record_media_volume(config: Any, image_name: str) -> None:
+def _media_volume_manifest_path(config: Any, error_type: Any) -> str:
     state_dir = config.get("SUSHY_EMULATOR_STATE_DIR")
     if not state_dir:
-        return
+        raise error_type("Missing Sushy state directory for virtual media cleanup")
+    return os.path.join(state_dir, "media-volumes")
 
-    manifest_path = os.path.join(state_dir, "media-volumes")
+
+def _recorded_media_volumes(config: Any, error_type: Any) -> set[str]:
+    manifest_path = _media_volume_manifest_path(config, error_type)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(manifest_path, flags)
+    except FileNotFoundError:
+        return set()
+    with os.fdopen(fd, encoding="utf-8") as manifest:
+        return {line.rstrip("\n") for line in manifest if line.rstrip("\n")}
+
+
+def _record_media_volume(config: Any, image_name: str, error_type: Any) -> None:
+    manifest_path = _media_volume_manifest_path(config, error_type)
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -107,6 +123,13 @@ def patch() -> None:
         image_size = os.stat(boot_image).st_size
 
         volume_names = [volume.name() for volume in pool.listAllVolumes()]
+        recorded_volumes = _recorded_media_volumes(driver._config, error.FishyError)
+        if image_name in volume_names and image_name not in recorded_volumes:
+            msg = f"Refusing to replace unrecorded virtual media volume {image_name}"
+            raise error.FishyError(msg)
+        if image_name not in recorded_volumes:
+            _record_media_volume(driver._config, image_name, error.FishyError)
+
         if image_name in volume_names:
             volume = pool.storageVolLookupByName(image_name)
             volume.delete()
@@ -119,7 +142,6 @@ def patch() -> None:
                 "size": image_size,
             }
         )
-        _record_media_volume(driver._config, image_name)
 
         stream = conn.newStream()
         volume.upload(stream, 0, image_size)

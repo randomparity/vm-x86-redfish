@@ -9,9 +9,18 @@ source "${script_dir}/lib/common"
 render_template() {
   local input="$1"
   local output="$2"
+  local output_base
+  local output_dir
   local python_bin
+  local tmp_output
   python_bin="$(python_313)"
-  "$python_bin" - "$input" "$output" <<'PY'
+  output_dir="$(dirname "$output")"
+  output_base="${output##*/}"
+  require_private_dir "$output_dir"
+  require_safe_project_file_or_absent "$output"
+  tmp_output="$(mktemp "${output_dir}/.${output_base}.XXXXXX")" ||
+    fail "cannot create temporary rendered file in $output_dir"
+  if ! "$python_bin" - "$input" "$tmp_output" <<'PY'; then
 import os
 import pathlib
 import re
@@ -42,6 +51,11 @@ if unresolved:
 
 pathlib.Path(sys.argv[2]).write_text(rendered, encoding="utf-8")
 PY
+    rm -- "$tmp_output"
+    return 1
+  fi
+  chmod 600 "$tmp_output"
+  mv -- "$tmp_output" "$output"
 }
 
 render_domain() {

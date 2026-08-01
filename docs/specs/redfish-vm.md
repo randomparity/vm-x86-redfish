@@ -258,9 +258,9 @@ resource cleanup. It:
    terminates only its Sushy child to simulate interruption. It waits boundedly for the client
    to fail; if the client remains alive, it terminates and waits for that exact PID.
 10. Terminates and waits for its remaining exact child PIDs, runs locked destruction, and
-    proves the domain, root disk, NVRAM, partial temporary download, every volume matching the
-    anchored `-<UUID>.img` suffix, and temporary state are absent while the developer domain
-    and unrelated libvirt resources remain unchanged.
+    proves the domain, root disk, NVRAM, partial temporary download, manifest-owned project
+    media volumes for the recorded UUID, and temporary state are absent while the developer
+    domain and unrelated libvirt resources remain unchanged.
 
 All polling and child-process termination have explicit timeouts. A test failure copies
 diagnostic logs to `.artifacts/<test-id>/`, then performs best-effort cleanup of resources that

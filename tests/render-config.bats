@@ -4,7 +4,8 @@ load "helpers/test-helper"
 
 @test "render-config rejects unset template values without writing output" {
   template="$BATS_TEST_TMPDIR/template.in"
-  output_path="$BATS_TEST_TMPDIR/rendered.conf"
+  mkdir -m 700 "$BATS_TEST_TMPDIR/private"
+  output_path="$BATS_TEST_TMPDIR/private/rendered.conf"
   printf 'value=@ROOT_VOLUME_PATH@\n' >"$template"
 
   run bash -c 'source ./scripts/render-config; unset ROOT_VOLUME_PATH; render_template "$1" "$2"' \
@@ -17,7 +18,8 @@ load "helpers/test-helper"
 
 @test "render-config rejects unresolved template tokens without writing output" {
   template="$BATS_TEST_TMPDIR/template.in"
-  output_path="$BATS_TEST_TMPDIR/rendered.conf"
+  mkdir -m 700 "$BATS_TEST_TMPDIR/private"
+  output_path="$BATS_TEST_TMPDIR/private/rendered.conf"
   printf 'value=@MISSING_VALUE@\n' >"$template"
 
   run bash -c 'source ./scripts/render-config; render_template "$1" "$2"' \
@@ -113,6 +115,37 @@ load "helpers/test-helper"
   [ ! -e "$BATS_TEST_TMPDIR/state/domain.xml" ]
 }
 
+@test "render-config rejects a symlinked domain UUID without writing domain XML" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/outside-domain-uuid"
+  ln -s "$BATS_TEST_TMPDIR/outside-domain-uuid" "$BATS_TEST_TMPDIR/state/domain-uuid"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    run ./scripts/render-config domain
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected project state file"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/state/domain.xml" ]
+}
+
+@test "render-config rejects symlinked domain XML output before writing through it" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+  printf 'outside\n' >"$BATS_TEST_TMPDIR/outside-domain.xml"
+  ln -s "$BATS_TEST_TMPDIR/outside-domain.xml" "$BATS_TEST_TMPDIR/state/domain.xml"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    run ./scripts/render-config domain
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected project state file"* ]]
+  [ "$(cat "$BATS_TEST_TMPDIR/outside-domain.xml")" = "outside" ]
+}
+
 @test "render-config finds its domain template outside the repository root" {
   mkdir -p "$BATS_TEST_TMPDIR/state"
   printf '123e4567-e89b-42d3-a456-426614174000\n' \
@@ -142,6 +175,21 @@ load "helpers/test-helper"
   run grep -F "SUSHY_EMULATOR_STATE_DIR = \"$BATS_TEST_TMPDIR/state/sushy\"" \
     "$BATS_TEST_TMPDIR/state/sushy-emulator.conf.py"
   [ "$status" -eq 0 ]
+}
+
+@test "render-config rejects symlinked Sushy config output before writing through it" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+  printf 'outside\n' >"$BATS_TEST_TMPDIR/outside-sushy.conf.py"
+  ln -s "$BATS_TEST_TMPDIR/outside-sushy.conf.py" \
+    "$BATS_TEST_TMPDIR/state/sushy-emulator.conf.py"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" run ./scripts/render-config sushy
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected project state file"* ]]
+  [ "$(cat "$BATS_TEST_TMPDIR/outside-sushy.conf.py")" = "outside" ]
 }
 
 @test "run-redfish refuses when lifecycle lock is held" {

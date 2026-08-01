@@ -134,3 +134,82 @@ def test_upload_image_records_manifest_before_upload_failure(tmp_path: Path) -> 
     assert (state_dir / "media-volumes").read_text(encoding="utf-8") == (
         "vm-x86-redfish-media-fedora-iso-11111111-2222-4333-8444-555555555555.img\n"
     )
+
+
+def test_upload_image_records_manifest_before_create_failure(tmp_path: Path) -> None:
+    boot_image = tmp_path / "fedora.iso"
+    boot_image.write_bytes(b"iso")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    class Domain:
+        def UUIDString(self) -> str:
+            return "11111111-2222-4333-8444-555555555555"
+
+    class Pool:
+        def XMLDesc(self) -> str:
+            return "<pool><target><path>/var/lib/libvirt/images</path></target></pool>"
+
+        def listAllVolumes(self) -> list[object]:
+            return []
+
+        def createXML(self, _xml: str) -> object:
+            raise RuntimeError("create failed")
+
+    class Connection:
+        def storagePoolLookupByName(self, _name: str) -> Pool:
+            return Pool()
+
+    class Driver:
+        STORAGE_POOL = "default"
+        STORAGE_VOLUME_XML = "%(name)s %(path)s %(size)s"
+
+        def __init__(self) -> None:
+            self._config = {"SUSHY_EMULATOR_STATE_DIR": str(state_dir)}
+
+    upload_image = cast(Any, libvirtdriver.LibvirtDriver._upload_image)
+    with pytest.raises(RuntimeError, match="create failed"):
+        upload_image(Driver(), Domain(), Connection(), str(boot_image))
+
+    assert (state_dir / "media-volumes").read_text(encoding="utf-8") == (
+        "vm-x86-redfish-media-fedora-iso-11111111-2222-4333-8444-555555555555.img\n"
+    )
+
+
+def test_upload_image_refuses_unrecorded_existing_volume(tmp_path: Path) -> None:
+    boot_image = tmp_path / "fedora.iso"
+    boot_image.write_bytes(b"iso")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    class Domain:
+        def UUIDString(self) -> str:
+            return "11111111-2222-4333-8444-555555555555"
+
+    class ExistingVolume:
+        def name(self) -> str:
+            return "vm-x86-redfish-media-fedora-iso-11111111-2222-4333-8444-555555555555.img"
+
+    class Pool:
+        def XMLDesc(self) -> str:
+            return "<pool><target><path>/var/lib/libvirt/images</path></target></pool>"
+
+        def listAllVolumes(self) -> list[ExistingVolume]:
+            return [ExistingVolume()]
+
+    class Connection:
+        def storagePoolLookupByName(self, _name: str) -> Pool:
+            return Pool()
+
+    class Driver:
+        STORAGE_POOL = "default"
+        STORAGE_VOLUME_XML = "%(name)s %(path)s %(size)s"
+
+        def __init__(self) -> None:
+            self._config = {"SUSHY_EMULATOR_STATE_DIR": str(state_dir)}
+
+    upload_image = cast(Any, libvirtdriver.LibvirtDriver._upload_image)
+    with pytest.raises(error.FishyError, match="Refusing to replace unrecorded"):
+        upload_image(Driver(), Domain(), Connection(), str(boot_image))
+
+    assert not (state_dir / "media-volumes").exists()
