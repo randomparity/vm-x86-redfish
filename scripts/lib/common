@@ -165,6 +165,8 @@ check_listener_available() {
   local address="$1"
   local port="$2"
   local probe_port="$port"
+  local probe_output
+  local probe_status
   local python_bin
   local endpoint
   if integration_override_enabled && [ -n "${VM_X86_REDFISH_PORT_CHECK_PORT:-}" ]; then
@@ -178,23 +180,39 @@ check_listener_available() {
     esac
   fi
   python_bin="$(python_313)"
-  "$python_bin" - "$address" "$probe_port" <<'PY' || fail "$endpoint is already in use"
+  if probe_output="$("$python_bin" - "$address" "$probe_port" 2>&1 <<'PY'
+import errno
 import socket
 import sys
 
-address, port = sys.argv[1:]
-infos = socket.getaddrinfo(
-    address,
-    int(port),
-    type=socket.SOCK_STREAM,
-    flags=socket.AI_NUMERICHOST | socket.AI_PASSIVE,
-)
-family, socktype, protocol, _, sockaddr = infos[0]
-with socket.socket(family, socktype, protocol) as sock:
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(sockaddr)
-    sock.listen()
+try:
+    address, port = sys.argv[1:]
+    infos = socket.getaddrinfo(
+        address,
+        int(port),
+        type=socket.SOCK_STREAM,
+        flags=socket.AI_NUMERICHOST | socket.AI_PASSIVE,
+    )
+    family, socktype, protocol, _, sockaddr = infos[0]
+    with socket.socket(family, socktype, protocol) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(sockaddr)
+        sock.listen()
+except OSError as error:
+    reason = (error.strerror or "socket error").replace("\n", " ")
+    print(reason)
+    raise SystemExit(2 if error.errno == errno.EADDRINUSE else 1)
 PY
+  )"; then
+    return 0
+  else
+    probe_status=$?
+  fi
+  if [ "$probe_status" -eq 2 ]; then
+    fail "$endpoint is already in use"
+  fi
+  [ -n "$probe_output" ] || probe_output="socket error"
+  fail "cannot bind $endpoint: $probe_output"
 }
 
 reject_listener_collision() {

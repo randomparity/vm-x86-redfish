@@ -164,6 +164,27 @@ esac
   [[ "$doctor_output" == *"127.0.0.1:${test_port} is already in use"* ]]
 }
 
+@test "doctor reports a non-bindable configured endpoint without a traceback" {
+  local python_bin
+  python_bin="$(PATH="${PATH#*:}" UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+  install_all_doctor_success_mocks
+  install_mock_command uv "
+case \"\$*\" in
+  \"python find 3.13\") printf '%s\\n' '$python_bin' ;;
+  *) exit 2 ;;
+esac
+"
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=8443 \
+    run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot bind 192.0.2.20:8443: Cannot assign requested address"* ]]
+  [[ "$output" != *"already in use"* ]]
+  [[ "$output" != *"Traceback"* ]]
+}
+
 @test "doctor accepts recently closed loopback connections" {
   python_bin="$(PATH="${PATH#*:}" UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
   test_port="$(
