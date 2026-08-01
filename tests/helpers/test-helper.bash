@@ -128,24 +128,33 @@ stop_tracked_children() {
   TRACKED_CHILDREN=()
 }
 
+child_is_running_job() {
+  local target_pid="$1"
+  local job_pid
+  while IFS= read -r job_pid; do
+    [ "$job_pid" = "$target_pid" ] && return 0
+  done < <(jobs -pr)
+  return 1
+}
+
 stop_child() {
   local pid="$1"
   local timeout_seconds="${CHILD_STOP_TIMEOUT_SECONDS:-10}"
   [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 2
-  if ! kill "$pid" 2>/dev/null; then
+  if ! child_is_running_job "$pid"; then
+    wait "$pid" 2>/dev/null || true
     return 0
   fi
+  kill "$pid" 2>/dev/null || true
   local deadline=$((SECONDS + timeout_seconds))
-  while kill -0 "$pid" 2>/dev/null; do
+  while child_is_running_job "$pid"; do
     [ "$SECONDS" -lt "$deadline" ] || break
     sleep 0.1
   done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -9 "$pid"
+  if child_is_running_job "$pid"; then
+    kill -9 "$pid" 2>/dev/null || true
   fi
-  if wait "$pid" 2>/dev/null; then
-    return 0
-  fi
+  wait "$pid" 2>/dev/null || true
   return 0
 }
 

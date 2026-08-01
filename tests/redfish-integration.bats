@@ -1382,6 +1382,34 @@ teardown() {
   [ "$status" -ne 0 ]
 }
 
+@test "exact child cleanup reaps an exited child without signaling a reused PID" {
+  true &
+  exited_pid="$!"
+  track_child "$exited_pid"
+  sleep 0.1
+  kill() {
+    printf '%s\n' "$*" >>"$BATS_TEST_TMPDIR/unexpected-signals"
+    return 0
+  }
+
+  stop_tracked_child "$exited_pid"
+
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected-signals" ]
+  [ "${#TRACKED_CHILDREN[@]}" -eq 0 ]
+}
+
+@test "exact child cleanup terminates and reaps a running tracked child" {
+  sleep 30 &
+  running_pid="$!"
+  track_child "$running_pid"
+
+  stop_tracked_child "$running_pid"
+
+  run kill -0 "$running_pid"
+  [ "$status" -ne 0 ]
+  [ "${#TRACKED_CHILDREN[@]}" -eq 0 ]
+}
+
 @test "integration harness installs bounded client helpers before live mutation" {
   bounded_client_path="$PATH"
   install_mock_command curl 'printf "curl %s\n" "$*"'
