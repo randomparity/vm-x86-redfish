@@ -29,7 +29,7 @@ wait_for_domain_state() {
   local expected="$1"
   local deadline=$((SECONDS + 30))
   local state
-  until state="$(virsh -c "$LIBVIRT_URI" domstate "$VM_X86_REDFISH_DOMAIN_NAME")" &&
+  until state="$(bounded_virsh domstate "$VM_X86_REDFISH_DOMAIN_NAME")" &&
     [ "$state" = "$expected" ]; do
     [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 1
@@ -39,7 +39,7 @@ wait_for_domain_state() {
 post_reset() {
   local system_url="$1"
   local reset_type="$2"
-  curl --silent --show-error --fail \
+  bounded_curl --silent --show-error --fail \
     --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
     --user "${REDFISH_USERNAME}:${REDFISH_PASSWORD}" \
     -H 'Content-Type: application/json' \
@@ -51,9 +51,10 @@ teardown() {
   stop_tracked_children
   cleanup_log="$VM_X86_REDFISH_ARTIFACTS_DIR/destroy.log"
   cleanup_status=0
-  ./scripts/destroy-vm >"$cleanup_log" 2>&1 || cleanup_status="$?"
+  timeout --kill-after=5 120 ./scripts/destroy-vm >"$cleanup_log" 2>&1 ||
+    cleanup_status="$?"
   if [ "$cleanup_status" -ne 0 ]; then
-    if ! virsh -c "$LIBVIRT_URI" dumpxml "$VM_X86_REDFISH_DOMAIN_NAME" \
+    if ! bounded_virsh dumpxml "$VM_X86_REDFISH_DOMAIN_NAME" \
       >"$VM_X86_REDFISH_ARTIFACTS_DIR/domain.xml" 2>&1; then
       printf 'domain XML unavailable after cleanup failure\n' \
         >>"$VM_X86_REDFISH_ARTIFACTS_DIR/domain.xml"
@@ -67,6 +68,23 @@ teardown() {
 @test "integration harness installs cleanup helpers before live mutation" {
   run declare -F stop_tracked_children
   [ "$status" -eq 0 ]
+}
+
+@test "integration harness installs bounded client helpers before live mutation" {
+  original_path="$PATH"
+  install_mock_command curl 'printf "curl %s\n" "$*"'
+  install_mock_command timeout 'printf "timeout %s\n" "$*"'
+
+  run bounded_curl https://127.0.0.1:8000/redfish/v1
+  [ "$status" -eq 0 ]
+  [ "$output" = \
+    "curl --connect-timeout 5 --max-time 15 https://127.0.0.1:8000/redfish/v1" ]
+
+  run bounded_virsh domstate example-domain
+  [ "$status" -eq 0 ]
+  [ "$output" = \
+    "timeout --kill-after=2 10 virsh -c qemu:///system domstate example-domain" ]
+  export PATH="$original_path"
 }
 
 @test "integration harness stops children before destroying VM resources" {
@@ -95,12 +113,12 @@ teardown() {
   run kill -0 "$child_pid"
   [ "$status" -ne 0 ]
 
-  run ./scripts/destroy-vm
+  run timeout --kill-after=5 120 ./scripts/destroy-vm
   [ "$status" -eq 0 ]
 }
 
 @test "authenticated Redfish controls isolated libvirt domain power" {
-  run ./scripts/create-vm
+  run timeout --kill-after=5 120 ./scripts/create-vm
   [ "$status" -eq 0 ]
 
   ./scripts/run-redfish >"$VM_X86_REDFISH_ARTIFACTS_DIR/sushy.log" 2>&1 &
@@ -108,12 +126,12 @@ teardown() {
   track_child "$sushy_pid"
 
   wait_for_url "https://127.0.0.1:8000/redfish/v1"
-  run curl --silent --show-error --fail \
+  run bounded_curl --silent --show-error --fail \
     --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
     "https://127.0.0.1:8000/redfish/v1"
   [ "$status" -eq 0 ]
 
-  run curl --silent --output /dev/null --write-out '%{http_code}' \
+  run bounded_curl --silent --output /dev/null --write-out '%{http_code}' \
     --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
     "https://127.0.0.1:8000/redfish/v1/Systems"
   [ "$status" -eq 0 ]
@@ -122,7 +140,7 @@ teardown() {
   # shellcheck disable=SC1091 # create-vm writes this test-specific credentials file.
   source "$VM_X86_REDFISH_STATE_DIR/credentials.env"
   systems_json="$VM_X86_REDFISH_ARTIFACTS_DIR/systems.json"
-  curl --silent --show-error --fail \
+  bounded_curl --silent --show-error --fail \
     --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
     --user "${REDFISH_USERNAME}:${REDFISH_PASSWORD}" \
     "https://127.0.0.1:8000/redfish/v1/Systems" >"$systems_json"
@@ -141,9 +159,38 @@ PY
   )"
   [[ "$system_url" = /redfish/v1/Systems/* ]]
 
+  run bounded_virsh domstate "$VM_X86_REDFISH_DOMAIN_NAME"
+  [ "$status" -eq 0 ]
+  [ "$output" = "shut off" ]
+  run bounded_curl --silent --output /dev/null --write-out '%{http_code}' \
+    --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
+    -H 'Content-Type: application/json' \
+    -d '{"ResetType":"On"}' \
+    "https://127.0.0.1:8000${system_url}/Actions/ComputerSystem.Reset"
+  [ "$status" -eq 0 ]
+  [ "$output" = "401" ]
+  run bounded_virsh domstate "$VM_X86_REDFISH_DOMAIN_NAME"
+  [ "$status" -eq 0 ]
+  [ "$output" = "shut off" ]
+
   post_reset "$system_url" On
   wait_for_domain_state running
+
+  restart_events="$VM_X86_REDFISH_ARTIFACTS_DIR/force-restart-events.log"
+  timeout --kill-after=5 20 virsh -c "$LIBVIRT_URI" event \
+    --domain "$VM_X86_REDFISH_DOMAIN_NAME" --event lifecycle --loop --timeout 15 \
+    >"$restart_events" 2>&1 &
+  event_pid="$!"
+  track_child "$event_pid"
+  sleep 1
+  run kill -0 "$event_pid"
+  [ "$status" -eq 0 ]
   post_reset "$system_url" ForceRestart
+  wait "$event_pid"
+  run grep -E 'Stopped Destroyed$' "$restart_events"
+  [ "$status" -eq 0 ]
+  run grep -E 'Started Booted$' "$restart_events"
+  [ "$status" -eq 0 ]
   wait_for_domain_state running
   post_reset "$system_url" ForceOff
   wait_for_domain_state "shut off"

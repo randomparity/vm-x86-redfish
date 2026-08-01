@@ -18,6 +18,7 @@ check_commands() {
   need_command uuidgen "util-linux-core"
   need_command uv "uv"
   need_command curl "curl"
+  need_command timeout "coreutils"
   need_command openssl "openssl"
   need_command htpasswd "httpd-tools"
   need_command gcc "gcc"

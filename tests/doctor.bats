@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2016 # Mock bodies expand when the installed scripts run.
 
 load "helpers/test-helper"
 
@@ -55,8 +56,8 @@ case "$*" in
 esac
 '
   install_mock_command pkg-config 'exit 0'
-  for command in qemu-system-x86_64 qemu-img uuidgen curl openssl htpasswd gcc bats \
-    shellcheck shfmt grub2-mkrescue xorriso; do
+  for command in qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd gcc \
+    bats shellcheck shfmt grub2-mkrescue xorriso; do
     install_recording_noop "$command"
   done
   mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
@@ -88,8 +89,8 @@ case "$*" in
 esac
 '
   install_mock_command pkg-config 'exit 0'
-  for command in uname qemu-system-x86_64 qemu-img uuidgen curl openssl htpasswd bats \
-    gcc shellcheck shfmt grub2-mkrescue xorriso; do
+  for command in uname qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd \
+    bats gcc shellcheck shfmt grub2-mkrescue xorriso; do
     install_recording_noop "$command"
   done
   install_mock_command uname 'printf "x86_64\n"'
@@ -113,6 +114,14 @@ esac
   PATH="$BATS_TEST_TMPDIR/bin" run ./scripts/doctor
   [ "$status" -ne 0 ]
   [[ "$output" == *"missing command 'uuidgen': install util-linux-core"* ]]
+}
+
+@test "doctor reports missing timeout with Fedora package hint" {
+  install_all_doctor_success_mocks
+  rm "$BATS_TEST_TMPDIR/bin/timeout"
+  PATH="$BATS_TEST_TMPDIR/bin" run ./scripts/doctor
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"missing command 'timeout': install coreutils"* ]]
 }
 
 @test "doctor reports missing libvirt development headers" {
@@ -155,7 +164,12 @@ esac
 
 @test "doctor does not create VM runtime state" {
   install_all_doctor_success_mocks
-  run ./scripts/doctor
+  doctor_workdir="$BATS_TEST_TMPDIR/doctor-workdir"
+  mkdir -p "$doctor_workdir"
+  cd "$doctor_workdir"
+  unset VM_X86_REDFISH_STATE_DIR VM_X86_REDFISH_ARTIFACTS_DIR
+
+  run "$REPO_ROOT/scripts/doctor"
   [ "$status" -eq 0 ]
   [ ! -e .state ]
   [ ! -e .artifacts ]
