@@ -10,6 +10,10 @@ setup() {
   export VM_X86_REDFISH_DOMAIN_NAME="vm-x86-redfish-${TEST_ID}"
   export VM_X86_REDFISH_ROOT_VOLUME_NAME="vm-x86-redfish-${TEST_ID}.qcow2"
   export VM_X86_REDFISH_ARTIFACTS_DIR=".artifacts/${TEST_ID}"
+  export VM_X86_REDFISH_SOURCE_IMAGE="$BATS_TEST_TMPDIR/source.qcow2"
+  export VM_X86_REDFISH_MEMORY_MIB=4096
+  export VM_X86_REDFISH_ROOT_DISK_GIB=1
+  qemu-img create -f qcow2 "$VM_X86_REDFISH_SOURCE_IMAGE" 64M >/dev/null
   source ./scripts/lib/common
   load_runtime_config
   [ "$LIBVIRT_URI" = "qemu:///system" ]
@@ -674,6 +678,17 @@ esac
 @test "authenticated Redfish controls isolated libvirt domain power" {
   run timeout --kill-after=5 120 ./scripts/create-vm
   [ "$status" -eq 0 ]
+
+  root_info="$(bounded_virsh vol-dumpxml --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
+  python_bin="$(python_313)"
+  "$python_bin" - "$root_info" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+volume = ET.fromstring(sys.argv[1])
+assert volume.find("capacity").text == str(1024**3)
+assert volume.find("target/format").get("type") == "qcow2"
+PY
 
   ./scripts/run-redfish >"$VM_X86_REDFISH_ARTIFACTS_DIR/sushy.log" 2>&1 &
   sushy_pid="$!"

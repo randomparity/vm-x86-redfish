@@ -99,19 +99,29 @@ permissions, SELinux policy, or packages. On Fedora 44, `htpasswd` is supplied b
 
 The fixed domain name is `vm-x86-redfish`. Its definition contains:
 
-- `type='kvm'`, x86_64 `q35`, two vCPUs, and 4 GiB RAM;
+- `type='kvm'`, x86_64 `q35`, two vCPUs, configurable RAM (4 GiB by default), and host CPU
+  passthrough;
 - libvirt UEFI firmware auto-selection with Secure Boot disabled;
-- one sparse 40 GiB qcow2 volume in the `default` pool;
+- one managed qcow2 volume in the `default` pool, copied from an operator-selected qcow2
+  image and resized to a configurable capacity (40 GiB by default);
 - one virtio NIC attached to the active `default` network;
 - one emulated 16550A serial device at COM1 with a matching libvirt console target named
   `serial0`; no virtio console;
 - no permanently attached CD-ROM; Sushy adds and removes virtual media;
 - namespaced libvirt metadata identifying project ownership and the exact root-volume name.
 
+The create-time inputs are `VM_X86_REDFISH_SOURCE_IMAGE`,
+`VM_X86_REDFISH_MEMORY_MIB`, and `VM_X86_REDFISH_ROOT_DISK_GIB`. The source image is
+required; memory and disk size use the defaults above. The target disk must be at least as
+large as the source image's virtual size. Creation never modifies the source file, and guest
+filesystem expansion remains the responsibility of cloud-init or the image's normal
+first-boot behavior.
+
 Creation generates a UUID once and records it in `.state/domain-uuid`. If a resource with
 the fixed name already exists without matching ownership metadata and UUID, creation fails.
 Re-running creation validates the existing definition and repairs only missing project-owned
-runtime files; it does not overwrite divergent VM hardware.
+runtime files; it does not overwrite divergent VM hardware. Namespaced metadata records the
+configured memory, disk size, and source-image digest so incompatible reruns fail.
 
 If domain definition fails after creating the disk, creation deletes that exact new volume.
 It never modifies the existing `ubuntu25.10` domain or any host network or pool.

@@ -11,11 +11,21 @@ details and credentials, and start the Redfish service:
 
 ```bash
 make doctor
+export VM_X86_REDFISH_SOURCE_IMAGE=/path/to/fedora-cloud.qcow2
+export VM_X86_REDFISH_MEMORY_MIB=8192
+export VM_X86_REDFISH_ROOT_DISK_GIB=80
 make create
 source .state/connection.env
 source "$REDFISH_CREDENTIALS_FILE"
 make redfish
 ```
+
+`VM_X86_REDFISH_SOURCE_IMAGE` is required and must point to a readable qcow2 image.
+Memory defaults to `4096` MiB and root-disk size defaults to `40` GiB when their variables
+are omitted. Creation copies the source into the libvirt pool, resizes only that managed
+copy, and leaves filesystem growth to the guest image's normal first-boot behavior. Use the
+same three settings on later `make create` runs; incompatible settings are rejected instead
+of changing an existing VM.
 
 `make redfish` runs Sushy in the foreground. Leave it running and make Redfish requests from
 a second terminal:

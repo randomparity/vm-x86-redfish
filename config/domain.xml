@@ -5,9 +5,12 @@
     <rp:vm-x86-redfish>
       <rp:project>vm-x86-redfish</rp:project>
       <rp:root-volume>@ROOT_VOLUME_NAME@</rp:root-volume>
+      <rp:memory-mib>@MEMORY_MIB@</rp:memory-mib>
+      <rp:root-disk-gib>@ROOT_DISK_GIB@</rp:root-disk-gib>
+      <rp:source-image-sha256>@SOURCE_IMAGE_SHA256@</rp:source-image-sha256>
     </rp:vm-x86-redfish>
   </metadata>
-  <memory unit='MiB'>4096</memory>
+  <memory unit='MiB'>@MEMORY_MIB@</memory>
   <vcpu placement='static'>2</vcpu>
   <os firmware='efi'>
     <type arch='x86_64' machine='q35'>hvm</type>
