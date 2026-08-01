@@ -286,12 +286,13 @@ PY
 }
 
 @test "create-vm rejects mismatched TLS SAN identity without replacing it" {
-  local cert_before key_before
+  local cert_before domain_uuid_before key_before state_path
   install_existing_domain_mocks
   printf 'test-cert\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
   printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
   chmod 600 "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
   cert_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  domain_uuid_before="$(<"$VM_X86_REDFISH_STATE_DIR/domain-uuid")"
   key_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")"
 
   VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS=1 \
@@ -303,6 +304,10 @@ PY
   [[ "$output" == *"destroy and recreate"* ]]
   [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")" = "$cert_before" ]
   [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")" = "$key_before" ]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/domain-uuid")" = "$domain_uuid_before" ]
+  for state_path in credentials.env htpasswd connection.env sushy-emulator.conf.py; do
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/$state_path" ]
+  done
 }
 
 @test "create-vm reports TLS SAN verification errors" {
@@ -315,6 +320,27 @@ PY
 
   [ "$status" -ne 0 ]
   [[ "$output" == *"failed to verify Redfish TLS certificate"* ]]
+}
+
+@test "create-vm rolls back a TLS SAN identity when publishing its key fails" {
+  local tmp_tls
+  install_existing_domain_mocks
+  install_mock_command mv '
+destination="${!#}"
+if [ "$destination" = "$VM_X86_REDFISH_STATE_DIR/tls.key" ]; then
+  exit 1
+fi
+/usr/bin/mv "$@"
+'
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [ ! -e "$VM_X86_REDFISH_STATE_DIR/tls.crt" ]
+  [ ! -e "$VM_X86_REDFISH_STATE_DIR/tls.key" ]
+  shopt -s nullglob
+  tmp_tls=("$VM_X86_REDFISH_STATE_DIR"/.tls.*)
+  [ "${#tmp_tls[@]}" -eq 0 ]
 }
 
 @test "create-vm writes source-safe default connection metadata" {

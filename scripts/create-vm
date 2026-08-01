@@ -147,6 +147,7 @@ import_root_volume() {
 }
 
 create_redfish_runtime_state() {
+  validate_existing_tls
   create_redfish_credentials_once
   create_tls_once
   write_connection_metadata
@@ -222,11 +223,9 @@ REDFISH_PASSWORD='${password}'"
   write_htpasswd "$htpasswd_path"
 }
 
-create_tls_once() {
+validate_existing_tls() {
   local cert_path="${STATE_DIR}/tls.crt"
   local key_path="${STATE_DIR}/tls.key"
-  local san
-  local tmp_cert tmp_key
   local verify_status
   require_safe_create_state_file_or_absent "$cert_path"
   require_safe_create_state_file_or_absent "$key_path"
@@ -247,6 +246,17 @@ create_tls_once() {
   if [ -f "$cert_path" ] || [ -f "$key_path" ]; then
     fail "incomplete Redfish TLS state: expected both $cert_path and $key_path"
   fi
+}
+
+create_tls_once() {
+  local cert_path="${STATE_DIR}/tls.crt"
+  local key_path="${STATE_DIR}/tls.key"
+  local san
+  local tmp_cert tmp_key
+  validate_existing_tls
+  if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+    return 0
+  fi
   san="DNS:localhost,IP:127.0.0.1"
   if [ "$REDFISH_LISTEN_IP" != "127.0.0.1" ]; then
     san+=",IP:${REDFISH_LISTEN_IP}"
@@ -266,8 +276,14 @@ create_tls_once() {
     fail "failed to create Redfish TLS certificate"
   fi
   chmod 600 "$tmp_key" "$tmp_cert"
-  mv -- "$tmp_cert" "$cert_path"
-  mv -- "$tmp_key" "$key_path"
+  if ! mv -- "$tmp_cert" "$cert_path"; then
+    rm -- "$tmp_cert" "$tmp_key"
+    fail "failed to publish Redfish TLS certificate"
+  fi
+  if ! mv -- "$tmp_key" "$key_path"; then
+    rm -- "$tmp_key" "$cert_path"
+    fail "failed to publish Redfish TLS key"
+  fi
 }
 
 shell_quote() {
