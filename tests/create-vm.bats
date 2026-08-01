@@ -4,6 +4,8 @@ load "helpers/test-helper"
 
 setup() {
   setup_test_workspace
+  export VM_X86_REDFISH_REAL_OPENSSL
+  VM_X86_REDFISH_REAL_OPENSSL="$(command -v openssl)"
   export VM_X86_REDFISH_SOURCE_IMAGE="$BATS_TEST_TMPDIR/source.qcow2"
   printf 'test qcow2 image\n' >"$VM_X86_REDFISH_SOURCE_IMAGE"
   export VM_X86_REDFISH_TEST_SOURCE_SHA256
@@ -20,6 +22,48 @@ esac
     'printf "uuidgen\\n" >>"$BATS_TEST_TMPDIR/commands.log"
 printf "11111111-2222-3333-8444-555555555555\\n"'
   install_redfish_state_mocks
+}
+
+install_real_openssl() {
+  install_mock_command openssl \
+    "exec '$VM_X86_REDFISH_REAL_OPENSSL' \"\$@\""
+}
+
+generate_valid_tls_pair() {
+  local cert_path="$1"
+  local key_path="$2"
+  "$VM_X86_REDFISH_REAL_OPENSSL" req -x509 -newkey rsa:2048 -sha256 -days 2 -nodes \
+    -subj "/CN=localhost" -addext "subjectAltName=IP:127.0.0.1" \
+    -keyout "$key_path" -out "$cert_path" >/dev/null 2>&1
+  chmod 600 "$cert_path" "$key_path"
+}
+
+generate_expired_tls_pair() {
+  local cert_path="$1"
+  local key_path="$2"
+  local extension_path="$BATS_TEST_TMPDIR/expired-tls.extensions"
+  "$VM_X86_REDFISH_REAL_OPENSSL" genpkey -algorithm RSA \
+    -pkeyopt rsa_keygen_bits:2048 -out "$key_path" >/dev/null 2>&1
+  printf 'subjectAltName=IP:127.0.0.1\n' >"$extension_path"
+  "$VM_X86_REDFISH_REAL_OPENSSL" x509 -new -key "$key_path" \
+    -subj "/CN=localhost" -not_before 20200101000000Z -not_after 20200102000000Z \
+    -extfile "$extension_path" -out "$cert_path" >/dev/null 2>&1
+  rm -- "$extension_path"
+  chmod 600 "$cert_path" "$key_path"
+}
+
+assert_tls_rejection_preserved_precreate_state() {
+  local cert_digest="$1"
+  local key_digest="$2"
+  local state_path
+  [ "$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")" = "$cert_digest" ]
+  [ "$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")" = "$key_digest" ]
+  run grep -F "virsh " "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+  for state_path in domain-uuid domain.xml credentials.env htpasswd connection.env \
+    sushy-emulator.conf.py; do
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/$state_path" ]
+  done
 }
 
 install_redfish_state_mocks() {
@@ -49,8 +93,20 @@ case "$*" in
     printf "test-key\\n" >"$key"
     printf "test-cert\\n" >"$cert"
     ;;
+  verify*)
+    exit "${VM_X86_REDFISH_OPENSSL_VERIFY_STATUS:-0}"
+    ;;
+  pkey*)
+    printf "%s\n" "${VM_X86_REDFISH_OPENSSL_KEY_PUBLIC:-test-public-key}"
+    ;;
   x509*)
-    exit "${VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS:-0}"
+    if [[ "$*" == *" -checkip "* ]]; then
+      exit "${VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS:-0}"
+    fi
+    if [[ "$*" == *" -pubkey "* ]]; then
+      printf "%s\n" "${VM_X86_REDFISH_OPENSSL_CERT_PUBLIC:-test-public-key}"
+    fi
+    exit "${VM_X86_REDFISH_OPENSSL_X509_STATUS:-0}"
     ;;
   *)
     exit 2
@@ -304,7 +360,7 @@ PY
 
   [ "$status" -ne 0 ]
   [[ "$output" == *"does not cover configured Redfish listener 192.0.2.20"* ]]
-  [[ "$output" == *"destroy and recreate"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
   [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")" = "$cert_before" ]
   [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")" = "$key_before" ]
   [ "$(<"$VM_X86_REDFISH_STATE_DIR/domain-uuid")" = "$domain_uuid_before" ]
@@ -349,6 +405,62 @@ PY
 
   [ "$status" -ne 0 ]
   [[ "$output" == *"failed to verify Redfish TLS certificate"* ]]
+}
+
+@test "create-vm rejects malformed TLS before VM or generated-state mutation" {
+  local cert_digest key_digest
+  install_create_success_mocks
+  generate_valid_tls_pair \
+    "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  printf 'not a certificate\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  cert_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")"
+  install_real_openssl
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"existing Redfish TLS certificate is malformed"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
+  assert_tls_rejection_preserved_precreate_state "$cert_digest" "$key_digest"
+}
+
+@test "create-vm rejects expired TLS before VM or generated-state mutation" {
+  local cert_digest key_digest
+  install_create_success_mocks
+  generate_expired_tls_pair \
+    "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  cert_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")"
+  install_real_openssl
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not a current valid self-signed identity"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
+  assert_tls_rejection_preserved_precreate_state "$cert_digest" "$key_digest"
+}
+
+@test "create-vm rejects a mismatched TLS key before VM or generated-state mutation" {
+  local cert_digest key_digest other_cert other_key
+  install_create_success_mocks
+  generate_valid_tls_pair \
+    "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  other_cert="$BATS_TEST_TMPDIR/other.crt"
+  other_key="$BATS_TEST_TMPDIR/other.key"
+  generate_valid_tls_pair "$other_cert" "$other_key"
+  cp -- "$other_key" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  cert_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")"
+  install_real_openssl
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"certificate and private key do not match"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
+  assert_tls_rejection_preserved_precreate_state "$cert_digest" "$key_digest"
 }
 
 @test "create-vm rolls back a TLS SAN identity when publishing its key fails" {

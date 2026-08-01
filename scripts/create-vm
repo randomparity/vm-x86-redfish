@@ -224,13 +224,34 @@ REDFISH_PASSWORD='${password}'"
 
 validate_existing_tls() {
   local cert_path="${STATE_DIR}/tls.crt"
+  local cert_public_key
   local key_path="${STATE_DIR}/tls.key"
+  local key_public_key
   local verify_status
   require_safe_create_state_file_or_absent "$cert_path"
   require_safe_create_state_file_or_absent "$key_path"
   if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
     require_private_file "$cert_path"
     require_private_file "$key_path"
+    if ! openssl x509 -in "$cert_path" -noout >/dev/null 2>&1; then
+      fail "existing Redfish TLS certificate is malformed; run make destroy, then make create"
+    fi
+    if ! openssl verify -check_ss_sig -CAfile "$cert_path" "$cert_path" \
+      >/dev/null 2>&1; then
+      fail "existing Redfish TLS certificate is not a current valid self-signed identity;" \
+        "run make destroy, then make create"
+    fi
+    if ! cert_public_key="$(openssl x509 -in "$cert_path" -pubkey -noout 2>/dev/null)"; then
+      fail "cannot read existing Redfish TLS certificate public key;" \
+        "run make destroy, then make create"
+    fi
+    if ! key_public_key="$(openssl pkey -in "$key_path" -pubout 2>/dev/null)"; then
+      fail "existing Redfish TLS private key is malformed; run make destroy, then make create"
+    fi
+    if [ "$cert_public_key" != "$key_public_key" ]; then
+      fail "existing Redfish TLS certificate and private key do not match;" \
+        "run make destroy, then make create"
+    fi
     if openssl x509 -checkip "$REDFISH_LISTEN_IP" -noout -in "$cert_path"; then
       return 0
     else
@@ -238,7 +259,7 @@ validate_existing_tls() {
     fi
     if [ "$verify_status" -eq 1 ]; then
       fail "existing Redfish TLS certificate does not cover configured Redfish listener" \
-        "${REDFISH_LISTEN_IP}; destroy and recreate it"
+        "${REDFISH_LISTEN_IP}; run make destroy, then make create"
     fi
     fail "failed to verify Redfish TLS certificate for ${REDFISH_LISTEN_IP}"
   fi
