@@ -66,7 +66,7 @@ try:
 except ValueError:
     raise SystemExit(1)
 
-if parsed.is_unspecified or parsed.is_multicast:
+if parsed.is_unspecified or parsed.is_multicast or getattr(parsed, "scope_id", None) is not None:
     raise SystemExit(1)
 
 print(parsed)

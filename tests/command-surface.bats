@@ -108,6 +108,12 @@ ${SERIAL_LISTEN_IP_VARIABLE}=192.0.2.10|${SERIAL_LISTEN_PORT_VARIABLE}"
   done
 }
 
+@test "runtime endpoint configuration rejects IPv6 scope IDs" {
+  run_endpoint_case "${REDFISH_LISTEN_IP_VARIABLE}=fe80::1%eth0"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"$REDFISH_LISTEN_IP_VARIABLE"* ]]
+}
+
 @test "runtime endpoint helpers format IPv6 hosts in URIs" {
   local configuration="${REDFISH_LISTEN_IP_VARIABLE}=2001:db8::10,""\
 ${REDFISH_LISTEN_PORT_VARIABLE}=65535,${SERIAL_MODE_VARIABLE}=tcp,""\
