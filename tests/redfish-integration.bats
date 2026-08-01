@@ -1765,7 +1765,8 @@ esac
   printf '%s\n' 11111111-2222-4333-8444-555555555555 \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
   bounded_virsh() {
-    printf '%s\n' '<domain><os><nvram>/var/lib/libvirt/qemu/nvram/test_VARS.fd</nvram></os></domain>'
+    printf '%s\n' \
+      '<domain><os><nvram>/var/lib/libvirt/qemu/nvram/test_VARS.fd</nvram></os></domain>'
   }
 
   run retain_remote_cleanup_identity

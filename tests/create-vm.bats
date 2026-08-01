@@ -373,7 +373,7 @@ fi
 }
 
 @test "create-vm writes source-safe default connection metadata" {
-  local connection_path expected_ca expected_credentials
+  local connection_path expected_ca expected_connection expected_credentials
   export VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state'quoted"
   mkdir -p "$VM_X86_REDFISH_STATE_DIR"
   install_create_success_mocks
@@ -393,7 +393,9 @@ printf "%s|%s|%s|%s|%s\\n" \
   "$SERIAL_TRANSPORT" "$SERIAL_ENDPOINT"
 ' bash "$connection_path"
   [ "$status" -eq 0 ]
-  [ "$output" = "https://127.0.0.1:8000|${expected_ca}|${expected_credentials}|pty|libvirt-console://vm-x86-redfish/serial0" ]
+  expected_connection="https://127.0.0.1:8000|${expected_ca}|${expected_credentials}|pty|"
+  expected_connection+="libvirt-console://vm-x86-redfish/serial0"
+  [ "$output" = "$expected_connection" ]
 }
 
 @test "create-vm writes TCP IPv6 connection metadata" {

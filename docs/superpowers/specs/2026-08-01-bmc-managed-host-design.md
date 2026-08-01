@@ -1,6 +1,6 @@
 # BMC-managed host endpoint design
 
-Issue: [#6](https://github.com/randomparity/vm-x86-redfish/issues/6)  
+Issue: [#6](https://github.com/randomparity/vm-x86-redfish/issues/6)
 Decision: [ADR 0001](../../adr/0001-configure-management-endpoints.md)
 
 ## Scope authority
