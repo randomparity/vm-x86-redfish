@@ -180,7 +180,8 @@ check_listener_available() {
     esac
   fi
   python_bin="$(python_313)"
-  if probe_output="$("$python_bin" - "$address" "$probe_port" 2>&1 <<'PY'
+  if probe_output="$(
+    "$python_bin" - "$address" "$probe_port" 2>&1 <<'PY'
 import errno
 import socket
 import sys
