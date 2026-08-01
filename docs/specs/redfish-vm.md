@@ -322,5 +322,6 @@ The remote NMI arm runs once with PTY serial and once with TCP serial. For each 
 A proven Redfish bind collision retries either arm with fresh endpoints up to three attempts;
 a proven TCP-serial bind collision retries the TCP arm the same way. Non-collision failures do
 not retry. All polling and child-process termination have explicit timeouts. Test failures
-retain diagnostics in `.artifacts/<test-id>/`; a failure to prove ownership leaves the resource
-in place and reports the exact manual inspection command.
+retain diagnostics in `.artifacts/<test-id>/`. A failure to prove ownership fails closed rather
+than deleting the unverified resource; its attempt cleanup log remains in that artifact tree.
+The standard teardown also records domain XML there when cleanup fails.
