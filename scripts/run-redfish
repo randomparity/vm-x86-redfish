@@ -5,11 +5,25 @@ script_dir="${BASH_SOURCE[0]%/*}"
 # shellcheck source=scripts/lib/common
 source "${script_dir}/lib/common"
 
+require_redfish_runtime_state() {
+  local path
+  for path in \
+    "${STATE_DIR}/credentials.env" \
+    "${STATE_DIR}/htpasswd" \
+    "${STATE_DIR}/tls.crt" \
+    "${STATE_DIR}/tls.key" \
+    "${STATE_DIR}/connection.env" \
+    "${STATE_DIR}/sushy-emulator.conf.py"; do
+    require_private_file "$path"
+  done
+}
+
 run_redfish() {
   local patch_dir tmpdir
   [ -f "${STATE_DIR}/sushy-emulator.conf.py" ] ||
     fail "missing ${STATE_DIR}/sushy-emulator.conf.py: run make create first"
   require_private_dir "${STATE_DIR}/tmp"
+  require_redfish_runtime_state
   tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
   patch_dir="$(repo_root)/python"
   export TMPDIR="$tmpdir"

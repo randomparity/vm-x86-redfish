@@ -2,6 +2,26 @@
 
 load "helpers/test-helper"
 
+write_redfish_runtime_state() {
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp" "$VM_X86_REDFISH_STATE_DIR/sushy"
+  chmod 700 "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_STATE_DIR/tmp" \
+    "$VM_X86_REDFISH_STATE_DIR/sushy"
+  printf "REDFISH_USERNAME='admin'\nREDFISH_PASSWORD='redfish-test-password'\n" \
+    >"$VM_X86_REDFISH_STATE_DIR/credentials.env"
+  printf 'admin:test-hash\n' >"$VM_X86_REDFISH_STATE_DIR/htpasswd"
+  printf 'test-cert\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
+  printf "REDFISH_ENDPOINT='https://127.0.0.1:8000'\n" \
+    >"$VM_X86_REDFISH_STATE_DIR/connection.env"
+  printf '# test config\n' >"$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/credentials.env" \
+    "$VM_X86_REDFISH_STATE_DIR/htpasswd" \
+    "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
+    "$VM_X86_REDFISH_STATE_DIR/tls.key" \
+    "$VM_X86_REDFISH_STATE_DIR/connection.env" \
+    "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+}
+
 @test "render-config rejects unset template values without writing output" {
   template="$BATS_TEST_TMPDIR/template.in"
   mkdir -m 700 "$BATS_TEST_TMPDIR/private"
@@ -218,9 +238,7 @@ load "helpers/test-helper"
 }
 
 @test "run-redfish sets TMPDIR and execs sushy-emulator" {
-  mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
-  touch "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
-  chmod 700 "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_STATE_DIR/tmp"
+  write_redfish_runtime_state
   install_mock_command uv \
     'printf "TMPDIR=%s\nPYTHONPATH=%s\nCONFIG=%s\n" "$TMPDIR" "$PYTHONPATH" "$*"'
   run ./scripts/run-redfish
@@ -228,6 +246,16 @@ load "helpers/test-helper"
   [[ "$output" == *"TMPDIR=$VM_X86_REDFISH_STATE_DIR/tmp"* ]]
   [[ "$output" == *"PYTHONPATH=$REPO_ROOT/python"* ]]
   [[ "$output" == *run\ --locked\ sushy-emulator\ --config\ */sushy-emulator.conf.py* ]]
+}
+
+@test "run-redfish rejects loose Redfish runtime files" {
+  write_redfish_runtime_state
+  chmod 644 "$VM_X86_REDFISH_STATE_DIR/tls.key"
+
+  run ./scripts/run-redfish
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"file must be mode 0600"* ]]
 }
 
 @test "run-redfish rejects unguarded runtime overrides" {

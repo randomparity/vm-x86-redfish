@@ -75,30 +75,65 @@ esac
 '
 }
 
+write_existing_domain_xml() {
+  local extra_devices root_path root_volume_name target_path
+  target_path="$1"
+  root_volume_name="${2:-vm-x86-redfish.qcow2}"
+  root_path="${3:-/var/lib/libvirt/images/vm-x86-redfish.qcow2}"
+  extra_devices="${4:-}"
+  cat >"$target_path" <<XML
+<domain type="kvm" xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+  <name>vm-x86-redfish</name>
+  <uuid>11111111-2222-3333-8444-555555555555</uuid>
+  <metadata>
+    <rp:project>vm-x86-redfish</rp:project>
+    <rp:root-volume>${root_volume_name}</rp:root-volume>
+  </metadata>
+  <os firmware="efi">
+    <type arch="x86_64" machine="q35">hvm</type>
+    <firmware><feature enabled="no" name="secure-boot"/></firmware>
+    <boot dev="hd"/>
+  </os>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2" discard="unmap"/>
+      <source file="${root_path}"/>
+      <target dev="vda" bus="virtio"/>
+    </disk>
+    <interface type="network">
+      <source network="default"/>
+      <model type="virtio"/>
+    </interface>
+    <serial type="pty">
+      <target type="isa-serial" port="0"><model name="isa-serial"/></target>
+    </serial>
+    <console type="pty">
+      <target type="serial" port="0"/>
+    </console>
+    <channel type="unix">
+      <target type="virtio" name="org.qemu.guest_agent.0"/>
+    </channel>
+    <graphics type="vnc" listen="127.0.0.1"/>
+    <video><model type="virtio"/></video>
+${extra_devices}
+  </devices>
+</domain>
+XML
+}
+
 install_existing_domain_mocks() {
   printf '11111111-2222-3333-8444-555555555555\n' \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  write_existing_domain_xml "$BATS_TEST_TMPDIR/existing-domain.xml"
   install_mock_command virsh '
 printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
   *"dominfo vm-x86-redfish")
     exit 0
     ;;
-  *"dumpxml vm-x86-redfish")
-    cat <<XML
-<domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
-  <uuid>11111111-2222-3333-8444-555555555555</uuid>
-  <metadata>
-    <rp:project>vm-x86-redfish</rp:project>
-    <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
-  </metadata>
-  <devices>
-    <disk type="file" device="disk">
-      <source file="/var/lib/libvirt/images/vm-x86-redfish.qcow2"/>
-    </disk>
-  </devices>
-</domain>
-XML
+  *"dumpxml vm-x86-redfish"*)
+    cat "$BATS_TEST_TMPDIR/existing-domain.xml"
     ;;
   *"vol-info --pool default vm-x86-redfish.qcow2")
     exit 0
@@ -146,40 +181,7 @@ PY
 }
 
 @test "create-vm repairs missing Redfish state for valid existing domain" {
-  printf '11111111-2222-3333-8444-555555555555\n' \
-    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
-  install_mock_command virsh '
-case "$*" in
-  *"dominfo vm-x86-redfish")
-    exit 0
-    ;;
-  *"dumpxml vm-x86-redfish")
-    cat <<XML
-<domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
-  <uuid>11111111-2222-3333-8444-555555555555</uuid>
-  <metadata>
-    <rp:project>vm-x86-redfish</rp:project>
-    <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
-  </metadata>
-  <devices>
-    <disk type="file" device="disk">
-      <source file="/var/lib/libvirt/images/vm-x86-redfish.qcow2"/>
-    </disk>
-  </devices>
-</domain>
-XML
-    ;;
-  *"vol-info --pool default vm-x86-redfish.qcow2")
-    exit 0
-    ;;
-  *"vol-path --pool default vm-x86-redfish.qcow2")
-    printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\\n"
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-'
+  install_existing_domain_mocks
 
   run ./scripts/create-vm
 
@@ -213,7 +215,7 @@ esac
 printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
   *"dominfo vm-x86-redfish") exit 0 ;;
-  *"dumpxml vm-x86-redfish") cat "$VM_X86_REDFISH_STATE_DIR/domain.xml" ;;
+  *"dumpxml vm-x86-redfish"*) cat "$VM_X86_REDFISH_STATE_DIR/domain.xml" ;;
   *"vol-info --pool default vm-x86-redfish.qcow2") exit 0 ;;
   *"vol-path --pool default vm-x86-redfish.qcow2")
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\\n" ;;
@@ -240,6 +242,7 @@ esac
   install_existing_domain_mocks
   printf "REDFISH_USERNAME='admin'\ntouch '%s'\nREDFISH_PASSWORD='redfish-test-password'\n" \
     "$BATS_TEST_TMPDIR/sourced" >"$VM_X86_REDFISH_STATE_DIR/credentials.env"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/credentials.env"
 
   run ./scripts/create-vm
 
@@ -254,6 +257,7 @@ esac
   install_existing_domain_mocks
   printf "REDFISH_USERNAME='admin'\nREDFISH_PASSWORD='redfish-test-password'\n" \
     >"$VM_X86_REDFISH_STATE_DIR/credentials.env"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/credentials.env"
   printf 'outside\n' >"$BATS_TEST_TMPDIR/outside-htpasswd"
   ln -s "$BATS_TEST_TMPDIR/outside-htpasswd" "$VM_X86_REDFISH_STATE_DIR/htpasswd"
 
@@ -313,11 +317,42 @@ esac
   [ "$status" -ne 0 ]
 }
 
+@test "create-vm rejects loose existing Redfish credentials" {
+  install_existing_domain_mocks
+  printf "REDFISH_USERNAME='admin'\nREDFISH_PASSWORD='redfish-test-password'\n" \
+    >"$VM_X86_REDFISH_STATE_DIR/credentials.env"
+  chmod 644 "$VM_X86_REDFISH_STATE_DIR/credentials.env"
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"file must be mode 0600"* ]]
+  run grep -F "htpasswd" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm rejects loose existing TLS key" {
+  install_existing_domain_mocks
+  printf "REDFISH_USERNAME='admin'\nREDFISH_PASSWORD='redfish-test-password'\n" \
+    >"$VM_X86_REDFISH_STATE_DIR/credentials.env"
+  printf 'test-cert\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/credentials.env" "$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  chmod 644 "$VM_X86_REDFISH_STATE_DIR/tls.key"
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"file must be mode 0600"* ]]
+  run grep -F "openssl req" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
 @test "create-vm refuses existing domain without project metadata" {
   install_mock_command virsh '
 case "$*" in
   *"dominfo vm-x86-redfish") exit 0 ;;
-  *"dumpxml vm-x86-redfish") printf "<domain><name>vm-x86-redfish</name></domain>\\n" ;;
+  *"dumpxml vm-x86-redfish"*) printf "<domain><name>vm-x86-redfish</name></domain>\\n" ;;
   *) exit 2 ;;
 esac
 '
@@ -332,16 +367,42 @@ esac
   install_mock_command virsh '
 case "$*" in
   *"dominfo vm-x86-redfish") exit 0 ;;
-  *"dumpxml vm-x86-redfish") cat <<XML
-<domain xmlns:owned="https://github.com/randomparity/vm-x86-redfish">
+  *"dumpxml vm-x86-redfish"*) cat <<XML
+<domain type="kvm" xmlns:owned="https://github.com/randomparity/vm-x86-redfish">
+  <name>vm-x86-redfish</name>
   <uuid>11111111-2222-3333-8444-555555555555</uuid>
   <metadata>
     <owned:project>vm-x86-redfish</owned:project>
     <owned:root-volume>vm-x86-redfish&amp;owned.qcow2</owned:root-volume>
   </metadata>
-  <devices><disk type="file" device="disk">
-    <source file="/var/lib/libvirt/images/vm-x86-redfish&amp;owned.qcow2"/>
-  </disk></devices>
+  <os firmware="efi">
+    <type arch="x86_64" machine="q35">hvm</type>
+    <firmware><feature enabled="no" name="secure-boot"/></firmware>
+    <boot dev="hd"/>
+  </os>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2" discard="unmap"/>
+      <source file="/var/lib/libvirt/images/vm-x86-redfish&amp;owned.qcow2"/>
+      <target dev="vda" bus="virtio"/>
+    </disk>
+    <interface type="network">
+      <source network="default"/>
+      <model type="virtio"/>
+    </interface>
+    <serial type="pty">
+      <target type="isa-serial" port="0"><model name="isa-serial"/></target>
+    </serial>
+    <console type="pty">
+      <target type="serial" port="0"/>
+    </console>
+    <channel type="unix">
+      <target type="virtio" name="org.qemu.guest_agent.0"/>
+    </channel>
+    <graphics type="vnc" listen="127.0.0.1"/>
+    <video><model type="virtio"/></video>
+  </devices>
 </domain>
 XML
     ;;
@@ -360,7 +421,7 @@ esac
   install_mock_command virsh '
 case "$*" in
   *"dominfo vm-x86-redfish") exit 0 ;;
-  *"dumpxml vm-x86-redfish") cat <<XML
+  *"dumpxml vm-x86-redfish"*) cat <<XML
 <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
   <uuid>11111111-2222-3333-8444-555555555555</uuid>
   <devices>
@@ -388,7 +449,7 @@ esac
   install_mock_command virsh '
 case "$*" in
   *"dominfo vm-x86-redfish") exit 0 ;;
-  *"dumpxml vm-x86-redfish") cat <<XML
+  *"dumpxml vm-x86-redfish"*) cat <<XML
 <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
   <uuid>11111111-2222-3333-8444-555555555555</uuid>
   <metadata><rp:project>vm-x86-redfish</rp:project>
@@ -410,7 +471,7 @@ esac
   install_mock_command virsh '
 case "$*" in
   *"dominfo vm-x86-redfish") exit 0 ;;
-  *"dumpxml vm-x86-redfish") cat <<XML
+  *"dumpxml vm-x86-redfish"*) cat <<XML
 <domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
   <uuid>11111111-2222-3333-8444-555555555555</uuid>
   <metadata><rp:project>vm-x86-redfish</rp:project>
@@ -429,6 +490,39 @@ esac
   run ./scripts/create-vm
   [ "$status" -ne 0 ]
   [[ "$output" == *"does not use root volume path"* ]]
+}
+
+@test "create-vm refuses owned existing domain with an extra disk" {
+  local extra_disk
+  extra_disk='    <disk type="file" device="disk">
+      <source file="/var/lib/libvirt/images/extra.qcow2"/>
+      <target dev="vdb" bus="virtio"/>
+    </disk>'
+  install_existing_domain_mocks
+  write_existing_domain_xml "$BATS_TEST_TMPDIR/existing-domain.xml" \
+    "vm-x86-redfish.qcow2" \
+    "/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    "$extra_disk"
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"hardware does not match expected project shape"* ]]
+}
+
+@test "create-vm refuses owned existing domain with a host device" {
+  local host_device
+  host_device='    <hostdev mode="subsystem" type="usb" managed="yes"/>'
+  install_existing_domain_mocks
+  write_existing_domain_xml "$BATS_TEST_TMPDIR/existing-domain.xml" \
+    "vm-x86-redfish.qcow2" \
+    "/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    "$host_device"
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"hardware does not match expected project shape"* ]]
 }
 
 @test "create-vm deletes newly created disk when vol-path fails" {

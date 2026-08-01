@@ -83,6 +83,15 @@ require_private_dir() {
   [ "$(stat -c '%a' "$path")" = "700" ] || fail "directory must be mode 0700: $path"
 }
 
+require_private_file() {
+  local path="$1"
+  reject_symlink "$path"
+  [ -f "$path" ] || fail "missing private file: $path"
+  [ "$(stat -c '%u' "$path")" = "$(id -u)" ] ||
+    fail "file must be owned by the current user: $path"
+  [ "$(stat -c '%a' "$path")" = "600" ] || fail "file must be mode 0600: $path"
+}
+
 canonical_dir() {
   local path="$1"
   reject_symlink "$path"
@@ -222,6 +231,97 @@ domain_disk_source_matches() {
   local xml="$1"
   local root_path="$2"
   xml_disk_source_equals "$xml" "$root_path"
+}
+
+domain_shape_matches_expected() {
+  local python_bin
+  local root_path="$2"
+  local xml="$1"
+  python_bin="$(python_313)"
+  "$python_bin" - "$xml" "$DEFAULT_DOMAIN_NAME" "$root_path" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, domain_name, root_path = sys.argv[1:]
+try:
+    root = ET.parse(xml_path).getroot()
+except ET.ParseError:
+    raise SystemExit(1)
+
+def fail():
+    raise SystemExit(1)
+
+def require(condition):
+    if not condition:
+        fail()
+
+def one(elements):
+    require(len(elements) == 1)
+    return elements[0]
+
+def child(parent, name):
+    elem = parent.find(name)
+    require(elem is not None)
+    return elem
+
+def text(parent, name):
+    elem = child(parent, name)
+    return elem.text or ""
+
+require(root.tag == "domain")
+require(root.get("type") == "kvm")
+require(text(root, "name") == domain_name)
+os_elem = child(root, "os")
+boot_entries = os_elem.findall("boot")
+require(len(boot_entries) == 1)
+require(boot_entries[0].get("dev") == "hd")
+devices = child(root, "devices")
+require(not any(True for _ in devices.iter("hostdev")))
+require(not any(True for _ in devices.iter("boot")))
+all_disks = devices.findall("disk")
+disk = one(all_disks)
+require(disk.get("type") == "file")
+require(disk.get("device") == "disk")
+driver = child(disk, "driver")
+require(driver.get("name") == "qemu")
+require(driver.get("type") == "qcow2")
+require(driver.get("discard") == "unmap")
+source = child(disk, "source")
+require(source.get("file") == root_path)
+target = child(disk, "target")
+require(target.get("dev") == "vda")
+require(target.get("bus") == "virtio")
+interface = one(devices.findall("interface"))
+require(interface.get("type") == "network")
+require(child(interface, "source").get("network") == "default")
+require(child(interface, "model").get("type") == "virtio")
+serial = one(devices.findall("serial"))
+serial_target = child(serial, "target")
+require(serial.get("type") == "pty")
+require(serial_target.get("type") == "isa-serial")
+require(serial_target.get("port") == "0")
+require(child(serial_target, "model").get("name") == "isa-serial")
+console = one(devices.findall("console"))
+console_target = child(console, "target")
+require(console.get("type") == "pty")
+require(console_target.get("type") == "serial")
+require(console_target.get("port") == "0")
+channel = one(devices.findall("channel"))
+channel_target = child(channel, "target")
+require(channel.get("type") == "unix")
+require(channel_target.get("type") == "virtio")
+require(channel_target.get("name") == "org.qemu.guest_agent.0")
+graphics = one(devices.findall("graphics"))
+require(graphics.get("type") == "vnc")
+listen = graphics.get("listen")
+listen_elem = graphics.find("listen")
+if listen is None and listen_elem is not None:
+    listen = listen_elem.get("address")
+require(listen == "127.0.0.1")
+video_model = child(one(devices.findall("video")), "model")
+require(video_model.get("type") == "virtio")
+require(text(devices, "emulator") == "/usr/bin/qemu-system-x86_64")
+PY
 }
 
 volume_name_for_media() {

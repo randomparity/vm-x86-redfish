@@ -19,7 +19,7 @@ dump_existing_domain_xml() {
   require_safe_create_state_file_or_absent "$xml_path"
   tmp_path="$(mktemp "${STATE_DIR}/.existing-domain.xml.XXXXXX")" ||
     fail "cannot create temporary existing domain XML in $STATE_DIR"
-  if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" >"$tmp_path"; then
+  if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" --inactive >"$tmp_path"; then
     rm -- "$tmp_path"
     fail "failed to dump existing domain XML for $DEFAULT_DOMAIN_NAME"
   fi
@@ -46,6 +46,8 @@ validate_or_reject_existing_domain() {
     root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
     domain_disk_source_matches "$xml_path" "$root_path" ||
       fail "existing domain $DEFAULT_DOMAIN_NAME does not use root volume path $root_path"
+    domain_shape_matches_expected "$xml_path" "$root_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME hardware does not match expected project shape"
     return 0
   fi
   return 1
@@ -83,6 +85,7 @@ require_create_state_file() {
   if [ -L "$path" ] || [ ! -f "$path" ]; then
     fail "expected regular project state file: $path"
   fi
+  require_private_file "$path"
 }
 
 read_redfish_credentials() {
@@ -146,6 +149,8 @@ create_tls_once() {
   require_safe_create_state_file_or_absent "$cert_path"
   require_safe_create_state_file_or_absent "$key_path"
   if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+    require_private_file "$cert_path"
+    require_private_file "$key_path"
     return 0
   fi
   if [ -f "$cert_path" ] || [ -f "$key_path" ]; then
