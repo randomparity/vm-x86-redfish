@@ -134,6 +134,52 @@ reject_endpoint_disagreement() {
   fi
 }
 
+validate_sushy_endpoint_contract() {
+  local config_path="${STATE_DIR}/sushy-emulator.conf.py"
+  local python_bin
+  python_bin="$(python_313)"
+  if ! "$python_bin" - "$config_path" "$REDFISH_LISTEN_IP" \
+    "$REDFISH_LISTEN_PORT" <<'PY'; then
+import ast
+import pathlib
+import sys
+
+config_path, expected_ip, expected_port = sys.argv[1:]
+try:
+    tree = ast.parse(pathlib.Path(config_path).read_text(encoding="utf-8"))
+except (OSError, SyntaxError, UnicodeError):
+    raise SystemExit(1)
+
+
+def assigned_values(name):
+    values = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            values.append(node.value)
+    return values
+
+
+listen_ips = assigned_values("SUSHY_EMULATOR_LISTEN_IP")
+listen_ports = assigned_values("SUSHY_EMULATOR_LISTEN_PORT")
+ip_matches = len(listen_ips) == 1 and isinstance(listen_ips[0], ast.Constant)
+ip_matches = ip_matches and type(listen_ips[0].value) is str
+ip_matches = ip_matches and listen_ips[0].value == expected_ip
+port_matches = len(listen_ports) == 1 and isinstance(listen_ports[0], ast.Call)
+if port_matches:
+    call = listen_ports[0]
+    port_matches = isinstance(call.func, ast.Name) and call.func.id == "int"
+    port_matches = port_matches and len(call.args) == 1 and not call.keywords
+    port_matches = port_matches and isinstance(call.args[0], ast.Constant)
+    port_matches = port_matches and type(call.args[0].value) is str
+    port_matches = port_matches and call.args[0].value == expected_port
+raise SystemExit(0 if ip_matches and port_matches else 1)
+PY
+    fail "persisted Sushy listen endpoint disagrees with connection metadata"
+  fi
+}
+
 run_redfish() {
   local configured_redfish_ip="$REDFISH_LISTEN_IP"
   local configured_redfish_port="$REDFISH_LISTEN_PORT"
@@ -157,6 +203,7 @@ run_redfish() {
     "$configured_serial_ip" "$SERIAL_LISTEN_IP" VM_X86_REDFISH_SERIAL_LISTEN_IP serial
   reject_endpoint_disagreement "${VM_X86_REDFISH_SERIAL_LISTEN_PORT+x}" \
     "$configured_serial_port" "$SERIAL_LISTEN_PORT" VM_X86_REDFISH_SERIAL_LISTEN_PORT serial
+  validate_sushy_endpoint_contract
   tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
   patch_dir="$(repo_root)/python"
   export TMPDIR="$tmpdir"

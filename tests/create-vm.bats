@@ -543,6 +543,36 @@ printf "%s|%s|%s\\n" "$REDFISH_ENDPOINT" "$SERIAL_TRANSPORT" "$SERIAL_ENDPOINT"
   [ -f "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py" ]
 }
 
+@test "run-redfish rejects connection metadata left newer than Sushy config" {
+  local initial_config
+  install_create_success_mocks
+  run ./scripts/create-vm
+  [ "$status" -eq 0 ]
+  initial_config="$(<"$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py")"
+  install_existing_domain_mocks
+  install_mock_command htpasswd '
+read -r password
+[ "$password" = "redfish-test-password" ]
+printf "admin:test-hash\n" >"$3"
+printf "invalid-after-validation\n" >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+'
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_LISTEN_PORT=8443 run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid domain UUID"* ]]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py")" = "$initial_config" ]
+  grep -F "REDFISH_ENDPOINT='https://127.0.0.1:8443'" \
+    "$VM_X86_REDFISH_STATE_DIR/connection.env"
+
+  run ./scripts/run-redfish
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"persisted Sushy listen endpoint disagrees with connection metadata"* ]]
+  [[ "$output" != *"run: Redfish endpoint"* ]]
+}
+
 @test "create-vm accepts a matching TCP serial transport on rerun" {
   install_existing_domain_mocks tcp 192.0.2.20 9000
 

@@ -25,7 +25,10 @@ write_redfish_runtime_state() {
   printf "SERIAL_TRANSPORT='pty'\n" >>"$VM_X86_REDFISH_STATE_DIR/connection.env"
   printf "SERIAL_ENDPOINT='libvirt-console://vm-x86-redfish/serial0'\n" \
     >>"$VM_X86_REDFISH_STATE_DIR/connection.env"
-  printf '# test config\n' >"$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+  printf 'SUSHY_EMULATOR_LISTEN_IP = "127.0.0.1"\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
+  printf 'SUSHY_EMULATOR_LISTEN_PORT = int("8000")\n' \
+    >>"$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
   chmod 600 "$VM_X86_REDFISH_STATE_DIR/credentials.env" \
     "$VM_X86_REDFISH_STATE_DIR/htpasswd" \
     "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
@@ -434,6 +437,10 @@ PY
     -e "s|SERIAL_TRANSPORT='pty'|SERIAL_TRANSPORT='tcp'|" \
     -e "s|libvirt-console://vm-x86-redfish/serial0|tcp://[2001:db8::20]:9000|" \
     "$VM_X86_REDFISH_STATE_DIR/connection.env"
+  sed -i \
+    -e 's|"127.0.0.1"|"192.0.2.20"|' \
+    -e 's|"8000"|"8443"|' \
+    "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
   install_mock_command uv \
     'case "$*" in
       "python find 3.13") command -v python3 ;;
