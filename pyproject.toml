@@ -3,7 +3,7 @@ name = "vm-x86-redfish"
 version = "0.1.0"
 requires-python = "==3.13.*"
 dependencies = [
-  "libvirt-python==12.0.0",
+  "libvirt-python==12.5.0",
   "sushy-tools==2.2.0",
 ]
 

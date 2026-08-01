@@ -243,9 +243,9 @@ wheels = [
 
 [[package]]
 name = "libvirt-python"
-version = "12.0.0"
+version = "12.5.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/5e/cd/a8fdd1c691f2a6a6dc8b0711b42473a7342e4d1a7a1e9ef90677a236eb73/libvirt_python-12.0.0.tar.gz", hash = "sha256:7b4de7d2dde2bc380cf4e108d1eeb8aad50beb3ae351ab9265a7fedc587742bc", size = 243300, upload-time = "2026-01-15T09:14:43.074Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/59/5e/4c6a60e1ed061cfc2e1899178b8acc05a350bc93d212940ee61c142664d3/libvirt_python-12.5.0.tar.gz", hash = "sha256:25ea2261e0d6cab9d004b700911d88b57911b14528ed04b3487a617ec2b4cda9", size = 245493, upload-time = "2026-07-01T12:01:36.863Z" }
 
 [[package]]
 name = "license-expression"
@@ -655,7 +655,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "libvirt-python", specifier = "==12.0.0" },
+    { name = "libvirt-python", specifier = "==12.5.0" },
     { name = "sushy-tools", specifier = "==2.2.0" },
 ]
 
