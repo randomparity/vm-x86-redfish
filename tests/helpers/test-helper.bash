@@ -130,13 +130,15 @@ stop_tracked_children() {
 
 stop_child() {
   local pid="$1"
+  local timeout_seconds="${CHILD_STOP_TIMEOUT_SECONDS:-10}"
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 2
   if ! kill "$pid" 2>/dev/null; then
     return 0
   fi
-  local deadline=$((SECONDS + 10))
+  local deadline=$((SECONDS + timeout_seconds))
   while kill -0 "$pid" 2>/dev/null; do
     [ "$SECONDS" -lt "$deadline" ] || break
-    sleep 1
+    sleep 0.1
   done
   if kill -0 "$pid" 2>/dev/null; then
     kill -9 "$pid"

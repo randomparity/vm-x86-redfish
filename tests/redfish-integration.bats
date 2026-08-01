@@ -1,7 +1,24 @@
 #!/usr/bin/env bats
 # shellcheck disable=SC2030,SC2031 # Bats isolates PATH changes to each test process.
+# shellcheck disable=SC2329 # Bats invokes test helpers indirectly and tests override retry hooks.
 
 load "helpers/test-helper"
+
+setup_file() {
+  if [ "${VM_X86_REDFISH_INTEGRATION_HELPER_ONLY:-}" = "1" ]; then
+    return 0
+  fi
+  require_remote_integration_prerequisites || return
+  export VM_X86_REDFISH_INTEGRATION_TEST=1
+  # shellcheck disable=SC1091 # Integration preflight runs from the repository root.
+  source ./scripts/lib/common
+  if ! select_routable_host_ip >/dev/null; then
+    printf 'integration prerequisite: no bindable non-loopback IPv4 route source is available\n' \
+      >&2
+    return 1
+  fi
+  ./scripts/doctor
+}
 
 setup() {
   setup_integration_workspace
@@ -136,6 +153,548 @@ create_nmi_iso() {
     tests/fixtures/grub.cfg.in >"$iso_root/boot/grub/grub.cfg"
   grub2-mkrescue -o "$iso_path" "$iso_root" \
     >"$VM_X86_REDFISH_ARTIFACTS_DIR/grub2-mkrescue-nmi.log" 2>&1
+}
+
+select_routable_host_ip() {
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - <<'PY'
+import ipaddress
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    sock.connect(("192.0.2.1", 9))
+    address = ipaddress.ip_address(sock.getsockname()[0])
+if address.is_loopback or address.is_unspecified or address.is_multicast:
+    raise SystemExit("no concrete non-loopback IPv4 route source is available")
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+    probe.bind((str(address), 0))
+print(address)
+PY
+}
+
+allocate_tcp_port() {
+  local address="$1"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$address" <<'PY'
+import socket
+import sys
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind((sys.argv[1], 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+configure_remote_attempt() {
+  local attempt="$2"
+  local serial_mode="$1"
+  REMOTE_ATTEMPT_DIR="${VM_X86_REDFISH_ARTIFACTS_DIR}/remote-${serial_mode}-${attempt}"
+  REMOTE_ATTEMPT_PIDS=()
+  mkdir -p "$REMOTE_ATTEMPT_DIR"
+  REMOTE_HOST_IP="$(select_routable_host_ip)" || return
+  REMOTE_REDFISH_PORT="$(allocate_tcp_port "$REMOTE_HOST_IP")" || return
+  export VM_X86_REDFISH_LISTEN_IP="$REMOTE_HOST_IP"
+  export VM_X86_REDFISH_LISTEN_PORT="$REMOTE_REDFISH_PORT"
+  export VM_X86_REDFISH_SERIAL_MODE="$serial_mode"
+  if [ "$serial_mode" = "tcp" ]; then
+    REMOTE_SERIAL_PORT="$(allocate_tcp_port "$REMOTE_HOST_IP")" || return
+    while [ "$REMOTE_SERIAL_PORT" = "$REMOTE_REDFISH_PORT" ]; do
+      REMOTE_SERIAL_PORT="$(allocate_tcp_port "$REMOTE_HOST_IP")" || return
+    done
+    export VM_X86_REDFISH_SERIAL_LISTEN_IP="$REMOTE_HOST_IP"
+    export VM_X86_REDFISH_SERIAL_LISTEN_PORT="$REMOTE_SERIAL_PORT"
+  else
+    REMOTE_SERIAL_PORT=""
+    unset VM_X86_REDFISH_SERIAL_LISTEN_IP VM_X86_REDFISH_SERIAL_LISTEN_PORT
+  fi
+  load_runtime_config
+}
+
+track_remote_child() {
+  local pid="$1"
+  local role="${2:-child}"
+  track_child "$pid"
+  REMOTE_ATTEMPT_PIDS+=("$pid")
+  printf '%s=%s\n' "$role" "$pid" >>"$REMOTE_ATTEMPT_DIR/children.pids"
+}
+
+record_remote_tracked_child() {
+  local pid="$1"
+  local role="$2"
+  REMOTE_ATTEMPT_PIDS+=("$pid")
+  printf '%s=%s\n' "$role" "$pid" >>"$REMOTE_ATTEMPT_DIR/children.pids"
+}
+
+wait_for_text_count() {
+  local expected_count="$3"
+  local path="$1"
+  local pattern="$2"
+  local deadline=$((SECONDS + 60))
+  local observed
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -f "$path" ]; then
+      observed="$(awk -v text="$pattern" 'index($0, text) { count++ } END { print count + 0 }' \
+        "$path")"
+      [ "$observed" -lt "$expected_count" ] || return 0
+    fi
+    sleep 1
+  done
+  printf 'timed out waiting for %s occurrence(s) of %s in %s\n' \
+    "$expected_count" "$pattern" "$path" >&2
+  return 1
+}
+
+start_bind_fault() {
+  local address="$1"
+  local port="$2"
+  local ready_path="$3"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$address" "$port" "$ready_path" <<'PY' &
+import pathlib
+import signal
+import socket
+import sys
+
+address, port, ready_path = sys.argv[1:]
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind((address, int(port)))
+    listener.listen()
+    pathlib.Path(ready_path).write_text("ready\n", encoding="utf-8")
+    signal.pause()
+PY
+  REMOTE_FAULT_PID="$!"
+  track_remote_child "$REMOTE_FAULT_PID" fault-listener
+  wait_for_file "$ready_path"
+}
+
+verified_create_collision() {
+  local endpoint="$1"
+  local log_path="$2"
+  grep -F "error: ${endpoint} is already in use" "$log_path" >/dev/null
+}
+
+attempt_create_has_bind_collision() {
+  local serial_mode="$1"
+  local log_path="$2"
+  local redfish_endpoint_value
+  local serial_endpoint_value
+  redfish_endpoint_value="$(endpoint_address_port "$REMOTE_HOST_IP" "$REMOTE_REDFISH_PORT")"
+  if verified_create_collision "$redfish_endpoint_value" "$log_path"; then
+    return 0
+  fi
+  [ "$serial_mode" = "tcp" ] || return 1
+  serial_endpoint_value="$(endpoint_address_port "$REMOTE_HOST_IP" "$REMOTE_SERIAL_PORT")"
+  verified_create_collision "$serial_endpoint_value" "$log_path"
+}
+
+create_remote_domain() {
+  local create_log="$REMOTE_ATTEMPT_DIR/create.log"
+  local fault="$2"
+  local serial_mode="$1"
+  if [ "$fault" = "redfish" ]; then
+    start_bind_fault "$REMOTE_HOST_IP" "$REMOTE_REDFISH_PORT" \
+      "$REMOTE_ATTEMPT_DIR/redfish-fault.ready" || return
+  elif [ "$fault" = "serial" ] && [ "$serial_mode" = "tcp" ]; then
+    start_bind_fault "$REMOTE_HOST_IP" "$REMOTE_SERIAL_PORT" \
+      "$REMOTE_ATTEMPT_DIR/serial-fault.ready" || return
+  fi
+  if timeout --kill-after=5 120 ./scripts/create-vm >"$create_log" 2>&1; then
+    return 0
+  fi
+  if attempt_create_has_bind_collision "$serial_mode" "$create_log"; then
+    return 75
+  fi
+  printf 'remote %s create failed; see %s\n' "$serial_mode" "$create_log" >&2
+  return 1
+}
+
+start_remote_sushy() {
+  local log_path="$REMOTE_ATTEMPT_DIR/sushy.log"
+  local endpoint
+  local deadline=$((SECONDS + 30))
+  endpoint="$(redfish_endpoint)"
+  ./scripts/run-redfish >"$log_path" 2>&1 &
+  REMOTE_SUSHY_PID="$!"
+  track_remote_child "$REMOTE_SUSHY_PID" redfish
+  until bounded_curl --silent --fail --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
+    "${endpoint}/redfish/v1" >/dev/null; do
+    if ! kill -0 "$REMOTE_SUSHY_PID" 2>/dev/null; then
+      if grep -E 'Address already in use|EADDRINUSE' "$log_path" >/dev/null; then
+        return 75
+      fi
+      printf 'Redfish process exited before readiness; see %s\n' "$log_path" >&2
+      return 1
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+namespace_exec() {
+  nsenter --target "$REMOTE_NAMESPACE_PID" --user --net "$@"
+}
+
+namespace_curl() {
+  namespace_exec curl --connect-timeout 5 --max-time 15 "$@"
+}
+
+start_remote_namespace() {
+  local host_inode
+  local namespace_inode
+  local ready_path="$REMOTE_ATTEMPT_DIR/slirp.ready"
+  unshare --user --map-root-user --net sleep infinity \
+    >"$REMOTE_ATTEMPT_DIR/namespace.log" 2>&1 &
+  REMOTE_NAMESPACE_PID="$!"
+  track_remote_child "$REMOTE_NAMESPACE_PID" namespace
+  local namespace_deadline=$((SECONDS + 10))
+  until [ -e "/proc/${REMOTE_NAMESPACE_PID}/ns/net" ]; do
+    kill -0 "$REMOTE_NAMESPACE_PID" 2>/dev/null || return 1
+    [ "$SECONDS" -lt "$namespace_deadline" ] || return 1
+    sleep 1
+  done
+  host_inode="$(readlink /proc/self/ns/net)"
+  namespace_inode="$(readlink "/proc/${REMOTE_NAMESPACE_PID}/ns/net")"
+  printf 'host=%s\nnamespace=%s\n' "$host_inode" "$namespace_inode" \
+    >"$REMOTE_ATTEMPT_DIR/namespace-inodes.log"
+  [ "$host_inode" != "$namespace_inode" ] || return 1
+  : >"$ready_path"
+  slirp4netns --configure --mtu=65520 --disable-host-loopback \
+    --ready-fd=3 "$REMOTE_NAMESPACE_PID" tap0 3>"$ready_path" \
+    >"$REMOTE_ATTEMPT_DIR/slirp.log" 2>&1 &
+  REMOTE_SLIRP_PID="$!"
+  track_remote_child "$REMOTE_SLIRP_PID" slirp
+  local deadline=$((SECONDS + 30))
+  until grep -Fx '1' "$ready_path" >/dev/null; do
+    kill -0 "$REMOTE_SLIRP_PID" 2>/dev/null || return 1
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+prove_host_loopback_isolation() {
+  local control_dir="$BATS_TEST_TMPDIR/loopback-control"
+  local control_log="$REMOTE_ATTEMPT_DIR/loopback-negative.log"
+  mkdir -p "$control_dir"
+  printf 'host loopback control\n' >"$control_dir/control"
+  start_media_server "$control_dir" loopback-control
+  record_remote_tracked_child "$MEDIA_SERVER_PID" loopback-control
+  bounded_curl --silent --fail \
+    "http://127.0.0.1:${MEDIA_SERVER_PORT}/control" >/dev/null || return
+  if namespace_curl --silent --fail \
+    "http://10.0.2.2:${MEDIA_SERVER_PORT}/control" >"$control_log" 2>&1; then
+    printf 'remote namespace unexpectedly reached the host loopback control\n' >&2
+    return 1
+  fi
+}
+
+fetch_remote_system_url() {
+  local cert_path
+  local endpoint
+  local python_bin
+  local systems_json="$REMOTE_ATTEMPT_DIR/systems.json"
+  cert_path="$(realpath -e "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  endpoint="$(redfish_endpoint)"
+  namespace_curl --silent --show-error --fail \
+    --cacert "$cert_path" \
+    --user "${REDFISH_USERNAME}:${REDFISH_PASSWORD}" \
+    "${endpoint}/redfish/v1/Systems" >"$systems_json" || return
+  python_bin="$(python_313)"
+  REMOTE_SYSTEM_URL="$(
+    "$python_bin" - "$systems_json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as systems_file:
+    members = json.load(systems_file)["Members"]
+if len(members) != 1:
+    raise SystemExit(f"expected one remote system, found {len(members)}")
+print(members[0]["@odata.id"])
+PY
+  )"
+  [[ "$REMOTE_SYSTEM_URL" = /redfish/v1/Systems/* ]]
+}
+
+remote_redfish_action() {
+  local method="$1"
+  local path="$2"
+  local payload="$3"
+  local cert_path
+  cert_path="$(realpath -e "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  namespace_curl --silent --show-error --fail \
+    --cacert "$cert_path" \
+    --user "${REDFISH_USERNAME}:${REDFISH_PASSWORD}" \
+    -X "$method" -H 'Content-Type: application/json' -d "$payload" \
+    "$(redfish_endpoint)${path}"
+}
+
+attach_remote_nmi_media() {
+  local iso_name="nmi-${TEST_ID}.iso"
+  local iso_path="$BATS_TEST_TMPDIR/media/$iso_name"
+  local media_url
+  local payload
+  mkdir -p "$BATS_TEST_TMPDIR/media"
+  create_nmi_iso "$iso_path" || return
+  start_media_server "$BATS_TEST_TMPDIR/media" nmi-http
+  record_remote_tracked_child "$MEDIA_SERVER_PID" nmi-media
+  media_url="http://127.0.0.1:${MEDIA_SERVER_PORT}/${iso_name}"
+  payload="{\"Image\":\"${media_url}\",\"Inserted\":true}"
+  remote_redfish_action POST \
+    "${REMOTE_SYSTEM_URL}/VirtualMedia/Cd/Actions/VirtualMedia.InsertMedia" \
+    "$payload" || return
+  remote_redfish_action PATCH "$REMOTE_SYSTEM_URL" \
+    '{"Boot":{"BootSourceOverrideTarget":"Cd","BootSourceOverrideEnabled":"Once"}}'
+}
+
+start_remote_tcp_serial() {
+  local python_bin
+  local serial_log="$1"
+  python_bin="$(python_313)"
+  namespace_exec "$python_bin" - "$REMOTE_HOST_IP" "$REMOTE_SERIAL_PORT" <<'PY' \
+    >"$serial_log" 2>&1 &
+import socket
+import sys
+import time
+
+address, port = sys.argv[1], int(sys.argv[2])
+deadline = time.monotonic() + 60
+connection = None
+while time.monotonic() < deadline:
+    try:
+        connection = socket.create_connection((address, port), timeout=2)
+        break
+    except OSError:
+        time.sleep(0.5)
+if connection is None:
+    raise SystemExit("TCP serial listener did not become reachable")
+
+captured = bytearray()
+with connection:
+    connection.settimeout(1)
+    while time.monotonic() < deadline:
+        try:
+            data = connection.recv(4096)
+        except TimeoutError:
+            continue
+        if not data:
+            break
+        captured.extend(data)
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+        if captured.count(b"NMI_READY") >= 2:
+            raise SystemExit(0)
+raise SystemExit("TCP serial did not observe the restart readiness sentinel")
+PY
+  REMOTE_SERIAL_CLIENT_PID="$!"
+  track_remote_child "$REMOTE_SERIAL_CLIENT_PID" serial-client
+}
+
+start_remote_serial_capture() {
+  local serial_log="$1"
+  local serial_mode="$2"
+  if [ "$serial_mode" = "tcp" ]; then
+    start_remote_tcp_serial "$serial_log"
+  else
+    run_serial_console NMI_READY 2 >"$serial_log" 2>&1 &
+    REMOTE_SERIAL_CLIENT_PID="$!"
+    track_remote_child "$REMOTE_SERIAL_CLIENT_PID" serial-client
+  fi
+}
+
+listener_has_bind_collision() {
+  local address="$1"
+  local port="$2"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$address" "$port" <<'PY'
+import errno
+import socket
+import sys
+
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((sys.argv[1], int(sys.argv[2])))
+except OSError as error:
+    raise SystemExit(0 if error.errno == errno.EADDRINUSE else 1)
+raise SystemExit(1)
+PY
+}
+
+start_remote_domain_for_nmi() {
+  local post_status
+  local serial_mode="$1"
+  local state
+  if remote_redfish_action POST \
+    "${REMOTE_SYSTEM_URL}/Actions/ComputerSystem.Reset" '{"ResetType":"On"}'; then
+    wait_for_domain_state running
+    return
+  else
+    post_status="$?"
+  fi
+  if [ "$serial_mode" = "tcp" ]; then
+    state="$(bounded_virsh domstate "$VM_X86_REDFISH_DOMAIN_NAME" 2>/dev/null)" || state=""
+    if [ "$state" != "running" ] && listener_has_bind_collision \
+      "$REMOTE_HOST_IP" "$REMOTE_SERIAL_PORT"; then
+      return 75
+    fi
+  fi
+  return "$post_status"
+}
+
+prove_remote_nmi_restart() {
+  local serial_log="$REMOTE_ATTEMPT_DIR/serial.log"
+  local serial_mode="$1"
+  start_remote_domain_for_nmi "$serial_mode" || return
+  start_remote_serial_capture "$serial_log" "$serial_mode" || return
+  wait_for_text_count "$serial_log" NMI_READY 1 || return
+  if grep -F 'NMI_UNSUPPORTED:' "$serial_log" >/dev/null; then
+    printf 'NMI guest fixture reported an unsupported operation; see %s\n' "$serial_log" >&2
+    return 1
+  fi
+  remote_redfish_action POST \
+    "${REMOTE_SYSTEM_URL}/Actions/ComputerSystem.Reset" '{"ResetType":"Nmi"}' || return
+  wait_for_text_count "$serial_log" 'Kernel panic' 1 || return
+  wait_for_text_count "$serial_log" NMI_READY 2 || return
+  wait_for_domain_state running || return
+  if wait "$REMOTE_SERIAL_CLIENT_PID"; then
+    untrack_child "$REMOTE_SERIAL_CLIENT_PID"
+  else
+    printf 'serial capture failed; see %s\n' "$serial_log" >&2
+    return 1
+  fi
+}
+
+require_remote_integration_prerequisites() {
+  local command_name
+  local package_name
+  for command_name in slirp4netns unshare nsenter readlink; do
+    case "$command_name" in
+    slirp4netns) package_name=slirp4netns ;;
+    unshare | nsenter) package_name=util-linux-core ;;
+    readlink) package_name=coreutils ;;
+    esac
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      printf "integration prerequisite: missing command '%s': install %s\n" \
+        "$command_name" "$package_name" >&2
+      return 1
+    fi
+  done
+  if ! unshare --user --map-root-user --net true >/dev/null 2>&1; then
+    printf 'integration prerequisite: unprivileged user/network namespaces are unavailable\n' \
+      >&2
+    return 1
+  fi
+}
+
+run_remote_nmi_attempt() {
+  local attempt="$2"
+  local attempt_fault=none
+  local attempt_status
+  local fault="$3"
+  local serial_mode="$1"
+  [ "$attempt" -ne 1 ] || attempt_fault="$fault"
+  if create_remote_domain "$serial_mode" "$attempt_fault"; then
+    :
+  else
+    attempt_status="$?"
+    return "$attempt_status"
+  fi
+  # shellcheck disable=SC1091 # create-vm writes this attempt-specific credentials file.
+  source "$VM_X86_REDFISH_STATE_DIR/credentials.env"
+  if start_remote_sushy; then
+    :
+  else
+    attempt_status="$?"
+    return "$attempt_status"
+  fi
+  start_remote_namespace || return
+  prove_host_loopback_isolation || return
+  fetch_remote_system_url || return
+  attach_remote_nmi_media || return
+  prove_remote_nmi_restart "$serial_mode"
+}
+
+wait_for_address_port_free() {
+  local address="$1"
+  local port="$2"
+  local deadline=$((SECONDS + 30))
+  local python_bin
+  python_bin="$(python_313)"
+  until "$python_bin" - "$address" "$port" <<'PY'; do
+import socket
+import sys
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((sys.argv[1], int(sys.argv[2])))
+    sock.listen()
+PY
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+assert_remote_children_stopped() {
+  local pid
+  for pid in "${REMOTE_ATTEMPT_PIDS[@]:-}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'tracked attempt child still exists: %s\n' "$pid" >&2
+      return 1
+    fi
+  done
+}
+
+assert_remote_resources_absent() {
+  if bounded_virsh dominfo "$VM_X86_REDFISH_DOMAIN_NAME" >/dev/null 2>&1; then
+    printf 'test domain still exists: %s\n' "$VM_X86_REDFISH_DOMAIN_NAME" >&2
+    return 1
+  fi
+  if bounded_virsh vol-info --pool "$STORAGE_POOL" \
+    "$VM_X86_REDFISH_ROOT_VOLUME_NAME" >/dev/null 2>&1; then
+    printf 'test volume still exists: %s\n' "$VM_X86_REDFISH_ROOT_VOLUME_NAME" >&2
+    return 1
+  fi
+}
+
+remove_enumerated_attempt_state() {
+  local entry
+  local entries=()
+  [ -d "$VM_X86_REDFISH_STATE_DIR" ] || return 0
+  mapfile -d '' -t entries < <(
+    find "$VM_X86_REDFISH_STATE_DIR" -mindepth 1 -maxdepth 1 -print0
+  )
+  for entry in "${entries[@]:-}"; do
+    if [ "$entry" != "$VM_X86_REDFISH_STATE_DIR/lifecycle.lock" ] ||
+      [ ! -f "$entry" ] || [ -L "$entry" ]; then
+      printf 'unexpected state remains after remote attempt: %s\n' "$entry" >&2
+      return 1
+    fi
+  done
+  if [ -f "$VM_X86_REDFISH_STATE_DIR/lifecycle.lock" ]; then
+    rm -- "$VM_X86_REDFISH_STATE_DIR/lifecycle.lock"
+  fi
+  rmdir "$VM_X86_REDFISH_STATE_DIR"
+}
+
+cleanup_remote_attempt() {
+  local attempt="$2"
+  local cleanup_log="$REMOTE_ATTEMPT_DIR/destroy-${attempt}.log"
+  local serial_mode="$1"
+  stop_tracked_children
+  assert_remote_children_stopped || return
+  if ! timeout --kill-after=5 120 ./scripts/destroy-vm >"$cleanup_log" 2>&1; then
+    printf 'remote %s attempt %s cleanup failed; see %s\n' \
+      "$serial_mode" "$attempt" "$cleanup_log" >&2
+    return 1
+  fi
+  assert_remote_resources_absent || return
+  wait_for_address_port_free "$REMOTE_HOST_IP" "$REMOTE_REDFISH_PORT" || return
+  if [ "$serial_mode" = "tcp" ]; then
+    wait_for_address_port_free "$REMOTE_HOST_IP" "$REMOTE_SERIAL_PORT" || return
+  fi
+  remove_enumerated_attempt_state
 }
 
 post_virtual_media_action() {
@@ -406,9 +965,12 @@ assert_no_uuid_media_volumes() {
 }
 
 run_serial_console() {
+  local expected_count="${2:-0}"
+  local marker="${1:-}"
   local python_bin
   python_bin="$(python_313)"
-  "$python_bin" - "$LIBVIRT_URI" "$VM_X86_REDFISH_DOMAIN_NAME" <<'PY'
+  "$python_bin" - "$LIBVIRT_URI" "$VM_X86_REDFISH_DOMAIN_NAME" \
+    "$marker" "$expected_count" <<'PY'
 import errno
 import os
 import pty
@@ -417,7 +979,8 @@ import signal
 import sys
 import time
 
-uri, domain = sys.argv[1:]
+uri, domain, marker, expected_count_text = sys.argv[1:]
+expected_count = int(expected_count_text)
 command = [
     "timeout",
     "60",
@@ -434,7 +997,20 @@ pid, master_fd = pty.fork()
 if pid == 0:
     os.execvp(command[0], command)
 
+
+def forward_signal(signum, _frame):
+    try:
+        os.killpg(pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+signal.signal(signal.SIGTERM, forward_signal)
+signal.signal(signal.SIGINT, forward_signal)
+
 deadline = time.monotonic() + 70
+captured = bytearray()
+marker_reached = False
 status = None
 try:
     while time.monotonic() < deadline:
@@ -449,12 +1025,17 @@ try:
             raise
         if not data:
             break
+        captured.extend(data)
         sys.stdout.buffer.write(data)
         sys.stdout.buffer.flush()
+        if marker and captured.count(marker.encode()) >= expected_count:
+            marker_reached = True
+            forward_signal(signal.SIGTERM, None)
+            break
     else:
-        os.killpg(pid, signal.SIGTERM)
+        forward_signal(signal.SIGTERM, None)
         time.sleep(1)
-        os.killpg(pid, signal.SIGKILL)
+        forward_signal(signal.SIGKILL, None)
         raise SystemExit(124)
 finally:
     os.close(master_fd)
@@ -465,6 +1046,8 @@ finally:
 
 if status is None:
     raise SystemExit(1)
+if marker_reached:
+    raise SystemExit(0)
 raise SystemExit(os.waitstatus_to_exitcode(status))
 PY
 }
@@ -509,6 +1092,37 @@ post_reset() {
     -H 'Content-Type: application/json' \
     -d "{\"ResetType\":\"${reset_type}\"}" \
     "https://127.0.0.1:8000${system_url}/Actions/ComputerSystem.Reset"
+}
+
+run_remote_nmi_with_retries() {
+  local attempt
+  local attempt_status
+  local cleanup_status
+  local fault="$2"
+  local serial_mode="$1"
+  for attempt in 1 2 3; do
+    configure_remote_attempt "$serial_mode" "$attempt"
+    if run_remote_nmi_attempt "$serial_mode" "$attempt" "$fault"; then
+      attempt_status=0
+    else
+      attempt_status="$?"
+    fi
+    if cleanup_remote_attempt "$serial_mode" "$attempt"; then
+      cleanup_status=0
+    else
+      cleanup_status="$?"
+    fi
+    [ "$cleanup_status" -eq 0 ] || return "$cleanup_status"
+    [ "$attempt_status" -ne 0 ] || return 0
+    [ "$attempt_status" -eq 75 ] || return "$attempt_status"
+    if [ "$attempt" -eq 3 ]; then
+      printf 'remote %s attempt %s exhausted bind-collision retries\n' \
+        "$serial_mode" "$attempt" >&2
+      return 75
+    fi
+    printf 'remote %s attempt %s hit a verified bind collision; retrying\n' \
+      "$serial_mode" "$attempt"
+  done
 }
 
 simulate_failed_teardown_audits() {
@@ -562,6 +1176,40 @@ teardown() {
   [ "$status" -eq 0 ]
 }
 
+@test "remote child tracking records exact namespace and client PIDs" {
+  REMOTE_ATTEMPT_DIR="$BATS_TEST_TMPDIR/remote-child-records"
+  REMOTE_ATTEMPT_PIDS=()
+  mkdir -p "$REMOTE_ATTEMPT_DIR"
+
+  track_remote_child 12345 namespace
+  track_remote_child 23456 serial-client
+
+  run cat "$REMOTE_ATTEMPT_DIR/children.pids"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'namespace=12345\nserial-client=23456' ]
+  [ "${REMOTE_ATTEMPT_PIDS[*]}" = "12345 23456" ]
+  # shellcheck disable=SC2034 # Loaded teardown consumes the child registry.
+  TRACKED_CHILDREN=()
+}
+
+@test "exact child cleanup has a configurable bounded escalation" {
+  python_bin="$(python_313)"
+  "$python_bin" -c \
+    'import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.pause()' &
+  stubborn_pid="$!"
+  track_child "$stubborn_pid"
+  sleep 1
+  # shellcheck disable=SC2034 # Loaded cleanup helper reads this test deadline.
+  CHILD_STOP_TIMEOUT_SECONDS=1
+  started_at="$SECONDS"
+
+  stop_tracked_child "$stubborn_pid"
+
+  [ $((SECONDS - started_at)) -lt 4 ]
+  run kill -0 "$stubborn_pid"
+  [ "$status" -ne 0 ]
+}
+
 @test "integration harness installs bounded client helpers before live mutation" {
   bounded_client_path="$PATH"
   install_mock_command curl 'printf "curl %s\n" "$*"'
@@ -577,6 +1225,81 @@ teardown() {
   [ "$output" = \
     "timeout --kill-after=2 10 virsh -c qemu:///system domstate example-domain" ]
   export PATH="$bounded_client_path"
+}
+
+@test "integration preflight names the missing remote-network prerequisite" {
+  empty_path="$BATS_TEST_TMPDIR/empty-path"
+  mkdir -p "$empty_path"
+
+  PATH="$empty_path" run require_remote_integration_prerequisites
+
+  [ "$status" -ne 0 ]
+  [ "$output" = \
+    "integration prerequisite: missing command 'slirp4netns': install slirp4netns" ]
+}
+
+@test "remote Redfish actions retain TLS authentication and the requested method" {
+  printf 'test certificate\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  REDFISH_USERNAME=test-user
+  REDFISH_PASSWORD=test-password
+  namespace_curl() {
+    printf '%s\n' "$*"
+  }
+
+  run remote_redfish_action PATCH /redfish/v1/Systems/test '{}'
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--cacert "*"/tls.crt"* ]]
+  [[ "$output" == *"--user test-user:test-password"* ]]
+  [[ "$output" == *"-X PATCH"* ]]
+  [[ "$output" == *"https://127.0.0.1:8000/redfish/v1/Systems/test"* ]]
+}
+
+@test "namespace clients enter the exact user and network namespaces" {
+  install_mock_command nsenter 'printf "%s\n" "$*"'
+  REMOTE_NAMESPACE_PID=4242
+
+  run namespace_exec curl https://192.0.2.10:8443/redfish/v1
+
+  [ "$status" -eq 0 ]
+  [ "$output" = \
+    "--target 4242 --user --net curl https://192.0.2.10:8443/redfish/v1" ]
+}
+
+@test "bind-collision classification accepts only configured attempt endpoints" {
+  REMOTE_HOST_IP=192.0.2.10
+  REMOTE_REDFISH_PORT=8443
+  REMOTE_SERIAL_PORT=9000
+  collision_log="$BATS_TEST_TMPDIR/create-collision.log"
+
+  printf 'error: 192.0.2.10:8443 is already in use\n' >"$collision_log"
+  run attempt_create_has_bind_collision pty "$collision_log"
+  [ "$status" -eq 0 ]
+  printf 'error: 192.0.2.10:9000 is already in use\n' >"$collision_log"
+  run attempt_create_has_bind_collision tcp "$collision_log"
+  [ "$status" -eq 0 ]
+  printf 'error: 192.0.2.10:9999 is already in use\n' >"$collision_log"
+  run attempt_create_has_bind_collision tcp "$collision_log"
+  [ "$status" -ne 0 ]
+}
+
+@test "TCP start classifies a verified serial bind collision for retry" {
+  REMOTE_HOST_IP=192.0.2.10
+  REMOTE_SERIAL_PORT=9000
+  REMOTE_SYSTEM_URL=/redfish/v1/Systems/test
+  remote_redfish_action() {
+    return 22
+  }
+  bounded_virsh() {
+    printf 'shut off\n'
+  }
+  listener_has_bind_collision() {
+    return 0
+  }
+
+  run start_remote_domain_for_nmi tcp
+
+  [ "$status" -eq 75 ]
 }
 
 @test "cleanup inventory snapshots require successful libvirt queries" {
@@ -671,6 +1394,71 @@ esac
 
   run timeout --kill-after=5 120 ./scripts/destroy-vm
   [ "$status" -eq 0 ]
+}
+
+@test "remote retry orchestration cleans collisions and stops after success" {
+  configure_remote_attempt() {
+    printf 'configure %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+  run_remote_nmi_attempt() {
+    printf 'run %s %s %s\n' "$1" "$2" "$3" >>"$BATS_TEST_TMPDIR/retry.log"
+    [ "$2" -eq 1 ] && return 75
+    return 0
+  }
+  cleanup_remote_attempt() {
+    printf 'cleanup %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+
+  run run_remote_nmi_with_retries pty redfish
+
+  [ "$status" -eq 0 ]
+  [ "$output" = "remote pty attempt 1 hit a verified bind collision; retrying" ]
+  run cat "$BATS_TEST_TMPDIR/retry.log"
+  [ "$status" -eq 0 ]
+  expected=$'configure pty 1\nrun pty 1 redfish\ncleanup pty 1\n'
+  expected+=$'configure pty 2\nrun pty 2 redfish\ncleanup pty 2'
+  [ "$output" = "$expected" ]
+}
+
+@test "remote retry orchestration does not retry non-collision failures" {
+  configure_remote_attempt() {
+    printf 'configure %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+  run_remote_nmi_attempt() {
+    printf 'run %s %s %s\n' "$1" "$2" "$3" >>"$BATS_TEST_TMPDIR/retry.log"
+    return 64
+  }
+  cleanup_remote_attempt() {
+    printf 'cleanup %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+
+  run run_remote_nmi_with_retries tcp serial
+
+  [ "$status" -eq 64 ]
+  run cat "$BATS_TEST_TMPDIR/retry.log"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'configure tcp 1\nrun tcp 1 serial\ncleanup tcp 1' ]
+}
+
+@test "remote retry orchestration bounds verified collisions at three attempts" {
+  configure_remote_attempt() {
+    printf 'configure %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+  run_remote_nmi_attempt() {
+    printf 'run %s %s %s\n' "$1" "$2" "$3" >>"$BATS_TEST_TMPDIR/retry.log"
+    return 75
+  }
+  cleanup_remote_attempt() {
+    printf 'cleanup %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+
+  run run_remote_nmi_with_retries tcp serial
+
+  [ "$status" -eq 75 ]
+  [[ "$output" == *"remote tcp attempt 3 exhausted bind-collision retries"* ]]
+  run grep -c '^cleanup tcp ' "$BATS_TEST_TMPDIR/retry.log"
+  [ "$status" -eq 0 ]
+  [ "$output" = "3" ]
 }
 
 @test "teardown destroys resources and reports every failed cleanup audit" {
@@ -938,4 +1726,30 @@ PY
 
   destroy_and_assert_virtual_media_cleanup \
     "$domain_uuid" "$interrupted_path" "$nvram_path" "$media_volume" "$inventory_dir"
+}
+
+@test "remote PTY serial proves TLS-authenticated Redfish NMI and restart" {
+  [ "${VM_X86_REDFISH_INTEGRATION_HELPER_ONLY:-}" != "1" ]
+  run run_remote_nmi_with_retries pty none
+  [ "$status" -eq 0 ]
+}
+
+@test "remote TCP serial proves TLS-authenticated Redfish NMI and restart" {
+  [ "${VM_X86_REDFISH_INTEGRATION_HELPER_ONLY:-}" != "1" ]
+  run run_remote_nmi_with_retries tcp none
+  [ "$status" -eq 0 ]
+}
+
+@test "remote PTY serial retries a stolen Redfish port after exact cleanup" {
+  [ "${VM_X86_REDFISH_INTEGRATION_HELPER_ONLY:-}" != "1" ]
+  run run_remote_nmi_with_retries pty redfish
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"remote pty attempt 1 hit a verified bind collision; retrying"* ]]
+}
+
+@test "remote TCP serial retries a stolen serial port after exact cleanup" {
+  [ "${VM_X86_REDFISH_INTEGRATION_HELPER_ONLY:-}" != "1" ]
+  run run_remote_nmi_with_retries tcp serial
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"remote tcp attempt 1 hit a verified bind collision; retrying"* ]]
 }
