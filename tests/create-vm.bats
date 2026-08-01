@@ -29,6 +29,15 @@ install_real_openssl() {
     "exec '$VM_X86_REDFISH_REAL_OPENSSL' \"\$@\""
 }
 
+install_bounded_encrypted_key_openssl() {
+  install_mock_command openssl '
+if [ "${1:-}" = "pkey" ] && [[ " $* " != *" -passin pass: "* ]]; then
+  sleep 30
+fi
+exec "$VM_X86_REDFISH_REAL_OPENSSL" "$@"
+'
+}
+
 generate_valid_tls_pair() {
   local cert_path="$1"
   local key_path="$2"
@@ -49,6 +58,16 @@ generate_expired_tls_pair() {
     -subj "/CN=localhost" -not_before 20200101000000Z -not_after 20200102000000Z \
     -extfile "$extension_path" -out "$cert_path" >/dev/null 2>&1
   rm -- "$extension_path"
+  chmod 600 "$cert_path" "$key_path"
+}
+
+generate_encrypted_tls_pair() {
+  local cert_path="$1"
+  local key_path="$2"
+  "$VM_X86_REDFISH_REAL_OPENSSL" req -x509 -newkey rsa:2048 -sha256 -days 2 \
+    -passout pass:redfish-test-key-password -subj "/CN=localhost" \
+    -addext "subjectAltName=IP:127.0.0.1" \
+    -keyout "$key_path" -out "$cert_path" >/dev/null 2>&1
   chmod 600 "$cert_path" "$key_path"
 }
 
@@ -459,6 +478,24 @@ PY
 
   [ "$status" -ne 0 ]
   [[ "$output" == *"certificate and private key do not match"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
+  assert_tls_rejection_preserved_precreate_state "$cert_digest" "$key_digest"
+}
+
+@test "create-vm rejects an encrypted TLS key without waiting for a passphrase" {
+  local cert_digest key_digest
+  install_create_success_mocks
+  generate_encrypted_tls_pair \
+    "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  cert_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")"
+  install_bounded_encrypted_key_openssl
+
+  run timeout --kill-after=1 3 ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 124 ]
+  [[ "$output" == *"existing Redfish TLS private key is malformed"* ]]
   [[ "$output" == *"run make destroy, then make create"* ]]
   assert_tls_rejection_preserved_precreate_state "$cert_digest" "$key_digest"
 }

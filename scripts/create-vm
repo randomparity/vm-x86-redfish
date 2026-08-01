@@ -245,7 +245,7 @@ validate_existing_tls() {
       fail "cannot read existing Redfish TLS certificate public key;" \
         "run make destroy, then make create"
     fi
-    if ! key_public_key="$(openssl pkey -in "$key_path" -pubout 2>/dev/null)"; then
+    if ! key_public_key="$(openssl pkey -passin pass: -in "$key_path" -pubout 2>/dev/null)"; then
       fail "existing Redfish TLS private key is malformed; run make destroy, then make create"
     fi
     if [ "$cert_public_key" != "$key_public_key" ]; then
