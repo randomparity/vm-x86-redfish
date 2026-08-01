@@ -118,9 +118,12 @@ serial clients.
 - Existing local-operator boundary: environment inputs control rendered Python, XML,
   certificate extensions, and shell-sourceable connection metadata.
 
-The trusted actor is the local test-host operator choosing addresses and firewall policy.
-Remote clients and other network peers are untrusted even when they possess Redfish Basic
-credentials.
+Unauthenticated network peers are untrusted. The local test-host operator and control-plane
+operators entrusted with the generated Redfish Basic credentials are trusted actors. Possession
+and use of those credentials grants full test-control authority, including power control and
+host-side HTTP/HTTPS fetches of operator-selected virtual-media URLs. That fetch authority
+includes loopback and private-network destinations, so credentials must be distributed only to
+trusted control-plane operators.
 
 ### Controls
 
@@ -128,6 +131,8 @@ credentials.
   OpenSSL, URI, or shell syntax. Rendering substitutes only validated canonical values.
 - Redfish retains existing TLS and Basic authentication behavior. Non-loopback selection
   emits an exposure warning; no claim is made that discovery is authenticated.
+- Generated Basic credentials are shared only with trusted test-control operators. There is no
+  virtual-media origin or destination policy.
 - TCP serial remains opt-in, emits a plaintext/unauthenticated warning, and binds only the
   exact operator-selected address. Connection metadata stays mode 0600.
 - Existing lifecycle ownership, UUID checks, locks, private state permissions, and bounded
@@ -136,9 +141,9 @@ credentials.
 ### Out of scope
 
 Firewall configuration, trusted public certificates, Redfish authorization beyond existing
-Basic authentication, serial encryption/authentication, and hostile co-tenants on the test
-host are not addressed. The service remains a development/test BMC stand-in, not a
-production BMC.
+Basic authentication, virtual-media destination filtering, serial encryption/authentication,
+and hostile co-tenants on the test host are not addressed. The service remains a
+development/test BMC stand-in, not a production BMC.
 
 ## Acceptance tests
 

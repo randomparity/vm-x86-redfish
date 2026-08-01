@@ -157,8 +157,11 @@ ignored `.artifacts/`. Do not commit generated files or credentials.
 
 This project provides Redfish rather than IPMI and manages one local project-owned VM through
 `qemu:///system`. Discovery at `/redfish/v1` is intentionally unauthenticated; system
-resources and mutation actions require Basic authentication. Authenticated users can request
-virtual-media URLs, so treat those URLs as trusted test inputs. TLS verification is enabled for
-virtual-media downloads. Production hardening, a new authorization model, trusted public
-certificates, firewall configuration, and encrypted or authenticated TCP serial are out of
-scope.
+resources and mutation actions require Basic authentication. Unauthenticated network peers are
+untrusted. Give the generated credentials only to trusted control-plane operators: using them
+grants full test-control authority, including power control and host-side HTTP/HTTPS fetches of
+operator-selected virtual-media URLs. No origin policy prevents those fetches from targeting
+loopback or private-network services, so treat media URLs as trusted test inputs. TLS
+verification is enabled for virtual-media downloads. Production hardening, a new authorization
+model, trusted public certificates, firewall configuration, and encrypted or authenticated TCP
+serial are out of scope.

@@ -260,10 +260,13 @@ filenames are covered by cleanup tests. Once the lifecycle lock is held, destruc
 enumerated temporary-media files beneath the canonical, non-symlink `.state/tmp` and removes
 the directory only when it is empty. It never uses an unchecked recursive deletion.
 
-Authenticated Redfish users can cause server-side URL fetches. Virtual-media TLS verification
-is enabled, but remote Redfish exposure is an explicit local-operator decision. Media URLs are
-trusted test inputs, and supplied media credentials may persist in the private Sushy state
-directory.
+Unauthenticated network peers are untrusted. The generated Redfish Basic credentials must be
+distributed only to trusted control-plane operators: possession and use grants full test-control
+authority, including power control and server-side HTTP/HTTPS fetches of operator-selected
+virtual-media URLs. No origin or destination policy prevents those fetches from targeting
+loopback or private-network services. Virtual-media TLS verification is enabled, but remote
+Redfish exposure is an explicit local-operator decision. Media URLs are trusted test inputs,
+and supplied media credentials may persist in the private Sushy state directory.
 
 ## Commands
 
