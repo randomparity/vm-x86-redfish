@@ -91,21 +91,56 @@ esac
 }
 
 write_existing_domain_xml() {
-  local extra_devices root_path root_volume_name target_path
+  local extra_devices root_path root_volume_name serial_devices serial_listen_ip
+  local serial_listen_port serial_metadata serial_mode target_path
   target_path="$1"
   root_volume_name="${2:-vm-x86-redfish.qcow2}"
   root_path="${3:-/var/lib/libvirt/images/vm-x86-redfish.qcow2}"
   extra_devices="${4:-}"
+  serial_mode="${5:-pty}"
+  serial_listen_ip="${6:-}"
+  serial_listen_port="${7:-}"
+  case "$serial_mode" in
+  pty)
+    serial_devices='<serial type="pty">
+      <target type="isa-serial" port="0"><model name="isa-serial"/></target>
+    </serial>
+    <console type="pty">
+      <target type="serial" port="0"/>
+    </console>'
+    ;;
+  tcp)
+    serial_devices="<serial type=\"tcp\">
+      <source mode=\"bind\" host=\"${serial_listen_ip}\" service=\"${serial_listen_port}\"/>
+      <protocol type=\"raw\"/>
+      <target type=\"isa-serial\" port=\"0\"><model name=\"isa-serial\"/></target>
+    </serial>
+    <console type=\"tcp\">
+      <source mode=\"bind\" host=\"${serial_listen_ip}\" service=\"${serial_listen_port}\"/>
+      <protocol type=\"raw\"/>
+      <target type=\"serial\" port=\"0\"/>
+    </console>"
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+  serial_metadata="      <rp:serial-mode>${serial_mode}</rp:serial-mode>
+      <rp:serial-listen-ip>${serial_listen_ip}</rp:serial-listen-ip>
+      <rp:serial-listen-port>${serial_listen_port}</rp:serial-listen-port>"
   cat >"$target_path" <<XML
 <domain type="kvm" xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
   <name>vm-x86-redfish</name>
   <uuid>11111111-2222-3333-8444-555555555555</uuid>
   <metadata>
-    <rp:project>vm-x86-redfish</rp:project>
-    <rp:root-volume>${root_volume_name}</rp:root-volume>
-    <rp:memory-mib>4096</rp:memory-mib>
-    <rp:root-disk-gib>40</rp:root-disk-gib>
-    <rp:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</rp:source-image-sha256>
+    <rp:vm-x86-redfish>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>${root_volume_name}</rp:root-volume>
+      <rp:memory-mib>4096</rp:memory-mib>
+      <rp:root-disk-gib>40</rp:root-disk-gib>
+      <rp:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</rp:source-image-sha256>
+${serial_metadata}
+    </rp:vm-x86-redfish>
   </metadata>
   <memory unit="MiB">4096</memory>
   <vcpu placement="static">2</vcpu>
@@ -126,12 +161,7 @@ write_existing_domain_xml() {
       <source network="default"/>
       <model type="virtio"/>
     </interface>
-    <serial type="pty">
-      <target type="isa-serial" port="0"><model name="isa-serial"/></target>
-    </serial>
-    <console type="pty">
-      <target type="serial" port="0"/>
-    </console>
+${serial_devices}
     <channel type="unix">
       <target type="virtio" name="org.qemu.guest_agent.0"/>
     </channel>
@@ -144,9 +174,13 @@ XML
 }
 
 install_existing_domain_mocks() {
+  local serial_listen_ip="${2:-}"
+  local serial_listen_port="${3:-}"
+  local serial_mode="${1:-pty}"
   printf '11111111-2222-3333-8444-555555555555\n' \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
-  write_existing_domain_xml "$BATS_TEST_TMPDIR/existing-domain.xml"
+  write_existing_domain_xml "$BATS_TEST_TMPDIR/existing-domain.xml" "" "" "" \
+    "$serial_mode" "$serial_listen_ip" "$serial_listen_port"
   install_mock_command virsh '
 printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
@@ -209,6 +243,72 @@ PY
   [ "$status" -eq 0 ]
   [ -f "$VM_X86_REDFISH_STATE_DIR/credentials.env" ]
   [ -f "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py" ]
+}
+
+@test "create-vm accepts a matching TCP serial transport on rerun" {
+  install_existing_domain_mocks tcp 192.0.2.20 9000
+
+  VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
+}
+
+@test "create-vm rejects incompatible serial transports before rewriting runtime state" {
+  local case_name
+  local duplicate_serial
+  for case_name in mode address port protocol source-mode duplicate-serial missing-console \
+    metadata-device-disagreement; do
+    install_existing_domain_mocks tcp 192.0.2.20 9000
+    case "$case_name" in
+    mode)
+      sed -i 's/type="tcp"/type="pty"/' "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    address)
+      sed -i 's/host="192.0.2.20"/host="192.0.2.21"/g' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    port)
+      sed -i 's/service="9000"/service="9001"/g' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    protocol)
+      sed -i '0,/protocol type="raw"/s//protocol type="telnet"/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    source-mode)
+      sed -i '0,/source mode="bind"/s//source mode="connect"/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    duplicate-serial)
+      duplicate_serial='<serial type="pty"><target type="isa-serial" port="1"/></serial>'
+      sed -i "/<channel type=\"unix\">/i\\    ${duplicate_serial}" \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    missing-console)
+      sed -i '/    <console type="tcp">/,/    <\/console>/d' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    metadata-device-disagreement)
+      sed -i 's/<rp:serial-listen-ip>192.0.2.20/<rp:serial-listen-ip>192.0.2.21/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    esac
+
+    : >"$BATS_TEST_TMPDIR/commands.log"
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+      VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+      VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+      run ./scripts/create-vm
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"configured tcp serial transport"* ]]
+    [[ "$output" == *"destroy and recreate"* ]]
+    run grep -F "htpasswd -iB -c" "$BATS_TEST_TMPDIR/commands.log"
+    [ "$status" -ne 0 ]
+  done
 }
 
 @test "create-vm writes uuid once and defines new owned domain" {
@@ -399,6 +499,9 @@ case "$*" in
     <owned:memory-mib>4096</owned:memory-mib>
     <owned:root-disk-gib>40</owned:root-disk-gib>
     <owned:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</owned:source-image-sha256>
+    <owned:serial-mode>pty</owned:serial-mode>
+    <owned:serial-listen-ip></owned:serial-listen-ip>
+    <owned:serial-listen-port></owned:serial-listen-port>
   </metadata>
   <memory unit="MiB">4096</memory>
   <vcpu placement="static">2</vcpu>

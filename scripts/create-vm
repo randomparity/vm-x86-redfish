@@ -71,6 +71,9 @@ dump_existing_domain_xml() {
 validate_or_reject_existing_domain() {
   local xml_path="${STATE_DIR}/existing-domain.xml"
   local root_path
+  local serial_error
+  local serial_endpoint_value
+  local serial_transport_name
   if virsh -c "$LIBVIRT_URI" dominfo "$DEFAULT_DOMAIN_NAME" >/dev/null 2>&1; then
     ensure_private_dir "$STATE_DIR"
     dump_existing_domain_xml "$xml_path"
@@ -91,8 +94,22 @@ validate_or_reject_existing_domain() {
       fail "existing domain $DEFAULT_DOMAIN_NAME does not match configured VM memory"
     domain_config_metadata_matches "$xml_path" ||
       fail "existing domain $DEFAULT_DOMAIN_NAME does not match configured sizing/image metadata"
-    domain_shape_matches_expected "$xml_path" "$root_path" ||
-      fail "existing domain $DEFAULT_DOMAIN_NAME hardware does not match expected project shape"
+    if domain_shape_matches_expected "$xml_path" "$root_path"; then
+      :
+    else
+      case "$?" in
+      2)
+        serial_endpoint_value="$(serial_endpoint)"
+        serial_transport_name="${SERIAL_MODE} serial transport ${serial_endpoint_value}"
+        serial_error="existing domain $DEFAULT_DOMAIN_NAME does not match configured "
+        serial_error+="${serial_transport_name}; destroy and recreate it"
+        fail "$serial_error"
+        ;;
+      *)
+        fail "existing domain $DEFAULT_DOMAIN_NAME hardware does not match expected project shape"
+        ;;
+      esac
+    fi
     return 0
   fi
   return 1

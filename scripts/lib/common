@@ -404,25 +404,49 @@ domain_shape_matches_expected() {
   local root_path="$2"
   local xml="$1"
   python_bin="$(python_313)"
-  "$python_bin" - "$xml" "$DEFAULT_DOMAIN_NAME" "$root_path" <<'PY'
+  "$python_bin" - "$xml" "$DEFAULT_DOMAIN_NAME" "$root_path" "$SERIAL_MODE" \
+    "$SERIAL_LISTEN_IP" "$SERIAL_LISTEN_PORT" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 
-xml_path, domain_name, root_path = sys.argv[1:]
+(
+    xml_path,
+    domain_name,
+    root_path,
+    serial_mode,
+    serial_listen_ip,
+    serial_listen_port,
+) = sys.argv[1:]
 try:
     root = ET.parse(xml_path).getroot()
 except ET.ParseError:
     raise SystemExit(1)
 
+class Mismatch(Exception):
+    pass
+
+
+class SerialMismatch(Mismatch):
+    pass
+
+
 def fail():
-    raise SystemExit(1)
+    raise Mismatch
 
 def require(condition):
     if not condition:
         fail()
 
+def serial_require(condition):
+    if not condition:
+        raise SerialMismatch
+
 def one(elements):
     require(len(elements) == 1)
+    return elements[0]
+
+def serial_one(elements):
+    serial_require(len(elements) == 1)
     return elements[0]
 
 def child(parent, name):
@@ -434,59 +458,106 @@ def text(parent, name):
     elem = child(parent, name)
     return elem.text or ""
 
-require(root.tag == "domain")
-require(root.get("type") == "kvm")
-require(text(root, "name") == domain_name)
-os_elem = child(root, "os")
-boot_entries = os_elem.findall("boot")
-require(len(boot_entries) == 1)
-require(boot_entries[0].get("dev") == "hd")
-devices = child(root, "devices")
-require(not any(True for _ in devices.iter("hostdev")))
-require(not any(True for _ in devices.iter("boot")))
-all_disks = devices.findall("disk")
-disk = one(all_disks)
-require(disk.get("type") == "file")
-require(disk.get("device") == "disk")
-driver = child(disk, "driver")
-require(driver.get("name") == "qemu")
-require(driver.get("type") == "qcow2")
-require(driver.get("discard") == "unmap")
-source = child(disk, "source")
-require(source.get("file") == root_path)
-target = child(disk, "target")
-require(target.get("dev") == "vda")
-require(target.get("bus") == "virtio")
-interface = one(devices.findall("interface"))
-require(interface.get("type") == "network")
-require(child(interface, "source").get("network") == "default")
-require(child(interface, "model").get("type") == "virtio")
-serial = one(devices.findall("serial"))
-serial_target = child(serial, "target")
-require(serial.get("type") == "pty")
-require(serial_target.get("type") == "isa-serial")
-require(serial_target.get("port") == "0")
-require(child(serial_target, "model").get("name") == "isa-serial")
-console = one(devices.findall("console"))
-console_target = child(console, "target")
-require(console.get("type") == "pty")
-require(console_target.get("type") == "serial")
-require(console_target.get("port") == "0")
-channel = one(devices.findall("channel"))
-channel_target = child(channel, "target")
-require(channel.get("type") == "unix")
-require(channel_target.get("type") == "virtio")
-require(channel_target.get("name") == "org.qemu.guest_agent.0")
-graphics = one(devices.findall("graphics"))
-require(graphics.get("type") == "vnc")
-listen = graphics.get("listen")
-listen_elem = graphics.find("listen")
-if listen is None and listen_elem is not None:
-    listen = listen_elem.get("address")
-require(listen == "127.0.0.1")
-video_model = child(one(devices.findall("video")), "model")
-require(video_model.get("type") == "virtio")
-require(text(devices, "emulator") == "/usr/bin/qemu-system-x86_64")
+def domain_serial_matches(devices):
+    serial = serial_one(devices.findall("serial"))
+    console = serial_one(devices.findall("console"))
+    serial_target = serial_one(serial.findall("target"))
+    console_target = serial_one(console.findall("target"))
+    serial_require(serial_target.get("type") == "isa-serial")
+    serial_require(serial_target.get("port") == "0")
+    serial_model = serial_one(serial_target.findall("model"))
+    serial_require(serial_model.get("name") == "isa-serial")
+    serial_require(console_target.get("type") == "serial")
+    serial_require(console_target.get("port") == "0")
+
+    if serial_mode == "pty":
+        serial_require(serial.get("type") == "pty")
+        serial_require(console.get("type") == "pty")
+        serial_require(not serial.findall("source"))
+        serial_require(not serial.findall("protocol"))
+        serial_require(not console.findall("source"))
+        serial_require(not console.findall("protocol"))
+    else:
+        serial_require(serial_mode == "tcp")
+        serial_require(serial.get("type") == "tcp")
+        serial_require(console.get("type") == "tcp")
+        expected_source = {
+            "mode": "bind",
+            "host": serial_listen_ip,
+            "service": serial_listen_port,
+        }
+        for device in (serial, console):
+            serial_require(serial_one(device.findall("source")).attrib == expected_source)
+            serial_require(serial_one(device.findall("protocol")).attrib == {"type": "raw"})
+
+    namespace = "https://github.com/randomparity/vm-x86-redfish"
+    container_tag = f"{{{namespace}}}vm-x86-redfish"
+
+    def metadata_elements(name):
+        tag = f"{{{namespace}}}{name}"
+        elements = []
+        for metadata in root.findall("metadata"):
+            elements.extend(metadata.findall(tag))
+            for container in metadata.findall(container_tag):
+                elements.extend(container.findall(tag))
+        return elements
+
+    def metadata_matches(name, expected):
+        element = serial_one(metadata_elements(name))
+        serial_require((element.text or "") == expected)
+
+    metadata_matches("serial-mode", serial_mode)
+    metadata_matches("serial-listen-ip", serial_listen_ip)
+    metadata_matches("serial-listen-port", serial_listen_port)
+
+try:
+    require(root.tag == "domain")
+    require(root.get("type") == "kvm")
+    require(text(root, "name") == domain_name)
+    os_elem = child(root, "os")
+    boot_entries = os_elem.findall("boot")
+    require(len(boot_entries) == 1)
+    require(boot_entries[0].get("dev") == "hd")
+    devices = child(root, "devices")
+    require(not any(True for _ in devices.iter("hostdev")))
+    require(not any(True for _ in devices.iter("boot")))
+    all_disks = devices.findall("disk")
+    disk = one(all_disks)
+    require(disk.get("type") == "file")
+    require(disk.get("device") == "disk")
+    driver = child(disk, "driver")
+    require(driver.get("name") == "qemu")
+    require(driver.get("type") == "qcow2")
+    require(driver.get("discard") == "unmap")
+    source = child(disk, "source")
+    require(source.get("file") == root_path)
+    target = child(disk, "target")
+    require(target.get("dev") == "vda")
+    require(target.get("bus") == "virtio")
+    interface = one(devices.findall("interface"))
+    require(interface.get("type") == "network")
+    require(child(interface, "source").get("network") == "default")
+    require(child(interface, "model").get("type") == "virtio")
+    domain_serial_matches(devices)
+    channel = one(devices.findall("channel"))
+    channel_target = child(channel, "target")
+    require(channel.get("type") == "unix")
+    require(channel_target.get("type") == "virtio")
+    require(channel_target.get("name") == "org.qemu.guest_agent.0")
+    graphics = one(devices.findall("graphics"))
+    require(graphics.get("type") == "vnc")
+    listen = graphics.get("listen")
+    listen_elem = graphics.find("listen")
+    if listen is None and listen_elem is not None:
+        listen = listen_elem.get("address")
+    require(listen == "127.0.0.1")
+    video_model = child(one(devices.findall("video")), "model")
+    require(video_model.get("type") == "virtio")
+    require(text(devices, "emulator") == "/usr/bin/qemu-system-x86_64")
+except SerialMismatch:
+    raise SystemExit(2)
+except Mismatch:
+    raise SystemExit(1)
 PY
 }
 
