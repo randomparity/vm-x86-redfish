@@ -18,6 +18,8 @@ one validation path, rendered configuration, TLS generation, ownership metadata,
 connection metadata. Redfish defaults to `127.0.0.1:8000`; serial defaults to the existing
 libvirt PTY. Operators may opt into a raw TCP serial listener with an explicit IP address and
 port. TCP listeners use libvirt server mode and do not add authentication or encryption.
+Lifecycle entry points that consume the configuration warn for non-loopback Redfish and for
+every TCP serial selection, naming the resulting exposure.
 
 Existing domains must match the configured serial transport and endpoint. Existing TLS state
 must contain the configured Redfish IP address; incompatible state fails with a remediation
@@ -32,6 +34,9 @@ identity. TCP serial traffic remains appropriate only for isolated test networks
 
 ## Considered & rejected
 
+- Keep the fixed host-local endpoints: rejected because loopback Redfish and a host-local
+  PTY cannot satisfy the sourced off-host control and serial-consumption outcome, although
+  this baseline would otherwise minimize exposure and state complexity.
 - Bind Redfish and serial to all interfaces by default: rejected because it silently widens
   access to unauthenticated serial data and a management API capable of fetching media URLs.
 - Add a proxy or new authenticated serial service: rejected because the issue asks for a test
@@ -39,4 +44,3 @@ identity. TCP serial traffic remains appropriate only for isolated test networks
   a second lifecycle.
 - Patch generated files after creation: rejected because reruns could not reliably validate
   the live contract and certificates would drift from the advertised endpoint.
-
