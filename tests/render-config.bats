@@ -237,7 +237,8 @@ load "helpers/test-helper"
       "11111111-2222-3333-4444-555555555555"
   '
   [ "$status" -eq 0 ]
-  [ "$output" = "fedora-iso-11111111-2222-3333-4444-555555555555.img" ]
+  [ "$output" = \
+    "vm-x86-redfish-media-fedora-iso-11111111-2222-3333-4444-555555555555.img" ]
 }
 
 @test "write_secret_file rejects a symlinked file path" {
@@ -315,7 +316,8 @@ load "helpers/test-helper"
   '
 
   [ "$status" -eq 0 ]
-  [ "$output" = "fedora-iso-11111111-2222-3333-4444-555555555555.img" ]
+  [ "$output" = \
+    "vm-x86-redfish-media-fedora-iso-11111111-2222-3333-4444-555555555555.img" ]
 }
 
 @test "runtime configuration rejects production test overrides" {

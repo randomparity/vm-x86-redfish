@@ -186,20 +186,20 @@ operating system is present.
 ## Virtual Media Storage
 
 On insertion, Sushy downloads the requested image and uploads a copy into the `default`
-libvirt pool as `<media-basename-with-dots-replaced>-<UUID>.img`. Sushy removes the temporary
-download after eject but does not remove the pool volume. Because its process `TMPDIR` is
-`.state/tmp`, an interrupted insertion leaves temporary data only beneath that validated
-directory.
+libvirt pool as `vm-x86-redfish-media-<media-basename-with-dots-replaced>-<UUID>.img`.
+Each upload records that exact volume name in private Sushy state before stream upload
+starts. Sushy removes the temporary download after eject but does not remove the pool
+volume. Because its process `TMPDIR` is `.state/tmp`, an interrupted insertion leaves
+temporary data only beneath that validated directory.
 
-`scripts/destroy-vm` therefore enumerates pool volumes and removes only media volumes whose
-names match the anchored form `^[^/]+-<UUID>\.img$`, in addition to the owned root disk. The
-matcher operates on each libvirt volume name as a string without shell glob expansion.
-Destruction refuses to continue if domain metadata, the recorded UUID, and the live UUID
-disagree. Interrupted
-insertion and repeated insertion with different filenames are covered by cleanup tests. Once
-the lifecycle lock is held, destruction removes enumerated temporary-media files beneath the
-canonical, non-symlink `.state/tmp` and removes the directory only when it is empty. It never
-uses an unchecked recursive deletion.
+`scripts/destroy-vm` therefore removes only exact media volume names recorded in private
+project state and matching the current project prefix plus recorded UUID, in addition to
+the owned root disk. The matcher operates on each libvirt volume name as a string without
+shell glob expansion. Destruction refuses to continue if domain metadata, the recorded UUID,
+and the live UUID disagree. Interrupted insertion and repeated insertion with different
+filenames are covered by cleanup tests. Once the lifecycle lock is held, destruction removes
+enumerated temporary-media files beneath the canonical, non-symlink `.state/tmp` and removes
+the directory only when it is empty. It never uses an unchecked recursive deletion.
 
 Because authenticated Redfish users can cause server-side URL fetches, the endpoint remains
 loopback-only. Virtual-media TLS verification is enabled. The documentation warns that media

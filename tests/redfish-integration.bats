@@ -260,16 +260,34 @@ capture_domain_inventory() {
   printf '%s\n' "$inventory" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort >"$destination"
 }
 
+volume_name_from_inventory_line() {
+  local line="$1"
+  local volume
+  line="${line#"${line%%[![:space:]]*}"}"
+  case "$line" in
+  "" | Name[[:space:]]* | ---*) return 0 ;;
+  esac
+  if [[ "$line" =~ ^(.+)[[:space:]][[:space:]]+/.*$ ]]; then
+    volume="${BASH_REMATCH[1]}"
+    volume="${volume%"${volume##*[![:space:]]}"}"
+    printf '%s\n' "$volume"
+  else
+    printf '%s\n' "$line"
+  fi
+}
+
 capture_volume_inventory() {
   local destination="$1"
   local inventory
+  local line
   if ! inventory="$(bounded_virsh vol-list --pool "$STORAGE_POOL")"; then
     printf 'failed to capture libvirt volume inventory for pool %s\n' \
       "$STORAGE_POOL" >&2
     return 1
   fi
-  printf '%s\n' "$inventory" | awk 'NR > 2 && NF { print $1 }' |
-    LC_ALL=C sort >"$destination"
+  while IFS= read -r line; do
+    volume_name_from_inventory_line "$line"
+  done <<<"$inventory" | LC_ALL=C sort >"$destination"
 }
 
 snapshot_live_inventory() {
@@ -335,7 +353,7 @@ assert_no_uuid_media_volumes() {
   local volumes=()
   mapfile -t volumes <"$inventory" || return
   for volume in "${volumes[@]}"; do
-    if [[ "$volume" = *-"$domain_uuid".img ]]; then
+    if [[ "$volume" = "$PROJECT_NAME-media-"*-"$domain_uuid".img ]]; then
       printf 'UUID media volume still exists: %s\n' "$volume" >&2
       return 1
     fi
@@ -548,8 +566,8 @@ case "$*" in
     ;;
   *"vol-list --pool default")
     printf " Name   Path\n-----------------------------------\n"
-    printf "%s %s\n" unrelated.qcow2 /var/lib/libvirt/images/unrelated.qcow2
-    printf "%s %s\n" vm-x86-redfish-near-match.qcow2 /var/lib/libvirt/images/near
+    printf "%s   %s\n" unrelated.qcow2 /var/lib/libvirt/images/unrelated.qcow2
+    printf "%s   %s\n" vm-x86-redfish-near-match.qcow2 /var/lib/libvirt/images/near
     ;;
 esac
 '

@@ -92,9 +92,18 @@ esac
   [[ "$output" == *"refusing to destroy unowned domain vm-x86-redfish"* ]]
 }
 
-@test "destroy-vm deletes only root and anchored uuid media volumes" {
+@test "destroy-vm deletes only root and manifest-owned media volumes" {
+  media_volume="vm-x86-redfish-media-fedora netinst-iso-11111111-2222-4333-8444-555555555555.img"
+  export MEDIA_VOLUME="$media_volume"
   printf '11111111-2222-4333-8444-555555555555\n' \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR/sushy"
+  chmod 700 "$VM_X86_REDFISH_STATE_DIR/sushy"
+  {
+    printf '%s\n' "$media_volume"
+    printf '%s\n' "$media_volume"
+  } \
+    >"$VM_X86_REDFISH_STATE_DIR/sushy/media-volumes"
   install_mock_command virsh '
 printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
@@ -124,9 +133,10 @@ XML
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
     ;;
   *"vol-list --pool default")
-    printf "vm-x86-redfish.qcow2 /var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
-    printf "fedora-iso-11111111-2222-4333-8444-555555555555.img /var/lib/libvirt/images/fedora\n"
-    printf "unrelated-22222222-2222-4333-8444-555555555555.img /var/lib/libvirt/images/other\n"
+    printf "vm-x86-redfish.qcow2   /var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+    printf "%s   /var/lib/libvirt/images/media.img\n" "$MEDIA_VOLUME"
+    printf "fedora-iso-11111111-2222-4333-8444-555555555555.img\n"
+    printf "unrelated-22222222-2222-4333-8444-555555555555.img\n"
     ;;
   *)
     exit 0
@@ -137,16 +147,26 @@ esac
   [ "$status" -eq 0 ]
   grep -F "vol-delete --pool default vm-x86-redfish.qcow2" \
     "$BATS_TEST_TMPDIR/commands.log"
-  grep -F "vol-delete --pool default fedora-iso-11111111-2222-4333-8444-555555555555.img" \
+  grep -F "vol-delete --pool default $media_volume" "$BATS_TEST_TMPDIR/commands.log"
+  run grep -Fc "vol-delete --pool default $media_volume" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1" ]
+  run grep -F "vol-delete --pool default fedora-iso-11111111-2222-4333-8444-555555555555.img" \
     "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
   run grep -F "unrelated-22222222" "$BATS_TEST_TMPDIR/commands.log"
   [ "$status" -ne 0 ]
   [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
 }
 
 @test "destroy-vm undefines owned domain when root volume is already absent" {
+  media_volume="vm-x86-redfish-media-partial-11111111-2222-4333-8444-555555555555.img"
+  export MEDIA_VOLUME="$media_volume"
   printf '11111111-2222-4333-8444-555555555555\n' \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR/sushy"
+  chmod 700 "$VM_X86_REDFISH_STATE_DIR/sushy"
+  printf '%s\n' "$media_volume" >"$VM_X86_REDFISH_STATE_DIR/sushy/media-volumes"
   install_mock_command virsh '
 printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
@@ -173,7 +193,7 @@ XML
     exit 2
     ;;
   *"vol-list --pool default")
-    printf "partial-11111111-2222-4333-8444-555555555555.img\n"
+    printf "%s\n" "$MEDIA_VOLUME"
     ;;
   *)
     exit 0
@@ -183,8 +203,7 @@ esac
   run ./scripts/destroy-vm
   [ "$status" -eq 0 ]
   grep -F "undefine vm-x86-redfish --nvram" "$BATS_TEST_TMPDIR/commands.log"
-  grep -F "vol-delete --pool default partial-11111111-2222-4333-8444-555555555555.img" \
-    "$BATS_TEST_TMPDIR/commands.log"
+  grep -F "vol-delete --pool default $media_volume" "$BATS_TEST_TMPDIR/commands.log"
   run grep -F "vol-path --pool default vm-x86-redfish.qcow2" "$BATS_TEST_TMPDIR/commands.log"
   [ "$status" -ne 0 ]
   run grep -F "vol-delete --pool default vm-x86-redfish.qcow2" "$BATS_TEST_TMPDIR/commands.log"
@@ -243,7 +262,7 @@ XML
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
     ;;
   *"vol-list --pool default")
-    printf "vm-x86-redfish.qcow2 /var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+    printf "vm-x86-redfish.qcow2\n"
     ;;
   *)
     exit 0
@@ -438,8 +457,13 @@ esac
 }
 
 @test "destroy-vm removes uuid media volumes when domain and root are absent" {
+  media_volume="vm-x86-redfish-media-partial-11111111-2222-4333-8444-555555555555.img"
+  export MEDIA_VOLUME="$media_volume"
   printf '11111111-2222-4333-8444-555555555555\n' \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR/sushy"
+  chmod 700 "$VM_X86_REDFISH_STATE_DIR/sushy"
+  printf '%s\n' "$media_volume" >"$VM_X86_REDFISH_STATE_DIR/sushy/media-volumes"
   mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
   chmod 700 "$VM_X86_REDFISH_STATE_DIR/tmp"
   touch "$VM_X86_REDFISH_STATE_DIR/tmp/interrupted-download"
@@ -450,7 +474,7 @@ case "$*" in
     exit 1
     ;;
   *"vol-list --pool default")
-    printf "partial-11111111-2222-4333-8444-555555555555.img\n"
+    printf "%s\n" "$MEDIA_VOLUME"
     ;;
   *)
     exit 0
@@ -459,8 +483,7 @@ esac
 '
   run ./scripts/destroy-vm
   [ "$status" -eq 0 ]
-  grep -F "vol-delete --pool default partial-11111111-2222-4333-8444-555555555555.img" \
-    "$BATS_TEST_TMPDIR/commands.log"
+  grep -F "vol-delete --pool default $media_volume" "$BATS_TEST_TMPDIR/commands.log"
   [ ! -e "$VM_X86_REDFISH_STATE_DIR/tmp" ]
   [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
 }
@@ -564,8 +587,12 @@ esac
 }
 
 @test "destroy-vm preserves state when media volume listing fails" {
+  media_volume="vm-x86-redfish-media-partial-11111111-2222-4333-8444-555555555555.img"
   printf '11111111-2222-4333-8444-555555555555\n' \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR/sushy"
+  chmod 700 "$VM_X86_REDFISH_STATE_DIR/sushy"
+  printf '%s\n' "$media_volume" >"$VM_X86_REDFISH_STATE_DIR/sushy/media-volumes"
   mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
   chmod 700 "$VM_X86_REDFISH_STATE_DIR/tmp"
   touch "$VM_X86_REDFISH_STATE_DIR/tmp/interrupted-download"

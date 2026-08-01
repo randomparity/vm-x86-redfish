@@ -2115,8 +2115,9 @@ operator workflows rather than wrapping Redfish itself.
 
 **Interfaces:**
 - Consumes project metadata, recorded UUID, root volume name, and lifecycle lock.
-- Removes only matching project-owned domain, NVRAM, root volume, UUID-scoped media volumes,
-  and validated `.state/tmp` temporary files or one-level Sushy child directories.
+- Removes only matching project-owned domain, NVRAM, root volume, manifest-owned media
+  volumes with the project prefix and recorded UUID, and validated `.state/tmp` temporary
+  files or one-level Sushy child directories.
 
 - [ ] **Step 1: Write destruction safety tests**
 
@@ -2163,7 +2164,7 @@ operator workflows rather than wrapping Redfish itself.
     [[ "$output" == *"refusing to destroy unowned domain vm-x86-redfish"* ]]
   }
 
-  @test "destroy-vm deletes only root and anchored uuid media volumes" {
+  @test "destroy-vm deletes only root and manifest-owned media volumes" {
     printf '11111111-2222-3333-4444-555555555555\n' \
       >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
     install_mock_command virsh '

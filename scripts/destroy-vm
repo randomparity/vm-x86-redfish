@@ -10,7 +10,15 @@ destroy_probe_path=""
 media_volume_matches_uuid() {
   local name="$1"
   local uuid="$2"
-  [[ "$name" =~ ^[^/]+-"$uuid"\.img$ ]]
+  local prefix="${PROJECT_NAME}-media-"
+  local suffix="-${uuid}.img"
+  [[ "$name" == "$prefix"*"$suffix" ]] || return 1
+  [[ "$name" != *"/"* ]] || return 1
+  [ "${#name}" -gt $((${#prefix} + ${#suffix})) ]
+}
+
+media_volume_manifest_file() {
+  printf '%s/sushy/media-volumes\n' "$STATE_DIR"
 }
 
 state_path_is_safe_file_or_absent() {
@@ -34,6 +42,30 @@ require_safe_tmpdir_or_absent() {
   local tmpdir="${STATE_DIR}/tmp"
   reject_symlink "$tmpdir"
   [ ! -e "$tmpdir" ] || require_private_dir "$tmpdir"
+}
+
+volume_name_from_list_line() {
+  local line="$1"
+  local volume
+  line="${line#"${line%%[![:space:]]*}"}"
+  [ -n "$line" ] || return 0
+  if [[ "$line" =~ ^(.+)[[:space:]][[:space:]]+/.*$ ]]; then
+    volume="${BASH_REMATCH[1]}"
+    volume="${volume%"${volume##*[![:space:]]}"}"
+    printf '%s\n' "$volume"
+  else
+    printf '%s\n' "$line"
+  fi
+}
+
+list_volume_names() {
+  local line volumes
+  if ! volumes="$(virsh --quiet -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL")"; then
+    return 1
+  fi
+  while IFS= read -r line; do
+    volume_name_from_list_line "$line"
+  done <<<"$volumes"
 }
 
 cleanup_project_state_files() {
@@ -84,10 +116,10 @@ domain_exists() {
 
 volume_exists() {
   local volume volumes
-  if ! volumes="$(virsh --quiet -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL")"; then
+  if ! volumes="$(list_volume_names)"; then
     fail "failed to list volumes in libvirt pool $STORAGE_POOL"
   fi
-  while read -r volume _; do
+  while IFS= read -r volume; do
     [ "$volume" = "$ROOT_VOLUME_NAME" ] && return 0
   done <<<"$volumes"
   return 1
@@ -136,7 +168,7 @@ cleanup_sushy_state_dir() {
   while IFS= read -r -d '' entry; do
     file="${entry##*/}"
     case "$file" in
-    vmedia.sqlite | vmedia.sqlite-shm | vmedia.sqlite-wal) ;;
+    media-volumes | vmedia.sqlite | vmedia.sqlite-shm | vmedia.sqlite-wal) ;;
     *) fail "unexpected entry in Sushy state directory: $entry" ;;
     esac
     if [ -f "$entry" ] && [ ! -L "$entry" ]; then
@@ -150,17 +182,35 @@ cleanup_sushy_state_dir() {
 
 delete_uuid_media_volumes() {
   local uuid="$1"
+  local deleted_volume
+  local deleted_volumes=()
+  local manifest_path
   local volume
+  local volume_to_delete
   local volumes
-  if ! volumes="$(virsh --quiet -c "$LIBVIRT_URI" vol-list --pool "$STORAGE_POOL")"; then
+  manifest_path="$(media_volume_manifest_file)"
+  if [ ! -e "$manifest_path" ] && [ ! -L "$manifest_path" ]; then
+    return 0
+  fi
+  require_project_state_file "$manifest_path"
+  if ! volumes="$(list_volume_names)"; then
     fail "failed to list volumes in libvirt pool $STORAGE_POOL"
   fi
-  while read -r volume _; do
-    [ -n "$volume" ] || continue
-    if media_volume_matches_uuid "$volume" "$uuid"; then
-      virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$volume"
-    fi
-  done <<<"$volumes"
+  while IFS= read -r volume_to_delete || [ -n "$volume_to_delete" ]; do
+    [ -n "$volume_to_delete" ] || continue
+    media_volume_matches_uuid "$volume_to_delete" "$uuid" ||
+      fail "unexpected media volume in manifest: $volume_to_delete"
+    for deleted_volume in "${deleted_volumes[@]:-}"; do
+      [ "$deleted_volume" != "$volume_to_delete" ] || continue 2
+    done
+    while IFS= read -r volume; do
+      if [ "$volume" = "$volume_to_delete" ]; then
+        virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$volume_to_delete"
+        deleted_volumes+=("$volume_to_delete")
+        break
+      fi
+    done <<<"$volumes"
+  done <"$manifest_path"
 }
 
 validate_destroy_proof() {

@@ -223,5 +223,5 @@ volume_name_for_media() {
   image_url="${image_url%%\?*}"
   base="${image_url##*/}"
   base="${base//./-}"
-  printf '%s-%s.img\n' "$base" "$domain_uuid"
+  printf '%s-media-%s-%s.img\n' "$PROJECT_NAME" "$base" "$domain_uuid"
 }
