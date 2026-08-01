@@ -193,14 +193,33 @@ print(nvram.text)
 PY
 }
 
-wait_for_tmp_file() {
+snapshot_tmp_files() {
   local tmpdir="$1"
+  local snapshot="$2"
+  find "$tmpdir" -type f -print0 >"$snapshot"
+}
+
+path_in_tmp_snapshot() {
+  local snapshot="$1"
+  local candidate="$2"
+  local path
+  while IFS= read -r -d '' path; do
+    [ "$path" != "$candidate" ] || return 0
+  done <"$snapshot"
+  return 1
+}
+
+wait_for_new_tmp_file() {
+  local snapshot="$1"
+  local tmpdir="$2"
   local deadline=$((SECONDS + 30))
   local path
   while [ "$SECONDS" -lt "$deadline" ]; do
     while IFS= read -r -d '' path; do
-      printf '%s\n' "$path"
-      return 0
+      if ! path_in_tmp_snapshot "$snapshot" "$path"; then
+        printf '%s\n' "$path"
+        return 0
+      fi
     done < <(find "$tmpdir" -type f -print0)
     sleep 0.1
   done
@@ -594,6 +613,22 @@ esac
   [ "$output" = "sentinel" ]
 }
 
+@test "temporary media wait ignores baseline files" {
+  tmpdir="$BATS_TEST_TMPDIR/media-tmp"
+  baseline="$BATS_TEST_TMPDIR/media-tmp-baseline"
+  stale_path="$tmpdir/stale-download"
+  fresh_path="$tmpdir/new-download"
+  mkdir -p "$tmpdir"
+  printf 'stale\n' >"$stale_path"
+  snapshot_tmp_files "$tmpdir" "$baseline"
+
+  bash -c 'sleep 0.2; printf "fresh\\n" >"$1"' -- "$fresh_path" &
+  track_child "$!"
+
+  observed_path="$(wait_for_new_tmp_file "$baseline" "$tmpdir")"
+  [ "$observed_path" = "$fresh_path" ]
+}
+
 @test "authenticated Redfish controls isolated libvirt domain power" {
   run timeout --kill-after=5 120 ./scripts/create-vm
   [ "$status" -eq 0 ]
@@ -759,11 +794,13 @@ PY
     --chunk-size 1024 --chunk-delay 1
   interrupted_url="http://127.0.0.1:${MEDIA_SERVER_PORT}/${iso_name}"
   interrupted_payload="{\"Image\":\"${interrupted_url}\",\"Inserted\":true}"
+  tmp_snapshot="$VM_X86_REDFISH_ARTIFACTS_DIR/interrupted-tmp-baseline"
+  snapshot_tmp_files "$VM_X86_REDFISH_STATE_DIR/tmp" "$tmp_snapshot"
   post_virtual_media_action "$system_url" InsertMedia "$interrupted_payload" \
     >"$VM_X86_REDFISH_ARTIFACTS_DIR/interrupted-client.log" 2>&1 &
   insert_pid="$!"
   track_child "$insert_pid"
-  interrupted_path="$(wait_for_tmp_file "$VM_X86_REDFISH_STATE_DIR/tmp")"
+  interrupted_path="$(wait_for_new_tmp_file "$tmp_snapshot" "$VM_X86_REDFISH_STATE_DIR/tmp")"
   [ -f "$interrupted_path" ]
 
   stop_tracked_child "$sushy_pid"
