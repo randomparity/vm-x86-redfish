@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -213,3 +214,80 @@ def test_upload_image_refuses_unrecorded_existing_volume(tmp_path: Path) -> None
         upload_image(Driver(), Domain(), Connection(), str(boot_image))
 
     assert not (state_dir / "media-volumes").exists()
+
+
+def test_upload_image_serializes_volume_creation_with_state_lock(tmp_path: Path) -> None:
+    boot_image = tmp_path / "fedora.iso"
+    boot_image.write_bytes(b"iso")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    created = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    class Domain:
+        def UUIDString(self) -> str:
+            return "11111111-2222-4333-8444-555555555555"
+
+    class Pool:
+        def XMLDesc(self) -> str:
+            return "<pool><target><path>/var/lib/libvirt/images</path></target></pool>"
+
+        def listAllVolumes(self) -> list[object]:
+            return []
+
+        def createXML(self, _xml: str) -> object:
+            created.set()
+            return Volume()
+
+    class Volume:
+        def upload(self, _stream: object, _offset: int, _length: int) -> None:
+            return None
+
+    class Stream:
+        def sendAll(self, _reader: object, _source: object) -> None:
+            return None
+
+        def finish(self) -> None:
+            return None
+
+    class Connection:
+        def storagePoolLookupByName(self, _name: str) -> Pool:
+            return Pool()
+
+        def newStream(self) -> Stream:
+            return Stream()
+
+    class Driver:
+        STORAGE_POOL = "default"
+        STORAGE_VOLUME_XML = "%(name)s %(path)s %(size)s"
+
+        def __init__(self) -> None:
+            self._config = {"SUSHY_EMULATOR_STATE_DIR": str(state_dir)}
+
+    driver = Driver()
+    lock_path = sitecustomize._media_volume_lock_path(driver._config, error.FishyError)
+    upload_lock = sitecustomize._thread_lock_for_path(lock_path)
+    upload_image = cast(Any, libvirtdriver.LibvirtDriver._upload_image)
+
+    def upload() -> None:
+        try:
+            upload_image(driver, Domain(), Connection(), str(boot_image))
+        except Exception as exc:  # noqa: BLE001 - re-raised in the parent test thread.
+            errors.append(exc)
+        finally:
+            done.set()
+
+    upload_lock.acquire()
+    thread = threading.Thread(target=upload)
+    thread.start()
+    try:
+        assert not created.wait(timeout=0.2)
+    finally:
+        upload_lock.release()
+
+    assert done.wait(timeout=2)
+    thread.join()
+    if errors:
+        raise errors[0]
+    assert created.is_set()

@@ -168,7 +168,8 @@ cleanup_sushy_state_dir() {
   while IFS= read -r -d '' entry; do
     file="${entry##*/}"
     case "$file" in
-    media-volumes | vmedia.sqlite | vmedia.sqlite-shm | vmedia.sqlite-wal) ;;
+    media-volumes | media-volumes.lock | vmedia.sqlite | vmedia.sqlite-journal | \
+      vmedia.sqlite-shm | vmedia.sqlite-wal) ;;
     *) fail "unexpected entry in Sushy state directory: $entry" ;;
     esac
     if [ -f "$entry" ] && [ ! -L "$entry" ]; then

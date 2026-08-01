@@ -493,7 +493,9 @@ esac
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
   mkdir -p "$VM_X86_REDFISH_STATE_DIR/sushy"
   chmod 700 "$VM_X86_REDFISH_STATE_DIR/sushy"
+  touch "$VM_X86_REDFISH_STATE_DIR/sushy/media-volumes.lock"
   printf 'media_password=secret\n' >"$VM_X86_REDFISH_STATE_DIR/sushy/vmedia.sqlite"
+  touch "$VM_X86_REDFISH_STATE_DIR/sushy/vmedia.sqlite-journal"
   install_mock_command virsh '
 case "$*" in
   *"dumpxml vm-x86-redfish")
