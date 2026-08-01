@@ -10,7 +10,9 @@ write_nmi_kernel_config() {
     CONFIG_HAVE_NMI=y \
     CONFIG_BLK_DEV_INITRD=y \
     CONFIG_PROC_FS=y \
+    CONFIG_PROC_SYSCTL=y \
     CONFIG_BINFMT_ELF=y \
+    CONFIG_PRINTK=y \
     CONFIG_SERIAL_8250_CONSOLE=y >"$config_path"
 }
 
@@ -434,8 +436,16 @@ assert_nmi_fixture_missing_capability() {
   assert_nmi_fixture_missing_capability CONFIG_PROC_FS
 }
 
+@test "NMI fixture doctor requires proc sysctl kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_PROC_SYSCTL
+}
+
 @test "NMI fixture doctor requires ELF kernel support" {
   assert_nmi_fixture_missing_capability CONFIG_BINFMT_ELF
+}
+
+@test "NMI fixture doctor requires kernel logging support" {
+  assert_nmi_fixture_missing_capability CONFIG_PRINTK
 }
 
 @test "NMI fixture doctor requires serial console kernel support" {

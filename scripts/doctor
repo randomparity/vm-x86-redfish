@@ -93,7 +93,9 @@ check_nmi_fixture_prerequisites() {
   require_kernel_capability "$config_path" "$kernel_release" CONFIG_HAVE_NMI
   require_kernel_capability "$config_path" "$kernel_release" CONFIG_BLK_DEV_INITRD
   require_kernel_capability "$config_path" "$kernel_release" CONFIG_PROC_FS
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_PROC_SYSCTL
   require_kernel_capability "$config_path" "$kernel_release" CONFIG_BINFMT_ELF
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_PRINTK
   require_kernel_capability "$config_path" "$kernel_release" CONFIG_SERIAL_8250_CONSOLE
   printf 'int main(void) { return 0; }\n' |
     gcc -static -x c -o /dev/null - >/dev/null 2>&1 ||
