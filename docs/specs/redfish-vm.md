@@ -170,7 +170,8 @@ Tests verify both behaviors rather than claiming that every endpoint is protecte
 
 The Redfish system identifier is the libvirt UUID returned by authenticated
 `GET /redfish/v1/Systems`. Requests using the domain-name alias may redirect; tests and
-documentation use the UUID URL exclusively.
+documentation discover the UUID from the Systems collection and use it for system-specific
+requests.
 
 Boot-device and virtual-media changes apply to inactive domain XML. Sushy may accept these
 requests while the VM is running, but they do not affect the current process. The supported

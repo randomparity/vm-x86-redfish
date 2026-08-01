@@ -17,7 +17,8 @@ errors, and clearly report missing host dependencies such as QEMU or libvirt.
 - `make create`: create or validate the project-owned VM and Redfish state.
 - `make redfish`: run the loopback Redfish service in the foreground.
 - `make test`: run offline tests and static checks.
-- `make test-integration`: run opt-in host integration tests and mutates host libvirt state.
+- `make test-integration`: run opt-in tests that mutate isolated host libvirt resources and
+  clean them up.
 - `make destroy`: remove only project-owned VM resources.
 - `make clean`: alias for `make destroy`.
 
