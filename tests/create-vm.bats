@@ -311,6 +311,92 @@ PY
   done
 }
 
+@test "create-vm rejects noncanonical serial and console children and attributes" {
+  local case_name
+  local console_target
+  local serial_model
+  local serial_target
+  for case_name in serial-child console-child serial-attribute console-attribute \
+    serial-target-attribute console-target-attribute serial-model-attribute; do
+    install_existing_domain_mocks tcp 192.0.2.20 9000
+    case "$case_name" in
+    serial-child)
+      sed -i '/    <\/serial>/i\      <log file="/tmp/serial.log"/>' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    console-child)
+      sed -i '/    <\/console>/i\      <log file="/tmp/console.log"/>' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    serial-attribute)
+      sed -i '0,/<serial type="tcp"/s//<serial type="tcp" unexpected="value"/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    console-attribute)
+      sed -i '0,/<console type="tcp"/s//<console type="tcp" unexpected="value"/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    serial-target-attribute)
+      serial_target='target type="isa-serial" port="0"'
+      sed -i "0,/${serial_target}/s//${serial_target} unexpected=\"value\"/" \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    console-target-attribute)
+      console_target='target type="serial" port="0"'
+      sed -i "0,/${console_target}/s//${console_target} unexpected=\"value\"/" \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    serial-model-attribute)
+      serial_model='model name="isa-serial"'
+      sed -i "0,/${serial_model}/s//${serial_model} unexpected=\"value\"/" \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    esac
+
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+      VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+      VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+      run ./scripts/create-vm
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"configured tcp serial transport"* ]]
+  done
+}
+
+@test "create-vm rejects direct serial metadata outside the project container" {
+  install_existing_domain_mocks tcp 192.0.2.20 9000
+  sed -i '/<rp:serial-/d' "$BATS_TEST_TMPDIR/existing-domain.xml"
+  sed -i '/^[[:space:]]*<\/metadata>/i\    <rp:serial-mode>tcp</rp:serial-mode>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+  sed -i '/^[[:space:]]*<\/metadata>/i\    <rp:serial-listen-ip>192.0.2.20</rp:serial-listen-ip>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+  sed -i '/^[[:space:]]*<\/metadata>/i\    <rp:serial-listen-port>9000</rp:serial-listen-port>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+
+  VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"configured tcp serial transport"* ]]
+}
+
+@test "create-vm accepts inactive libvirt serial aliases" {
+  install_existing_domain_mocks tcp 192.0.2.20 9000
+  sed -i '/    <\/serial>/i\      <alias name="serial0"/>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+  sed -i '/    <\/console>/i\      <alias name="serial0"/>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+
+  VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
+}
+
 @test "create-vm writes uuid once and defines new owned domain" {
   install_mock_command virsh '
 printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
@@ -494,14 +580,16 @@ case "$*" in
   <name>vm-x86-redfish</name>
   <uuid>11111111-2222-3333-8444-555555555555</uuid>
   <metadata>
-    <owned:project>vm-x86-redfish</owned:project>
-    <owned:root-volume>vm-x86-redfish&amp;owned.qcow2</owned:root-volume>
-    <owned:memory-mib>4096</owned:memory-mib>
-    <owned:root-disk-gib>40</owned:root-disk-gib>
-    <owned:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</owned:source-image-sha256>
-    <owned:serial-mode>pty</owned:serial-mode>
-    <owned:serial-listen-ip></owned:serial-listen-ip>
-    <owned:serial-listen-port></owned:serial-listen-port>
+    <owned:vm-x86-redfish>
+      <owned:project>vm-x86-redfish</owned:project>
+      <owned:root-volume>vm-x86-redfish&amp;owned.qcow2</owned:root-volume>
+      <owned:memory-mib>4096</owned:memory-mib>
+      <owned:root-disk-gib>40</owned:root-disk-gib>
+      <owned:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</owned:source-image-sha256>
+      <owned:serial-mode>pty</owned:serial-mode>
+      <owned:serial-listen-ip></owned:serial-listen-ip>
+      <owned:serial-listen-port></owned:serial-listen-port>
+    </owned:vm-x86-redfish>
   </metadata>
   <memory unit="MiB">4096</memory>
   <vcpu placement="static">2</vcpu>

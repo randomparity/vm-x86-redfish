@@ -449,6 +449,31 @@ def serial_one(elements):
     serial_require(len(elements) == 1)
     return elements[0]
 
+def serial_children_match(parent, expected, allow_alias=False):
+    alias_count = 0
+    actual = {name: 0 for name in expected}
+    for element in parent:
+        if element.tag == "alias":
+            serial_require(allow_alias)
+            alias_count += 1
+            serial_require(alias_count == 1)
+            serial_require(element.attrib == {"name": "serial0"})
+            serial_require(not list(element))
+            continue
+        serial_require(element.tag in actual)
+        actual[element.tag] += 1
+    serial_require(actual == expected)
+
+def serial_child(parent, name, attributes):
+    element = serial_one(parent.findall(name))
+    serial_require(element.attrib == attributes)
+    return element
+
+def serial_leaf(parent, name, attributes):
+    element = serial_child(parent, name, attributes)
+    serial_require(not list(element))
+    return element
+
 def child(parent, name):
     elem = parent.find(name)
     require(elem is not None)
@@ -461,49 +486,46 @@ def text(parent, name):
 def domain_serial_matches(devices):
     serial = serial_one(devices.findall("serial"))
     console = serial_one(devices.findall("console"))
-    serial_target = serial_one(serial.findall("target"))
-    console_target = serial_one(console.findall("target"))
-    serial_require(serial_target.get("type") == "isa-serial")
-    serial_require(serial_target.get("port") == "0")
-    serial_model = serial_one(serial_target.findall("model"))
-    serial_require(serial_model.get("name") == "isa-serial")
-    serial_require(console_target.get("type") == "serial")
-    serial_require(console_target.get("port") == "0")
 
     if serial_mode == "pty":
-        serial_require(serial.get("type") == "pty")
-        serial_require(console.get("type") == "pty")
-        serial_require(not serial.findall("source"))
-        serial_require(not serial.findall("protocol"))
-        serial_require(not console.findall("source"))
-        serial_require(not console.findall("protocol"))
+        serial_require(serial.attrib == {"type": "pty"})
+        serial_require(console.attrib == {"type": "pty"})
+        serial_children_match(serial, {"target": 1}, allow_alias=True)
+        serial_children_match(console, {"target": 1}, allow_alias=True)
     else:
         serial_require(serial_mode == "tcp")
-        serial_require(serial.get("type") == "tcp")
-        serial_require(console.get("type") == "tcp")
+        serial_require(serial.attrib == {"type": "tcp"})
+        serial_require(console.attrib == {"type": "tcp"})
         expected_source = {
             "mode": "bind",
             "host": serial_listen_ip,
             "service": serial_listen_port,
         }
         for device in (serial, console):
-            serial_require(serial_one(device.findall("source")).attrib == expected_source)
-            serial_require(serial_one(device.findall("protocol")).attrib == {"type": "raw"})
+            serial_children_match(
+                device, {"source": 1, "protocol": 1, "target": 1}, allow_alias=True
+            )
+            serial_leaf(device, "source", expected_source)
+            serial_leaf(device, "protocol", {"type": "raw"})
+
+    serial_target = serial_child(serial, "target", {"type": "isa-serial", "port": "0"})
+    console_target = serial_child(console, "target", {"type": "serial", "port": "0"})
+    serial_children_match(serial_target, {"model": 1})
+    serial_children_match(console_target, {})
+    serial_leaf(serial_target, "model", {"name": "isa-serial"})
 
     namespace = "https://github.com/randomparity/vm-x86-redfish"
     container_tag = f"{{{namespace}}}vm-x86-redfish"
-
-    def metadata_elements(name):
-        tag = f"{{{namespace}}}{name}"
-        elements = []
-        for metadata in root.findall("metadata"):
-            elements.extend(metadata.findall(tag))
-            for container in metadata.findall(container_tag):
-                elements.extend(container.findall(tag))
-        return elements
+    metadata = serial_one(root.findall("metadata"))
+    container = serial_one(metadata.findall(container_tag))
+    serial_require(container.attrib == {})
 
     def metadata_matches(name, expected):
-        element = serial_one(metadata_elements(name))
+        tag = f"{{{namespace}}}{name}"
+        serial_require(not metadata.findall(tag))
+        element = serial_one(container.findall(tag))
+        serial_require(element.attrib == {})
+        serial_require(not list(element))
         serial_require((element.text or "") == expected)
 
     metadata_matches("serial-mode", serial_mode)
