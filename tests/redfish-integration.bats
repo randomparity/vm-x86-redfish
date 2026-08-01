@@ -5,6 +5,7 @@
 load "helpers/test-helper"
 
 setup_file() {
+  local preflight_host_ip
   if [ "${VM_X86_REDFISH_INTEGRATION_HELPER_ONLY:-}" = "1" ]; then
     return 0
   fi
@@ -12,11 +13,14 @@ setup_file() {
   export VM_X86_REDFISH_INTEGRATION_TEST=1
   # shellcheck disable=SC1091 # Integration preflight runs from the repository root.
   source ./scripts/lib/common
-  if ! select_routable_host_ip >/dev/null; then
+  if preflight_host_ip="$(select_routable_host_ip)"; then
+    :
+  else
     printf 'integration prerequisite: no bindable non-loopback IPv4 route source is available\n' \
       >&2
     return 1
   fi
+  smoke_test_remote_namespace "$preflight_host_ip" || return
   ./scripts/doctor
 }
 
@@ -187,22 +191,58 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
 PY
 }
 
+remote_endpoint_was_used() {
+  local candidate="$1"
+  local endpoint
+  for endpoint in "${REMOTE_USED_ENDPOINTS[@]:-}"; do
+    [ "$endpoint" != "$candidate" ] || return 0
+  done
+  return 1
+}
+
+allocate_fresh_tcp_port() {
+  local address="$1"
+  local candidate
+  local endpoint
+  local allocation_attempt
+  for ((allocation_attempt = 1; allocation_attempt <= 32; allocation_attempt++)); do
+    if candidate="$(allocate_tcp_port "$address")"; then
+      endpoint="$(endpoint_address_port "$address" "$candidate")"
+      if ! remote_endpoint_was_used "$endpoint"; then
+        REMOTE_ALLOCATED_PORT="$candidate"
+        REMOTE_USED_ENDPOINTS+=("$endpoint")
+        return 0
+      fi
+    else
+      return "$?"
+    fi
+  done
+  printf 'failed to allocate a fresh TCP port for %s after 32 attempts\n' \
+    "$address" >&2
+  return 1
+}
+
 configure_remote_attempt() {
   local attempt="$2"
+  local config_status
   local serial_mode="$1"
   REMOTE_ATTEMPT_DIR="${VM_X86_REDFISH_ARTIFACTS_DIR}/remote-${serial_mode}-${attempt}"
   REMOTE_ATTEMPT_PIDS=()
   mkdir -p "$REMOTE_ATTEMPT_DIR"
-  REMOTE_HOST_IP="$(select_routable_host_ip)" || return
-  REMOTE_REDFISH_PORT="$(allocate_tcp_port "$REMOTE_HOST_IP")" || return
+  if REMOTE_HOST_IP="$(select_routable_host_ip)"; then
+    :
+  else
+    config_status="$?"
+    return "$config_status"
+  fi
+  allocate_fresh_tcp_port "$REMOTE_HOST_IP" || return
+  REMOTE_REDFISH_PORT="$REMOTE_ALLOCATED_PORT"
   export VM_X86_REDFISH_LISTEN_IP="$REMOTE_HOST_IP"
   export VM_X86_REDFISH_LISTEN_PORT="$REMOTE_REDFISH_PORT"
   export VM_X86_REDFISH_SERIAL_MODE="$serial_mode"
   if [ "$serial_mode" = "tcp" ]; then
-    REMOTE_SERIAL_PORT="$(allocate_tcp_port "$REMOTE_HOST_IP")" || return
-    while [ "$REMOTE_SERIAL_PORT" = "$REMOTE_REDFISH_PORT" ]; do
-      REMOTE_SERIAL_PORT="$(allocate_tcp_port "$REMOTE_HOST_IP")" || return
-    done
+    allocate_fresh_tcp_port "$REMOTE_HOST_IP" || return
+    REMOTE_SERIAL_PORT="$REMOTE_ALLOCATED_PORT"
     export VM_X86_REDFISH_SERIAL_LISTEN_IP="$REMOTE_HOST_IP"
     export VM_X86_REDFISH_SERIAL_LISTEN_PORT="$REMOTE_SERIAL_PORT"
   else
@@ -210,6 +250,9 @@ configure_remote_attempt() {
     unset VM_X86_REDFISH_SERIAL_LISTEN_IP VM_X86_REDFISH_SERIAL_LISTEN_PORT
   fi
   load_runtime_config
+  printf '%s=%s/%s\n' "$attempt" \
+    "$(endpoint_address_port "$REMOTE_HOST_IP" "$REMOTE_REDFISH_PORT")" \
+    "${serial_mode}:$(serial_endpoint)" >>"$REMOTE_ATTEMPT_DIR/endpoints.log"
 }
 
 track_remote_child() {
@@ -581,11 +624,174 @@ require_remote_integration_prerequisites() {
       return 1
     fi
   done
+  if [ "$(id -u)" -eq 0 ]; then
+    printf 'integration prerequisite: live harness must run as a non-root outer user\n' >&2
+    return 1
+  fi
   if ! unshare --user --map-root-user --net true >/dev/null 2>&1; then
     printf 'integration prerequisite: unprivileged user/network namespaces are unavailable\n' \
       >&2
     return 1
   fi
+}
+
+cleanup_namespace_smoke() {
+  local smoke_dir="$1"
+  local cleanup_status=0
+  local path
+  local pid
+  shift
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    stop_child "$pid" || cleanup_status="$?"
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'namespace smoke child still exists: %s\n' "$pid" >&2
+      cleanup_status=1
+    fi
+  done
+  for path in server.port slirp.ready server.log namespace.log slirp.log; do
+    if [ -e "$smoke_dir/$path" ] || [ -L "$smoke_dir/$path" ]; then
+      rm -- "$smoke_dir/$path" || cleanup_status="$?"
+    fi
+  done
+  rmdir "$smoke_dir" || cleanup_status=1
+  return "$cleanup_status"
+}
+
+start_namespace_smoke_processes() {
+  "$NAMESPACE_SMOKE_PYTHON" - "$NAMESPACE_SMOKE_ADDRESS" \
+    "$NAMESPACE_SMOKE_DIR/server.port" <<'PY' \
+    >"$NAMESPACE_SMOKE_DIR/server.log" 2>&1 &
+import pathlib
+import socket
+import sys
+address, port_path = sys.argv[1:]
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind((address, 0))
+    listener.listen()
+    listener.settimeout(15)
+    pathlib.Path(port_path).write_text(
+        f"{listener.getsockname()[1]}\n", encoding="utf-8"
+    )
+    connection, _ = listener.accept()
+    with connection:
+        connection.settimeout(5)
+        if connection.recv(16) != b"probe\n":
+            raise SystemExit("unexpected namespace smoke request")
+        connection.sendall(b"ok\n")
+PY
+  NAMESPACE_SMOKE_SERVER_PID="$!"
+  unshare --user --map-root-user --net sleep infinity \
+    >"$NAMESPACE_SMOKE_DIR/namespace.log" 2>&1 &
+  NAMESPACE_SMOKE_NAMESPACE_PID="$!"
+}
+
+wait_for_namespace_smoke_setup() {
+  local deadline=$((SECONDS + 10))
+  while [ ! -s "$NAMESPACE_SMOKE_DIR/server.port" ] ||
+    [ ! -e "/proc/${NAMESPACE_SMOKE_NAMESPACE_PID}/ns/net" ]; do
+    if ! kill -0 "$NAMESPACE_SMOKE_SERVER_PID" 2>/dev/null ||
+      ! kill -0 "$NAMESPACE_SMOKE_NAMESPACE_PID" 2>/dev/null ||
+      [ "$SECONDS" -ge "$deadline" ]; then
+      return 1
+    else
+      sleep 0.1
+    fi
+  done
+}
+
+assert_distinct_smoke_namespace() {
+  local host_inode
+  local namespace_inode
+  host_inode="$(readlink /proc/self/ns/net)" || return
+  namespace_inode="$(
+    readlink "/proc/${NAMESPACE_SMOKE_NAMESPACE_PID}/ns/net"
+  )" || return
+  [ "$host_inode" != "$namespace_inode" ]
+}
+
+start_namespace_smoke_slirp() {
+  local deadline=$((SECONDS + 10))
+  local slirp_status
+  : >"$NAMESPACE_SMOKE_DIR/slirp.ready"
+  slirp4netns --configure --mtu=65520 --disable-host-loopback \
+    --ready-fd=3 "$NAMESPACE_SMOKE_NAMESPACE_PID" tap0 \
+    3>"$NAMESPACE_SMOKE_DIR/slirp.ready" \
+    >"$NAMESPACE_SMOKE_DIR/slirp.log" 2>&1 &
+  NAMESPACE_SMOKE_SLIRP_PID="$!"
+  until grep -Fx '1' "$NAMESPACE_SMOKE_DIR/slirp.ready" >/dev/null; do
+    if ! kill -0 "$NAMESPACE_SMOKE_SLIRP_PID" 2>/dev/null; then
+      if wait "$NAMESPACE_SMOKE_SLIRP_PID"; then slirp_status=1; else slirp_status="$?"; fi
+      NAMESPACE_SMOKE_SLIRP_PID=""
+      return "$slirp_status"
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 0.1
+  done
+}
+
+run_namespace_smoke_client() {
+  local port
+  local server_status
+  port="$(<"$NAMESPACE_SMOKE_DIR/server.port")"
+  if timeout --kill-after=2 15 nsenter \
+    --target "$NAMESPACE_SMOKE_NAMESPACE_PID" --user --net \
+    "$NAMESPACE_SMOKE_PYTHON" - "$NAMESPACE_SMOKE_ADDRESS" "$port" <<'PY'; then
+import socket
+import sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5) as client:
+    client.sendall(b"probe\n")
+    if client.recv(16) != b"ok\n":
+        raise SystemExit("unexpected namespace smoke response")
+PY
+    :
+  else
+    return "$?"
+  fi
+  if wait "$NAMESPACE_SMOKE_SERVER_PID"; then
+    server_status=0
+  else
+    server_status="$?"
+  fi
+  NAMESPACE_SMOKE_SERVER_PID=""
+  return "$server_status"
+}
+
+run_namespace_smoke_step() {
+  [ "$NAMESPACE_SMOKE_STATUS" -eq 0 ] || return 0
+  if "$@"; then
+    return 0
+  else
+    NAMESPACE_SMOKE_STATUS="$?"
+  fi
+}
+
+smoke_test_remote_namespace() {
+  local cleanup_status=0
+  NAMESPACE_SMOKE_ADDRESS="$1"
+  NAMESPACE_SMOKE_NAMESPACE_PID=""
+  NAMESPACE_SMOKE_SERVER_PID=""
+  NAMESPACE_SMOKE_SLIRP_PID=""
+  NAMESPACE_SMOKE_STATUS=0
+  NAMESPACE_SMOKE_DIR="$(
+    mktemp -d "${BATS_TEST_TMPDIR:-/tmp}/redfish-slirp-smoke.XXXXXX"
+  )" || return
+  NAMESPACE_SMOKE_PYTHON="$(python_313)" || NAMESPACE_SMOKE_STATUS="$?"
+  run_namespace_smoke_step start_namespace_smoke_processes
+  run_namespace_smoke_step wait_for_namespace_smoke_setup
+  run_namespace_smoke_step assert_distinct_smoke_namespace
+  run_namespace_smoke_step start_namespace_smoke_slirp
+  run_namespace_smoke_step run_namespace_smoke_client
+  cleanup_namespace_smoke \
+    "$NAMESPACE_SMOKE_DIR" \
+    "$NAMESPACE_SMOKE_SLIRP_PID" \
+    "$NAMESPACE_SMOKE_NAMESPACE_PID" \
+    "$NAMESPACE_SMOKE_SERVER_PID" || cleanup_status="$?"
+  [ "$NAMESPACE_SMOKE_STATUS" -ne 0 ] || NAMESPACE_SMOKE_STATUS="$cleanup_status"
+  if [ "$NAMESPACE_SMOKE_STATUS" -ne 0 ]; then
+    printf 'integration prerequisite: namespace/slirp networking smoke probe failed\n' >&2
+  fi
+  return "$NAMESPACE_SMOKE_STATUS"
 }
 
 run_remote_nmi_attempt() {
@@ -601,6 +807,7 @@ run_remote_nmi_attempt() {
     attempt_status="$?"
     return "$attempt_status"
   fi
+  retain_remote_cleanup_identity || return
   # shellcheck disable=SC1091 # create-vm writes this attempt-specific credentials file.
   source "$VM_X86_REDFISH_STATE_DIR/credentials.env"
   if start_remote_sushy; then
@@ -647,15 +854,36 @@ assert_remote_children_stopped() {
 }
 
 assert_remote_resources_absent() {
-  if bounded_virsh dominfo "$VM_X86_REDFISH_DOMAIN_NAME" >/dev/null 2>&1; then
-    printf 'test domain still exists: %s\n' "$VM_X86_REDFISH_DOMAIN_NAME" >&2
+  local after_prefix="$1"
+  assert_domain_absent_from_inventory \
+    "${after_prefix}.domains" "$VM_X86_REDFISH_DOMAIN_NAME" || return
+  assert_volume_absent_from_inventory \
+    "${after_prefix}.volumes" "$VM_X86_REDFISH_ROOT_VOLUME_NAME" || return
+  if [ -n "${REMOTE_DOMAIN_UUID:-}" ]; then
+    assert_no_uuid_media_volumes \
+      "${after_prefix}.volumes" "$REMOTE_DOMAIN_UUID" || return
+  fi
+  if [ -n "${REMOTE_NVRAM_PATH:-}" ] &&
+    { [ -e "$REMOTE_NVRAM_PATH" ] || [ -L "$REMOTE_NVRAM_PATH" ]; }; then
+    printf 'test NVRAM still exists: %s\n' "$REMOTE_NVRAM_PATH" >&2
     return 1
   fi
-  if bounded_virsh vol-info --pool "$STORAGE_POOL" \
-    "$VM_X86_REDFISH_ROOT_VOLUME_NAME" >/dev/null 2>&1; then
-    printf 'test volume still exists: %s\n' "$VM_X86_REDFISH_ROOT_VOLUME_NAME" >&2
-    return 1
-  fi
+}
+
+prepare_remote_attempt_audit() {
+  REMOTE_DOMAIN_UUID=""
+  REMOTE_NVRAM_PATH=""
+  snapshot_live_inventory "$REMOTE_ATTEMPT_DIR/before"
+}
+
+retain_remote_cleanup_identity() {
+  local domain_xml="$REMOTE_ATTEMPT_DIR/domain-before-cleanup.xml"
+  REMOTE_DOMAIN_UUID="$(read_domain_uuid)" || return
+  bounded_virsh dumpxml --inactive "$VM_X86_REDFISH_DOMAIN_NAME" >"$domain_xml" || return
+  REMOTE_NVRAM_PATH="$(read_nvram_path "$domain_xml")" || return
+  printf 'uuid=%s\nnvram=%s\n' \
+    "$REMOTE_DOMAIN_UUID" "$REMOTE_NVRAM_PATH" \
+    >"$REMOTE_ATTEMPT_DIR/owned-resources.log"
 }
 
 remove_enumerated_attempt_state() {
@@ -689,7 +917,14 @@ cleanup_remote_attempt() {
       "$serial_mode" "$attempt" "$cleanup_log" >&2
     return 1
   fi
-  assert_remote_resources_absent || return
+  snapshot_live_inventory "$REMOTE_ATTEMPT_DIR/after" || return
+  assert_remote_resources_absent "$REMOTE_ATTEMPT_DIR/after" || return
+  assert_inventory_unchanged \
+    "$REMOTE_ATTEMPT_DIR/before.domains" \
+    "$REMOTE_ATTEMPT_DIR/after.domains" domains || return
+  assert_inventory_unchanged \
+    "$REMOTE_ATTEMPT_DIR/before.volumes" \
+    "$REMOTE_ATTEMPT_DIR/after.volumes" volumes || return
   wait_for_address_port_free "$REMOTE_HOST_IP" "$REMOTE_REDFISH_PORT" || return
   if [ "$serial_mode" = "tcp" ]; then
     wait_for_address_port_free "$REMOTE_HOST_IP" "$REMOTE_SERIAL_PORT" || return
@@ -1098,10 +1333,18 @@ run_remote_nmi_with_retries() {
   local attempt
   local attempt_status
   local cleanup_status
+  local configure_status
   local fault="$2"
   local serial_mode="$1"
+  REMOTE_USED_ENDPOINTS=()
   for attempt in 1 2 3; do
-    configure_remote_attempt "$serial_mode" "$attempt"
+    if configure_remote_attempt "$serial_mode" "$attempt"; then
+      :
+    else
+      configure_status="$?"
+      return "$configure_status"
+    fi
+    prepare_remote_attempt_audit || return
     if run_remote_nmi_attempt "$serial_mode" "$attempt" "$fault"; then
       attempt_status=0
     else
@@ -1238,6 +1481,97 @@ teardown() {
     "integration prerequisite: missing command 'slirp4netns': install slirp4netns" ]
 }
 
+@test "integration preflight rejects a root outer user before remote setup" {
+  id() {
+    printf '0\n'
+  }
+
+  run require_remote_integration_prerequisites
+
+  [ "$status" -ne 0 ]
+  [ "$output" = \
+    "integration prerequisite: live harness must run as a non-root outer user" ]
+}
+
+@test "remote namespace smoke probe traverses slirp and cleans exact PIDs" {
+  smoke_path="$PATH"
+  # shellcheck disable=SC2016 # The mock expands variables when it runs.
+  install_mock_command unshare '
+printf "%s\n" "$$" >"$BATS_TEST_TMPDIR/smoke-namespace.pid"
+trap "exit 0" TERM INT
+while :; do :; done
+'
+  # shellcheck disable=SC2016 # The mock expands variables when it runs.
+  install_mock_command slirp4netns '
+printf "%s\n" "$$" >"$BATS_TEST_TMPDIR/smoke-slirp.pid"
+printf "%s\n" "$*" >"$BATS_TEST_TMPDIR/smoke-slirp.args"
+printf "1\n" >&3
+trap "exit 0" TERM INT
+while :; do :; done
+'
+  # shellcheck disable=SC2016 # The mock expands variables when it runs.
+  install_mock_command nsenter '
+printf "%s\n" "$*" >"$BATS_TEST_TMPDIR/smoke-nsenter.args"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --target) shift 2 ;;
+    --user | --net) shift ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+'
+  # shellcheck disable=SC2016 # The mock expands variables when it runs.
+  install_mock_command readlink '
+case "$1" in
+  /proc/self/ns/net) printf "net:[100]\n" ;;
+  *) printf "net:[200]\n" ;;
+esac
+'
+
+  run smoke_test_remote_namespace 127.0.0.1
+  export PATH="$smoke_path"
+
+  [ "$status" -eq 0 ]
+  namespace_pid="$(<"$BATS_TEST_TMPDIR/smoke-namespace.pid")"
+  slirp_pid="$(<"$BATS_TEST_TMPDIR/smoke-slirp.pid")"
+  run kill -0 "$namespace_pid"
+  [ "$status" -ne 0 ]
+  run kill -0 "$slirp_pid"
+  [ "$status" -ne 0 ]
+  run grep -F -- '--disable-host-loopback' "$BATS_TEST_TMPDIR/smoke-slirp.args"
+  [ "$status" -eq 0 ]
+  run grep -F -- "--target $namespace_pid --user --net" \
+    "$BATS_TEST_TMPDIR/smoke-nsenter.args"
+  [ "$status" -eq 0 ]
+}
+
+@test "remote namespace smoke probe reaps its namespace when slirp fails" {
+  smoke_path="$PATH"
+  # shellcheck disable=SC2016 # The mock expands variables when it runs.
+  install_mock_command unshare '
+printf "%s\n" "$$" >"$BATS_TEST_TMPDIR/failed-smoke-namespace.pid"
+trap "exit 0" TERM INT
+while :; do :; done
+'
+  install_mock_command slirp4netns 'exit 31'
+  # shellcheck disable=SC2016 # The mock expands variables when it runs.
+  install_mock_command readlink '
+case "$1" in
+  /proc/self/ns/net) printf "net:[100]\n" ;;
+  *) printf "net:[200]\n" ;;
+esac
+'
+
+  run smoke_test_remote_namespace 127.0.0.1
+  export PATH="$smoke_path"
+
+  [ "$status" -ne 0 ]
+  namespace_pid="$(<"$BATS_TEST_TMPDIR/failed-smoke-namespace.pid")"
+  run kill -0 "$namespace_pid"
+  [ "$status" -ne 0 ]
+}
+
 @test "remote Redfish actions retain TLS authentication and the requested method" {
   printf 'test certificate\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
   REDFISH_USERNAME=test-user
@@ -1366,6 +1700,83 @@ esac
   [ "$status" -ne 0 ]
 }
 
+@test "remote cleanup fails closed when post-cleanup inventory capture fails" {
+  REMOTE_ATTEMPT_DIR="$BATS_TEST_TMPDIR/cleanup-inventory-error"
+  REMOTE_ATTEMPT_PIDS=()
+  REMOTE_HOST_IP=127.0.0.1
+  REMOTE_REDFISH_PORT=8443
+  mkdir -p "$REMOTE_ATTEMPT_DIR"
+  stop_tracked_children() { :; }
+  assert_remote_children_stopped() { :; }
+  timeout() { :; }
+  snapshot_live_inventory() {
+    printf 'snapshot %s\n' "$1" >>"$BATS_TEST_TMPDIR/cleanup.log"
+    return 37
+  }
+  assert_remote_resources_absent() {
+    printf 'absence audit unexpectedly ran\n' >>"$BATS_TEST_TMPDIR/cleanup.log"
+  }
+  wait_for_address_port_free() { :; }
+  remove_enumerated_attempt_state() { :; }
+
+  run cleanup_remote_attempt pty 1
+
+  [ "$status" -eq 37 ]
+  run cat "$BATS_TEST_TMPDIR/cleanup.log"
+  [ "$status" -eq 0 ]
+  [ "$output" = "snapshot $REMOTE_ATTEMPT_DIR/after" ]
+}
+
+@test "remote cleanup rejects every retained UUID media volume" {
+  after_prefix="$BATS_TEST_TMPDIR/after-media"
+  REMOTE_DOMAIN_UUID=11111111-2222-4333-8444-555555555555
+  REMOTE_NVRAM_PATH=""
+  printf 'unrelated\n' >"${after_prefix}.domains"
+  printf '%s\n' \
+    "vm-x86-redfish-media-nmi-${REMOTE_DOMAIN_UUID}.img" \
+    unrelated.qcow2 >"${after_prefix}.volumes"
+
+  run assert_remote_resources_absent "$after_prefix"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"UUID media volume still exists"* ]]
+}
+
+@test "remote cleanup rejects the retained NVRAM path" {
+  after_prefix="$BATS_TEST_TMPDIR/after-nvram"
+  REMOTE_DOMAIN_UUID=11111111-2222-4333-8444-555555555555
+  REMOTE_NVRAM_PATH="$BATS_TEST_TMPDIR/test_VARS.fd"
+  printf 'firmware state\n' >"$REMOTE_NVRAM_PATH"
+  : >"${after_prefix}.domains"
+  : >"${after_prefix}.volumes"
+
+  run assert_remote_resources_absent "$after_prefix"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"test NVRAM still exists"* ]]
+}
+
+@test "remote cleanup identity retains UUID and NVRAM before state deletion" {
+  REMOTE_ATTEMPT_DIR="$BATS_TEST_TMPDIR/retained-identity"
+  REMOTE_DOMAIN_UUID=""
+  REMOTE_NVRAM_PATH=""
+  mkdir -p "$REMOTE_ATTEMPT_DIR"
+  printf '%s\n' 11111111-2222-4333-8444-555555555555 \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  bounded_virsh() {
+    printf '%s\n' '<domain><os><nvram>/var/lib/libvirt/qemu/nvram/test_VARS.fd</nvram></os></domain>'
+  }
+
+  run retain_remote_cleanup_identity
+
+  [ "$status" -eq 0 ]
+  run cat "$REMOTE_ATTEMPT_DIR/owned-resources.log"
+  [ "$status" -eq 0 ]
+  expected=$'uuid=11111111-2222-4333-8444-555555555555\n'
+  expected+=$'nvram=/var/lib/libvirt/qemu/nvram/test_VARS.fd'
+  [ "$output" = "$expected" ]
+}
+
 @test "integration harness stops children before destroying VM resources" {
   ready_file="$BATS_TEST_TMPDIR/lifecycle-lock-ready"
   bash -c '
@@ -1400,6 +1811,9 @@ esac
   configure_remote_attempt() {
     printf 'configure %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
   }
+  prepare_remote_attempt_audit() {
+    printf 'prepare\n' >>"$BATS_TEST_TMPDIR/retry.log"
+  }
   run_remote_nmi_attempt() {
     printf 'run %s %s %s\n' "$1" "$2" "$3" >>"$BATS_TEST_TMPDIR/retry.log"
     [ "$2" -eq 1 ] && return 75
@@ -1415,14 +1829,103 @@ esac
   [ "$output" = "remote pty attempt 1 hit a verified bind collision; retrying" ]
   run cat "$BATS_TEST_TMPDIR/retry.log"
   [ "$status" -eq 0 ]
-  expected=$'configure pty 1\nrun pty 1 redfish\ncleanup pty 1\n'
-  expected+=$'configure pty 2\nrun pty 2 redfish\ncleanup pty 2'
+  expected=$'configure pty 1\nprepare\nrun pty 1 redfish\ncleanup pty 1\n'
+  expected+=$'configure pty 2\nprepare\nrun pty 2 redfish\ncleanup pty 2'
   [ "$output" = "$expected" ]
+}
+
+@test "remote retry orchestration stops when attempt configuration fails" {
+  configure_remote_attempt() {
+    printf 'configure %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
+    return 42
+  }
+  prepare_remote_attempt_audit() {
+    printf 'prepare\n' >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+  run_remote_nmi_attempt() {
+    printf 'run\n' >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+  cleanup_remote_attempt() {
+    printf 'cleanup\n' >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+
+  run run_remote_nmi_with_retries pty none
+
+  [ "$status" -eq 42 ]
+  run cat "$BATS_TEST_TMPDIR/retry.log"
+  [ "$status" -eq 0 ]
+  [ "$output" = "configure pty 1" ]
+}
+
+@test "remote attempt configuration propagates endpoint allocation failures" {
+  select_routable_host_ip() {
+    printf '192.0.2.10\n'
+  }
+  allocate_tcp_port() {
+    return 43
+  }
+  REMOTE_USED_ENDPOINTS=()
+
+  run configure_remote_attempt pty 1
+
+  [ "$status" -eq 43 ]
+}
+
+@test "remote retry orchestration stops when baseline inventory capture fails" {
+  configure_remote_attempt() {
+    printf 'configure\n' >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+  prepare_remote_attempt_audit() {
+    printf 'prepare\n' >>"$BATS_TEST_TMPDIR/retry.log"
+    return 38
+  }
+  run_remote_nmi_attempt() {
+    printf 'run\n' >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+  cleanup_remote_attempt() {
+    printf 'cleanup\n' >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+
+  run run_remote_nmi_with_retries pty none
+
+  [ "$status" -eq 38 ]
+  run cat "$BATS_TEST_TMPDIR/retry.log"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'configure\nprepare' ]
+}
+
+@test "remote retries replace every previously used endpoint tuple" {
+  port_queue="$BATS_TEST_TMPDIR/ports"
+  printf '%s\n' 8443 9000 8443 9000 8444 9001 >"$port_queue"
+  select_routable_host_ip() {
+    printf '192.0.2.10\n'
+  }
+  allocate_tcp_port() {
+    local selected_port
+    selected_port="$(sed -n '1p' "$port_queue")"
+    sed -i '1d' "$port_queue"
+    printf '%s\n' "$selected_port"
+  }
+  REMOTE_USED_ENDPOINTS=()
+
+  configure_remote_attempt tcp 1
+  before_tuple="${REMOTE_HOST_IP}:${REMOTE_REDFISH_PORT}/\
+${REMOTE_HOST_IP}:${REMOTE_SERIAL_PORT}"
+  configure_remote_attempt tcp 2
+  after_tuple="${REMOTE_HOST_IP}:${REMOTE_REDFISH_PORT}/\
+${REMOTE_HOST_IP}:${REMOTE_SERIAL_PORT}"
+
+  [ "$before_tuple" = "192.0.2.10:8443/192.0.2.10:9000" ]
+  [ "$after_tuple" = "192.0.2.10:8444/192.0.2.10:9001" ]
+  [ "$before_tuple" != "$after_tuple" ]
 }
 
 @test "remote retry orchestration does not retry non-collision failures" {
   configure_remote_attempt() {
     printf 'configure %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+  prepare_remote_attempt_audit() {
+    printf 'prepare\n' >>"$BATS_TEST_TMPDIR/retry.log"
   }
   run_remote_nmi_attempt() {
     printf 'run %s %s %s\n' "$1" "$2" "$3" >>"$BATS_TEST_TMPDIR/retry.log"
@@ -1437,12 +1940,15 @@ esac
   [ "$status" -eq 64 ]
   run cat "$BATS_TEST_TMPDIR/retry.log"
   [ "$status" -eq 0 ]
-  [ "$output" = $'configure tcp 1\nrun tcp 1 serial\ncleanup tcp 1' ]
+  [ "$output" = $'configure tcp 1\nprepare\nrun tcp 1 serial\ncleanup tcp 1' ]
 }
 
 @test "remote retry orchestration bounds verified collisions at three attempts" {
   configure_remote_attempt() {
     printf 'configure %s %s\n' "$1" "$2" >>"$BATS_TEST_TMPDIR/retry.log"
+  }
+  prepare_remote_attempt_audit() {
+    printf 'prepare\n' >>"$BATS_TEST_TMPDIR/retry.log"
   }
   run_remote_nmi_attempt() {
     printf 'run %s %s %s\n' "$1" "$2" "$3" >>"$BATS_TEST_TMPDIR/retry.log"
