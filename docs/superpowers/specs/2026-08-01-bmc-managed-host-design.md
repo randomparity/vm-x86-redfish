@@ -68,18 +68,34 @@ prints the effective endpoints after prerequisite checks.
 
 ## NMI verification
 
+The repository remains on pinned `sushy-tools==2.2.0`. An offline dependency-boundary test
+asserts that its system template advertises `Nmi`, its reset handler passes the requested
+type to the active systems driver, and `LibvirtDriver.set_power_state` calls
+`domain.injectNMI()` for an active domain. No repository adapter is added unless that test
+demonstrates the pinned dependency no longer supplies the complete path.
+
 The integration fixture builds a tiny initramfs around a static C init process, boots it with
 the host's matching readable kernel, and uses kernel arguments `unknown_nmi_panic=1`,
 `panic=1`, and `console=ttyS0`. The init process prints a readiness sentinel and waits. The
 test captures serial before posting `ResetType: Nmi`, then requires the kernel's panic output
 and an observable restart; HTTP success alone is insufficient. `make doctor` checks the
-kernel, static compiler support, and `cpio` needed to assemble this fixture. Existing `On`,
-`ForceRestart`, and `ForceOff` coverage remains.
+kernel and its x86 NMI configuration, static compiler support, and `cpio` needed to assemble
+this fixture. Before the NMI action, a bounded readiness probe proves that this exact kernel
+boots the initramfs, uses `ttyS0`, and exposes the requested panic sysctls. Failure reports the
+kernel release and missing capability as an unsupported-host prerequisite rather than an NMI
+failure. Existing `On`, `ForceRestart`, and `ForceOff` coverage remains.
 
 The integration test runs its serial-sentinel scenario once with PTY and once with TCP. PTY
-uses `virsh console`; TCP uses a bounded client connection to the run-specific loopback
-listener. Test-only overrides continue to randomize names, paths, and ports. Each run owns and
-cleans only its domain, volumes, child processes, sockets, and state.
+uses `virsh console`. For the reachability arm, Redfish and TCP serial bind to a concrete
+non-loopback host address. The harness launches a rootless user/network namespace through
+`unshare` and `slirp4netns`, then runs bounded clients inside that second network context. Both
+the TLS-verified Redfish Systems request and raw TCP serial connection must succeed from that
+context. The harness first proves its namespace has a distinct network namespace inode and
+cannot reach host loopback, so a host-local fallback cannot satisfy the assertion. Missing
+user-namespace support, `slirp4netns`, or a routable concrete host address fails preflight
+with the exact prerequisite. Test-only overrides continue to randomize names, paths, and
+ports. Each run owns and cleans only its domain, volumes, child processes, namespaces,
+sockets, and state.
 
 ## Failure behavior
 
@@ -128,11 +144,12 @@ production BMC.
 
 Offline Bats tests cover defaults, valid IPv4/IPv6 rendering, invalid and incompatible input,
 safe Python/XML/shell rendering, certificate SAN generation and mismatch, endpoint metadata,
-doctor endpoint probes and warnings, exact PTY/TCP domain shapes, and rerun rejection.
-Integration coverage proves Redfish discovery through the configured endpoint, all existing
-reset actions, NMI-induced guest panic and restart observed over serial, and the sentinel over
-both PTY and TCP transports. `make test` remains the CI guardrail; `make test-integration` is
-the host-mutating proof.
+doctor endpoint probes and warnings, exact PTY/TCP domain shapes, rerun rejection, and the
+pinned Sushy NMI boundary. Integration coverage proves TLS-authenticated Redfish discovery and
+raw serial connection from a distinct network namespace, all existing reset actions,
+NMI-induced guest panic and restart observed over serial, and the sentinel over both PTY and
+TCP transports. `make test` remains the CI guardrail; `make test-integration` is the
+host-mutating proof.
 
 ## Durable workflow state
 
