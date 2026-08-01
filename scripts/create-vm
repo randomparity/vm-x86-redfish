@@ -11,8 +11,9 @@ validate_create_config() {
     fail "VM_X86_REDFISH_MEMORY_MIB must be a positive integer"
   [[ "$ROOT_DISK_GIB" =~ ^[1-9][0-9]*$ ]] ||
     fail "VM_X86_REDFISH_ROOT_DISK_GIB must be a positive integer"
-  [ -f "$SOURCE_IMAGE" ] && [ -r "$SOURCE_IMAGE" ] ||
+  if [ ! -f "$SOURCE_IMAGE" ] || [ ! -r "$SOURCE_IMAGE" ]; then
     fail "VM_X86_REDFISH_SOURCE_IMAGE must name a readable qcow2 file"
+  fi
   SOURCE_IMAGE="$(realpath -e "$SOURCE_IMAGE")"
   if ! image_info="$(qemu-img info --output=json "$SOURCE_IMAGE")"; then
     fail "cannot inspect source image: $SOURCE_IMAGE"
