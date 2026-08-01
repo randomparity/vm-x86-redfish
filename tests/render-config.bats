@@ -2,6 +2,11 @@
 
 load "helpers/test-helper"
 
+setup() {
+  setup_test_workspace
+  export VM_X86_REDFISH_SOURCE_IMAGE_SHA256=test-source-sha256
+}
+
 write_redfish_runtime_state() {
   mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp" "$VM_X86_REDFISH_STATE_DIR/sushy"
   chmod 700 "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_STATE_DIR/tmp" \

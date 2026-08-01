@@ -5,6 +5,46 @@ script_dir="${BASH_SOURCE[0]%/*}"
 # shellcheck source=scripts/lib/common
 source "${script_dir}/lib/common"
 
+validate_create_config() {
+  local image_info sha256_output
+  [[ "$MEMORY_MIB" =~ ^[1-9][0-9]*$ ]] ||
+    fail "VM_X86_REDFISH_MEMORY_MIB must be a positive integer"
+  [[ "$ROOT_DISK_GIB" =~ ^[1-9][0-9]*$ ]] ||
+    fail "VM_X86_REDFISH_ROOT_DISK_GIB must be a positive integer"
+  [ -f "$SOURCE_IMAGE" ] && [ -r "$SOURCE_IMAGE" ] ||
+    fail "VM_X86_REDFISH_SOURCE_IMAGE must name a readable qcow2 file"
+  SOURCE_IMAGE="$(realpath -e "$SOURCE_IMAGE")"
+  if ! image_info="$(qemu-img info --output=json "$SOURCE_IMAGE")"; then
+    fail "cannot inspect source image: $SOURCE_IMAGE"
+  fi
+  if ! "$(python_313)" - "$ROOT_DISK_GIB" "$image_info" <<'PY'; then
+import json
+import sys
+
+try:
+    image = json.loads(sys.argv[2])
+except json.JSONDecodeError:
+    raise SystemExit(1)
+if not isinstance(image, dict):
+    raise SystemExit(1)
+target_bytes = int(sys.argv[1]) * 1024**3
+if image.get("format") != "qcow2":
+    raise SystemExit(1)
+virtual_size = image.get("virtual-size")
+if not isinstance(virtual_size, int) or isinstance(virtual_size, bool):
+    raise SystemExit(1)
+if virtual_size > target_bytes:
+    raise SystemExit(1)
+PY
+    fail "source image must be qcow2 and fit within ${ROOT_DISK_GIB} GiB"
+  fi
+  if ! sha256_output="$(sha256sum "$SOURCE_IMAGE")"; then
+    fail "cannot hash source image: $SOURCE_IMAGE"
+  fi
+  SOURCE_IMAGE_SHA256="${sha256_output%% *}"
+  export VM_X86_REDFISH_SOURCE_IMAGE_SHA256="$SOURCE_IMAGE_SHA256"
+}
+
 create_domain_uuid_once() {
   ensure_private_dir "$STATE_DIR"
   require_safe_project_file_or_absent "$DOMAIN_UUID_FILE"
@@ -46,6 +86,10 @@ validate_or_reject_existing_domain() {
     root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
     domain_disk_source_matches "$xml_path" "$root_path" ||
       fail "existing domain $DEFAULT_DOMAIN_NAME does not use root volume path $root_path"
+    domain_memory_matches "$xml_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME does not match configured VM memory"
+    domain_config_metadata_matches "$xml_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME does not match configured sizing/image metadata"
     domain_shape_matches_expected "$xml_path" "$root_path" ||
       fail "existing domain $DEFAULT_DOMAIN_NAME hardware does not match expected project shape"
     return 0
@@ -62,8 +106,26 @@ reject_root_volume_collision() {
 
 create_root_volume() {
   reject_root_volume_collision
-  virsh -c "$LIBVIRT_URI" vol-create-as "$STORAGE_POOL" "$ROOT_VOLUME_NAME" 40G \
+  virsh -c "$LIBVIRT_URI" vol-create-as "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+    "${ROOT_DISK_GIB}G" \
     --format qcow2
+}
+
+import_root_volume() {
+  if ! virsh -c "$LIBVIRT_URI" vol-upload --pool "$STORAGE_POOL" \
+    "$ROOT_VOLUME_NAME" "$SOURCE_IMAGE" --sparse; then
+    rollback_new_root_volume
+    fail "failed to import source image into $ROOT_VOLUME_NAME"
+  fi
+  if ! virsh -c "$LIBVIRT_URI" pool-refresh "$STORAGE_POOL"; then
+    rollback_new_root_volume
+    fail "failed to refresh storage pool $STORAGE_POOL after image import"
+  fi
+  if ! virsh -c "$LIBVIRT_URI" vol-resize --pool "$STORAGE_POOL" \
+    "$ROOT_VOLUME_NAME" "${ROOT_DISK_GIB}G"; then
+    rollback_new_root_volume
+    fail "failed to resize root volume $ROOT_VOLUME_NAME"
+  fi
 }
 
 create_redfish_runtime_state() {
@@ -189,6 +251,7 @@ rollback_new_root_volume() {
 create_new_domain() {
   local root_path
   create_root_volume
+  import_root_volume
   if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
     "$ROOT_VOLUME_NAME")"; then
     rollback_new_root_volume
@@ -215,4 +278,5 @@ create_vm_transaction() {
   create_redfish_runtime_state
 }
 
+validate_create_config
 with_lifecycle_lock "$LIFECYCLE_LOCK" create_vm_transaction

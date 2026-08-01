@@ -30,8 +30,11 @@ source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 replacements = {
     "@DOMAIN_NAME@": os.environ.get("DOMAIN_NAME"),
     "@DOMAIN_UUID@": os.environ.get("DOMAIN_UUID"),
+    "@MEMORY_MIB@": os.environ.get("MEMORY_MIB"),
     "@ROOT_VOLUME_NAME@": os.environ.get("ROOT_VOLUME_NAME"),
     "@ROOT_VOLUME_PATH@": os.environ.get("ROOT_VOLUME_PATH"),
+    "@ROOT_DISK_GIB@": os.environ.get("ROOT_DISK_GIB"),
+    "@SOURCE_IMAGE_SHA256@": os.environ.get("SOURCE_IMAGE_SHA256"),
     "@STATE_DIR@": os.environ.get("STATE_DIR"),
 }
 for token, value in replacements.items():
@@ -62,8 +65,11 @@ render_domain() {
   ensure_private_dir "$STATE_DIR"
   export DOMAIN_NAME="$DEFAULT_DOMAIN_NAME"
   export DOMAIN_UUID
+  export MEMORY_MIB
+  export ROOT_DISK_GIB
   export ROOT_VOLUME_NAME
   export ROOT_VOLUME_PATH="${VM_X86_REDFISH_ROOT_VOLUME_PATH:?missing root volume path}"
+  export SOURCE_IMAGE_SHA256="${VM_X86_REDFISH_SOURCE_IMAGE_SHA256:?missing source image digest}"
   export STATE_DIR
   DOMAIN_UUID="$(read_domain_uuid)"
   render_template "${repo_dir}/config/domain.xml" "${STATE_DIR}/domain.xml"

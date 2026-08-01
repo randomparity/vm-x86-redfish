@@ -4,6 +4,18 @@ load "helpers/test-helper"
 
 setup() {
   setup_test_workspace
+  export VM_X86_REDFISH_SOURCE_IMAGE="$BATS_TEST_TMPDIR/source.qcow2"
+  printf 'test qcow2 image\n' >"$VM_X86_REDFISH_SOURCE_IMAGE"
+  export VM_X86_REDFISH_TEST_SOURCE_SHA256
+  VM_X86_REDFISH_TEST_SOURCE_SHA256="$(sha256sum "$VM_X86_REDFISH_SOURCE_IMAGE")"
+  VM_X86_REDFISH_TEST_SOURCE_SHA256="${VM_X86_REDFISH_TEST_SOURCE_SHA256%% *}"
+  export VM_X86_REDFISH_SOURCE_IMAGE_SHA256="$VM_X86_REDFISH_TEST_SOURCE_SHA256"
+  install_mock_command qemu-img '
+case "$*" in
+  "info --output=json "*) printf '\''{"format":"qcow2","virtual-size":8589934592}\n'\'' ;;
+  *) exit 2 ;;
+esac
+'
   install_mock_command uuidgen \
     'printf "uuidgen\\n" >>"$BATS_TEST_TMPDIR/commands.log"
 printf "11111111-2222-3333-8444-555555555555\\n"'
@@ -62,6 +74,9 @@ case "$*" in
   *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2")
     exit 0
     ;;
+  *"vol-upload "*|*"pool-refresh "*|*"vol-resize "*)
+    exit 0
+    ;;
   *"vol-path --pool default vm-x86-redfish.qcow2")
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\\n"
     ;;
@@ -88,12 +103,18 @@ write_existing_domain_xml() {
   <metadata>
     <rp:project>vm-x86-redfish</rp:project>
     <rp:root-volume>${root_volume_name}</rp:root-volume>
+    <rp:memory-mib>4096</rp:memory-mib>
+    <rp:root-disk-gib>40</rp:root-disk-gib>
+    <rp:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</rp:source-image-sha256>
   </metadata>
+  <memory unit="MiB">4096</memory>
+  <vcpu placement="static">2</vcpu>
   <os firmware="efi">
     <type arch="x86_64" machine="q35">hvm</type>
     <firmware><feature enabled="no" name="secure-boot"/></firmware>
     <boot dev="hd"/>
   </os>
+  <cpu mode="host-passthrough" check="none"/>
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type="file" device="disk">
@@ -196,6 +217,7 @@ printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
   *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2") exit 1 ;;
   *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2") exit 0 ;;
+  *"vol-upload "*|*"pool-refresh "*|*"vol-resize "*) exit 0 ;;
   *"define "*"/domain.xml") exit 0 ;;
   *"vol-path --pool default vm-x86-redfish.qcow2")
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\\n" ;;
@@ -374,12 +396,18 @@ case "$*" in
   <metadata>
     <owned:project>vm-x86-redfish</owned:project>
     <owned:root-volume>vm-x86-redfish&amp;owned.qcow2</owned:root-volume>
+    <owned:memory-mib>4096</owned:memory-mib>
+    <owned:root-disk-gib>40</owned:root-disk-gib>
+    <owned:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</owned:source-image-sha256>
   </metadata>
+  <memory unit="MiB">4096</memory>
+  <vcpu placement="static">2</vcpu>
   <os firmware="efi">
     <type arch="x86_64" machine="q35">hvm</type>
     <firmware><feature enabled="no" name="secure-boot"/></firmware>
     <boot dev="hd"/>
   </os>
+  <cpu mode="host-passthrough" check="none"/>
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type="file" device="disk">
@@ -531,6 +559,7 @@ printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
   *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2") exit 1 ;;
   *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2") exit 0 ;;
+  *"vol-upload "*|*"pool-refresh "*|*"vol-resize "*) exit 0 ;;
   *"vol-path --pool default vm-x86-redfish.qcow2") exit 1 ;;
   *"vol-delete --pool default vm-x86-redfish.qcow2") exit 0 ;;
   *) exit 2 ;;
@@ -542,6 +571,26 @@ esac
   grep -F "vol-delete --pool default vm-x86-redfish.qcow2" "$BATS_TEST_TMPDIR/commands.log"
 }
 
+@test "create-vm deletes newly created disk when image import fails" {
+  install_mock_command virsh '
+printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+case "$*" in
+  *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2") exit 1 ;;
+  *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2") exit 0 ;;
+  *"vol-upload "*) exit 1 ;;
+  *"vol-delete --pool default vm-x86-redfish.qcow2") exit 0 ;;
+  *) exit 2 ;;
+esac
+'
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"failed to import source image"* ]]
+  grep -F "vol-delete --pool default vm-x86-redfish.qcow2" \
+    "$BATS_TEST_TMPDIR/commands.log"
+}
+
 @test "create-vm deletes newly created disk when domain rendering fails" {
   mkdir "$VM_X86_REDFISH_STATE_DIR/domain.xml"
   install_mock_command virsh '
@@ -549,6 +598,7 @@ printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
   *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2") exit 1 ;;
   *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2") exit 0 ;;
+  *"vol-upload "*|*"pool-refresh "*|*"vol-resize "*) exit 0 ;;
   *"vol-path --pool default vm-x86-redfish.qcow2")
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\\n" ;;
   *"vol-delete --pool default vm-x86-redfish.qcow2") exit 0 ;;
@@ -567,6 +617,7 @@ printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
   *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2") exit 1 ;;
   *"vol-create-as default vm-x86-redfish.qcow2 40G --format qcow2") exit 0 ;;
+  *"vol-upload "*|*"pool-refresh "*|*"vol-resize "*) exit 0 ;;
   *"vol-path --pool default vm-x86-redfish.qcow2")
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\\n" ;;
   *"define "*"/domain.xml") exit 1 ;;
@@ -600,6 +651,7 @@ printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
   *"dominfo test-domain"|*"vol-info --pool default test-volume.qcow2") exit 1 ;;
   *"vol-create-as default test-volume.qcow2 40G --format qcow2") exit 0 ;;
+  *"vol-upload "*|*"pool-refresh "*|*"vol-resize "*) exit 0 ;;
   *"vol-path --pool default test-volume.qcow2")
     printf "/var/lib/libvirt/images/test-volume.qcow2\n" ;;
   *"define "*"/domain.xml") exit 0 ;;
@@ -634,4 +686,115 @@ esac
     ./scripts/create-vm
   [ "$status" -ne 0 ]
   [[ "$output" == *"error: test-only overrides require VM_X86_REDFISH_INTEGRATION_TEST=1"* ]]
+}
+
+@test "create-vm requires a source qcow2 before libvirt mutation" {
+  install_create_success_mocks
+
+  run env -u VM_X86_REDFISH_SOURCE_IMAGE ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"VM_X86_REDFISH_SOURCE_IMAGE must name a readable qcow2 file"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/commands.log" ]
+}
+
+@test "create-vm imports and sizes a configured source image" {
+  source_image="$BATS_TEST_TMPDIR/source.qcow2"
+  printf 'qcow2 source\n' >"$source_image"
+  install_mock_command qemu-img '
+case "$*" in
+  "info --output=json "*) printf '\''{"format":"qcow2","virtual-size":8589934592}\n'\'' ;;
+  *) exit 2 ;;
+esac
+'
+  install_mock_command virsh '
+printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+case "$*" in
+  *"dominfo vm-x86-redfish"|*"vol-info --pool default vm-x86-redfish.qcow2") exit 1 ;;
+  *"vol-create-as default vm-x86-redfish.qcow2 64G --format qcow2") exit 0 ;;
+  *"vol-upload --pool default vm-x86-redfish.qcow2 "*" --sparse") exit 0 ;;
+  *"pool-refresh default") exit 0 ;;
+  *"vol-resize --pool default vm-x86-redfish.qcow2 64G") exit 0 ;;
+  *"vol-path --pool default vm-x86-redfish.qcow2")
+    printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n" ;;
+  *"define "*"/domain.xml") exit 0 ;;
+  *) exit 2 ;;
+esac
+'
+
+  VM_X86_REDFISH_SOURCE_IMAGE="$source_image" \
+    VM_X86_REDFISH_MEMORY_MIB=8192 \
+    VM_X86_REDFISH_ROOT_DISK_GIB=64 \
+    run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
+  grep -F "vol-upload --pool default vm-x86-redfish.qcow2 $source_image --sparse" \
+    "$BATS_TEST_TMPDIR/commands.log"
+  grep -F "vol-resize --pool default vm-x86-redfish.qcow2 64G" \
+    "$BATS_TEST_TMPDIR/commands.log"
+  grep -F "<memory unit='MiB'>8192</memory>" "$VM_X86_REDFISH_STATE_DIR/domain.xml"
+  grep -F '<rp:root-disk-gib>64</rp:root-disk-gib>' \
+    "$VM_X86_REDFISH_STATE_DIR/domain.xml"
+  source_sha256="$(sha256sum "$source_image")"
+  source_sha256="${source_sha256%% *}"
+  grep -F "<rp:source-image-sha256>$source_sha256</rp:source-image-sha256>" \
+    "$VM_X86_REDFISH_STATE_DIR/domain.xml"
+  grep -F "<cpu mode='host-passthrough' check='none'/>" \
+    "$VM_X86_REDFISH_STATE_DIR/domain.xml"
+  grep -F "<model type='virtio'/>" "$VM_X86_REDFISH_STATE_DIR/domain.xml"
+}
+
+@test "create-vm rejects invalid sizing before libvirt mutation" {
+  VM_X86_REDFISH_MEMORY_MIB=4G run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"VM_X86_REDFISH_MEMORY_MIB must be a positive integer"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/commands.log" ]
+}
+
+@test "create-vm rejects a source image larger than the target disk" {
+  install_mock_command qemu-img '
+case "$*" in
+  "info --output=json "*) printf '\''{"format":"qcow2","virtual-size":68719476736}\n'\'' ;;
+  *) exit 2 ;;
+esac
+'
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"source image must be qcow2 and fit within 40 GiB"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/commands.log" ]
+}
+
+@test "create-vm rejects a rerun with different configured memory" {
+  source_image="$BATS_TEST_TMPDIR/source.qcow2"
+  printf 'qcow2 source\n' >"$source_image"
+  export VM_X86_REDFISH_SOURCE_IMAGE="$source_image"
+  export VM_X86_REDFISH_MEMORY_MIB=8192
+  export VM_X86_REDFISH_ROOT_DISK_GIB=40
+  install_mock_command qemu-img '
+case "$*" in
+  "info --output=json "*) printf '\''{"format":"qcow2","virtual-size":8589934592}\n'\'' ;;
+  *) exit 2 ;;
+esac
+'
+  install_existing_domain_mocks
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not match configured VM memory"* ]]
+  run grep -E 'vol-create|vol-upload|vol-resize|define' "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm accepts equivalent libvirt memory units on rerun" {
+  install_existing_domain_mocks
+  sed -i 's/<memory unit="MiB">4096<\//<memory unit="KiB">4194304<\//' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+
+  run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
 }

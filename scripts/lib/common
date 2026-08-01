@@ -9,6 +9,10 @@ STORAGE_POOL="default"
 STATE_DIR=".state"
 ARTIFACTS_DIR=".artifacts"
 ROOT_VOLUME_NAME="vm-x86-redfish.qcow2"
+MEMORY_MIB="4096"
+ROOT_DISK_GIB="40"
+SOURCE_IMAGE=""
+SOURCE_IMAGE_SHA256=""
 DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
 LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
 
@@ -54,6 +58,9 @@ load_runtime_config() {
   STATE_DIR="${VM_X86_REDFISH_STATE_DIR:-.state}"
   ARTIFACTS_DIR="${VM_X86_REDFISH_ARTIFACTS_DIR:-.artifacts}"
   ROOT_VOLUME_NAME="${VM_X86_REDFISH_ROOT_VOLUME_NAME:-${DEFAULT_DOMAIN_NAME}.qcow2}"
+  MEMORY_MIB="${VM_X86_REDFISH_MEMORY_MIB:-4096}"
+  ROOT_DISK_GIB="${VM_X86_REDFISH_ROOT_DISK_GIB:-40}"
+  SOURCE_IMAGE="${VM_X86_REDFISH_SOURCE_IMAGE:-}"
   DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
   LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
 }
@@ -231,6 +238,39 @@ domain_disk_source_matches() {
   local xml="$1"
   local root_path="$2"
   xml_disk_source_equals "$xml" "$root_path"
+}
+
+domain_config_metadata_matches() {
+  local xml="$1"
+  xml_metadata_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+    "memory-mib" "$MEMORY_MIB" &&
+    xml_metadata_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+      "root-disk-gib" "$ROOT_DISK_GIB" &&
+    xml_metadata_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+      "source-image-sha256" "$SOURCE_IMAGE_SHA256"
+}
+
+domain_memory_matches() {
+  local xml="$1"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$xml" "$MEMORY_MIB" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, expected_mib = sys.argv[1:]
+memory = ET.parse(xml_path).getroot().find("memory")
+if memory is None or memory.text is None:
+    raise SystemExit(1)
+units = {"KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
+unit = memory.get("unit", "KiB")
+try:
+    actual_bytes = int(memory.text) * units[unit]
+except (KeyError, ValueError):
+    raise SystemExit(1)
+expected_bytes = int(expected_mib) * units["MiB"]
+raise SystemExit(0 if actual_bytes == expected_bytes else 1)
+PY
 }
 
 domain_shape_matches_expected() {
