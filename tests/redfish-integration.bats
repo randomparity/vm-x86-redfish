@@ -493,17 +493,20 @@ attach_remote_nmi_media() {
 
 start_remote_tcp_serial() {
   local python_bin
+  local ready_path="$2"
   local serial_log="$1"
   python_bin="$(python_313)"
-  namespace_exec "$python_bin" - "$REMOTE_HOST_IP" "$REMOTE_SERIAL_PORT" <<'PY' \
+  namespace_exec "$python_bin" - "$REMOTE_HOST_IP" "$REMOTE_SERIAL_PORT" "$ready_path" <<'PY' \
     >"$serial_log" 2>&1 &
+import pathlib
 import socket
 import sys
 import time
 
-address, port = sys.argv[1], int(sys.argv[2])
+address, port, ready_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 deadline = time.monotonic() + 60
 connection = None
+pathlib.Path(ready_path).write_text("ready\n", encoding="utf-8")
 while time.monotonic() < deadline:
     try:
         connection = socket.create_connection((address, port), timeout=2)
@@ -535,15 +538,18 @@ PY
 }
 
 start_remote_serial_capture() {
+  local ready_path="$REMOTE_ATTEMPT_DIR/serial-reader.ready"
   local serial_log="$1"
   local serial_mode="$2"
   if [ "$serial_mode" = "tcp" ]; then
-    start_remote_tcp_serial "$serial_log"
+    start_remote_tcp_serial "$serial_log" "$ready_path"
   else
-    run_serial_console NMI_READY 2 >"$serial_log" 2>&1 &
+    run_serial_console NMI_READY 2 "$ready_path" >"$serial_log" 2>&1 &
     REMOTE_SERIAL_CLIENT_PID="$!"
     track_remote_child "$REMOTE_SERIAL_CLIENT_PID" serial-client
   fi
+  wait_for_file "$ready_path" || return
+  kill -0 "$REMOTE_SERIAL_CLIENT_PID" 2>/dev/null
 }
 
 listener_has_bind_collision() {
@@ -587,10 +593,11 @@ start_remote_domain_for_nmi() {
 }
 
 prove_remote_nmi_restart() {
+  local capture_status
   local serial_log="$REMOTE_ATTEMPT_DIR/serial.log"
   local serial_mode="$1"
-  start_remote_domain_for_nmi "$serial_mode" || return
   start_remote_serial_capture "$serial_log" "$serial_mode" || return
+  start_remote_domain_for_nmi "$serial_mode" || return
   wait_for_text_count "$serial_log" NMI_READY 1 || return
   if grep -F 'NMI_UNSUPPORTED:' "$serial_log" >/dev/null; then
     printf 'NMI guest fixture reported an unsupported operation; see %s\n' "$serial_log" >&2
@@ -601,9 +608,9 @@ prove_remote_nmi_restart() {
   wait_for_text_count "$serial_log" 'Kernel panic' 1 || return
   wait_for_text_count "$serial_log" NMI_READY 2 || return
   wait_for_domain_state running || return
-  if wait "$REMOTE_SERIAL_CLIENT_PID"; then
-    untrack_child "$REMOTE_SERIAL_CLIENT_PID"
-  else
+  if wait "$REMOTE_SERIAL_CLIENT_PID"; then capture_status=0; else capture_status="$?"; fi
+  untrack_child "$REMOTE_SERIAL_CLIENT_PID"
+  if [ "$capture_status" -ne 0 ]; then
     printf 'serial capture failed; see %s\n' "$serial_log" >&2
     return 1
   fi
@@ -1203,88 +1210,10 @@ run_serial_console() {
   local expected_count="${2:-0}"
   local marker="${1:-}"
   local python_bin
+  local ready_path="${3:-}"
   python_bin="$(python_313)"
-  "$python_bin" - "$LIBVIRT_URI" "$VM_X86_REDFISH_DOMAIN_NAME" \
-    "$marker" "$expected_count" <<'PY'
-import errno
-import os
-import pty
-import select
-import signal
-import sys
-import time
-
-uri, domain, marker, expected_count_text = sys.argv[1:]
-expected_count = int(expected_count_text)
-command = [
-    "timeout",
-    "60",
-    "virsh",
-    "-c",
-    uri,
-    "console",
-    domain,
-    "--devname",
-    "serial0",
-    "--force",
-]
-pid, master_fd = pty.fork()
-if pid == 0:
-    os.execvp(command[0], command)
-
-
-def forward_signal(signum, _frame):
-    try:
-        os.killpg(pid, signum)
-    except ProcessLookupError:
-        pass
-
-
-signal.signal(signal.SIGTERM, forward_signal)
-signal.signal(signal.SIGINT, forward_signal)
-
-deadline = time.monotonic() + 70
-captured = bytearray()
-marker_reached = False
-status = None
-try:
-    while time.monotonic() < deadline:
-        readable, _, _ = select.select([master_fd], [], [], 1)
-        if not readable:
-            continue
-        try:
-            data = os.read(master_fd, 4096)
-        except OSError as exc:
-            if exc.errno == errno.EIO:
-                break
-            raise
-        if not data:
-            break
-        captured.extend(data)
-        sys.stdout.buffer.write(data)
-        sys.stdout.buffer.flush()
-        if marker and captured.count(marker.encode()) >= expected_count:
-            marker_reached = True
-            forward_signal(signal.SIGTERM, None)
-            break
-    else:
-        forward_signal(signal.SIGTERM, None)
-        time.sleep(1)
-        forward_signal(signal.SIGKILL, None)
-        raise SystemExit(124)
-finally:
-    os.close(master_fd)
-    try:
-        _, status = os.waitpid(pid, 0)
-    except ChildProcessError:
-        pass
-
-if status is None:
-    raise SystemExit(1)
-if marker_reached:
-    raise SystemExit(0)
-raise SystemExit(os.waitstatus_to_exitcode(status))
-PY
+  "$python_bin" tests/helpers/serial-console.py \
+    "$LIBVIRT_URI" "$VM_X86_REDFISH_DOMAIN_NAME" "$marker" "$expected_count" "$ready_path"
 }
 
 destroy_and_assert_virtual_media_cleanup() {
@@ -1635,6 +1564,71 @@ esac
   run start_remote_domain_for_nmi tcp
 
   [ "$status" -eq 75 ]
+}
+
+@test "NMI proof starts each serial reader before power and keeps its first marker" {
+  local serial_log serial_mode
+  REMOTE_SYSTEM_URL=/redfish/v1/Systems/test
+  wait_for_domain_state() {
+    return 0
+  }
+  start_remote_serial_capture() {
+    local capture_log="$1"
+    local capture_mode="$2"
+    printf 'reader:%s\n' "$capture_mode" >>"$BATS_TEST_TMPDIR/nmi-order"
+    printf 'NMI_READY\n' >"$capture_log"
+    true &
+    REMOTE_SERIAL_CLIENT_PID="$!"
+    track_child "$REMOTE_SERIAL_CLIENT_PID"
+  }
+  remote_redfish_action() {
+    case "$3" in
+    *'"On"'*)
+      grep -F 'NMI_READY' "$serial_log" >/dev/null || return 67
+      printf 'power\n' >>"$BATS_TEST_TMPDIR/nmi-order"
+      ;;
+    *'"Nmi"'*)
+      printf 'nmi\n' >>"$BATS_TEST_TMPDIR/nmi-order"
+      printf 'Kernel panic\nNMI_READY\n' >>"$serial_log"
+      ;;
+    *) return 68 ;;
+    esac
+  }
+
+  for serial_mode in pty tcp; do
+    REMOTE_ATTEMPT_DIR="$BATS_TEST_TMPDIR/nmi-order-$serial_mode"
+    mkdir -p "$REMOTE_ATTEMPT_DIR"
+    serial_log="$REMOTE_ATTEMPT_DIR/serial.log"
+    : >"$BATS_TEST_TMPDIR/nmi-order"
+
+    run prove_remote_nmi_restart "$serial_mode"
+
+    [ "$status" -eq 0 ]
+    run cat "$BATS_TEST_TMPDIR/nmi-order"
+    [ "$status" -eq 0 ]
+    [ "$output" = $'reader:'"$serial_mode"$'\npower\nnmi' ]
+    [ "$(grep -Fc NMI_READY "$serial_log")" -eq 2 ]
+  done
+}
+
+@test "PTY serial reader retries attachment without dropping first marker bytes" {
+  local attempt_file="$BATS_TEST_TMPDIR/console-attempts"
+  local ready_path="$BATS_TEST_TMPDIR/console-reader.ready"
+  install_mock_command virsh '
+attempt=0
+[ ! -f "$BATS_TEST_TMPDIR/console-attempts" ] || attempt="$(<"$BATS_TEST_TMPDIR/console-attempts")"
+attempt=$((attempt + 1))
+printf "%s\n" "$attempt" >"$BATS_TEST_TMPDIR/console-attempts"
+printf "NMI_READY\n"
+[ "$attempt" -ge 2 ]
+'
+
+  run run_serial_console NMI_READY 2 "$ready_path"
+
+  [ "$status" -eq 0 ]
+  [ -f "$ready_path" ]
+  [ "$(<"$attempt_file")" -eq 2 ]
+  [ "$(grep -o NMI_READY <<<"$output" | wc -l)" -eq 2 ]
 }
 
 @test "cleanup inventory snapshots require successful libvirt queries" {
