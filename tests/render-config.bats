@@ -103,6 +103,167 @@ write_redfish_runtime_state() {
   [[ "$output" != *"<target type='virtio'"* ]]
 }
 
+@test "render-config preserves the default PTY serial and console pair" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    run ./scripts/render-config domain
+  [ "$status" -eq 0 ]
+
+  run python3 - "$BATS_TEST_TMPDIR/state/domain.xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+serials = root.findall(".//serial")
+consoles = root.findall(".//console")
+assert len(serials) == 1
+assert serials[0].attrib == {"type": "pty"}
+assert serials[0].find("target").attrib == {"type": "isa-serial", "port": "0"}
+assert serials[0].find("target/model").attrib == {"name": "isa-serial"}
+assert len(consoles) == 1
+assert consoles[0].attrib == {"type": "pty"}
+assert consoles[0].find("target").attrib == {"type": "serial", "port": "0"}
+PY
+  [ "$status" -eq 0 ]
+}
+
+@test "render-config writes default Redfish listen values as Python literals" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" run ./scripts/render-config sushy
+  [ "$status" -eq 0 ]
+
+  run python3 - "$BATS_TEST_TMPDIR/state/sushy-emulator.conf.py" <<'PY'
+import runpy
+import sys
+
+config = runpy.run_path(sys.argv[1])
+assert config["SUSHY_EMULATOR_LISTEN_IP"] == "127.0.0.1"
+assert config["SUSHY_EMULATOR_LISTEN_PORT"] == 8000
+PY
+  [ "$status" -eq 0 ]
+}
+
+@test "render-config writes custom IPv4 and IPv6 Redfish listen values as Python literals" {
+  local address
+  local port
+  for address_port in "192.0.2.10 8443" "2001:db8::10 65535"; do
+    read -r address port <<<"$address_port"
+    mkdir -p "$BATS_TEST_TMPDIR/state-$port"
+    printf '123e4567-e89b-42d3-a456-426614174000\n' \
+      >"$BATS_TEST_TMPDIR/state-$port/domain-uuid"
+
+    VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state-$port" \
+      VM_X86_REDFISH_LISTEN_IP="$address" \
+      VM_X86_REDFISH_LISTEN_PORT="$port" \
+      run ./scripts/render-config sushy
+    [ "$status" -eq 0 ]
+
+    run python3 - "$BATS_TEST_TMPDIR/state-$port/sushy-emulator.conf.py" "$address" "$port" <<'PY'
+import runpy
+import sys
+
+config = runpy.run_path(sys.argv[1])
+assert config["SUSHY_EMULATOR_LISTEN_IP"] == sys.argv[2]
+assert config["SUSHY_EMULATOR_LISTEN_PORT"] == int(sys.argv[3])
+PY
+    [ "$status" -eq 0 ]
+  done
+}
+
+@test "render-config writes TCP serial device and matching console" {
+  mkdir -p "$BATS_TEST_TMPDIR/state"
+  printf '123e4567-e89b-42d3-a456-426614174000\n' \
+    >"$BATS_TEST_TMPDIR/state/domain-uuid"
+
+  VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state" \
+    VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP="2001:db8::20" \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/render-config domain
+  [ "$status" -eq 0 ]
+
+  run python3 - "$BATS_TEST_TMPDIR/state/domain.xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+serials = root.findall(".//serial")
+assert len(serials) == 1
+serial = serials[0]
+assert serial.attrib == {"type": "tcp"}
+sources = serial.findall("source")
+assert len(sources) == 1
+assert sources[0].attrib == {"mode": "bind", "host": "2001:db8::20", "service": "9000"}
+protocols = serial.findall("protocol")
+assert len(protocols) == 1
+assert protocols[0].attrib == {"type": "raw"}
+assert serial.find("target").attrib == {"type": "isa-serial", "port": "0"}
+assert serial.find("target/model").attrib == {"name": "isa-serial"}
+consoles = root.findall(".//console")
+assert len(consoles) == 1
+assert consoles[0].attrib == {"type": "tcp"}
+console_sources = consoles[0].findall("source")
+assert len(console_sources) == 1
+assert console_sources[0].attrib == {"mode": "bind", "host": "2001:db8::20", "service": "9000"}
+console_protocols = consoles[0].findall("protocol")
+assert len(console_protocols) == 1
+assert console_protocols[0].attrib == {"type": "raw"}
+assert consoles[0].find("target").attrib == {"type": "serial", "port": "0"}
+assert not root.findall(".//serial[@type='pty']")
+PY
+  [ "$status" -eq 0 ]
+}
+
+@test "render-config writes stable serial metadata for PTY and TCP serial modes" {
+  local state_dir
+  for mode in pty tcp; do
+    state_dir="$BATS_TEST_TMPDIR/$mode-state"
+    mkdir -p "$state_dir"
+    printf '123e4567-e89b-42d3-a456-426614174000\n' >"$state_dir/domain-uuid"
+
+    if [ "$mode" = tcp ]; then
+      VM_X86_REDFISH_STATE_DIR="$state_dir" \
+        VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+        VM_X86_REDFISH_SERIAL_MODE=tcp \
+        VM_X86_REDFISH_SERIAL_LISTEN_IP="192.0.2.20" \
+        VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+        run ./scripts/render-config domain
+    else
+      VM_X86_REDFISH_STATE_DIR="$state_dir" \
+        VM_X86_REDFISH_ROOT_VOLUME_PATH="/var/lib/libvirt/images/vm-x86-redfish.qcow2" \
+        run ./scripts/render-config domain
+    fi
+    [ "$status" -eq 0 ]
+
+    run python3 - "$state_dir/domain.xml" "$mode" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+namespace = "https://github.com/randomparity/vm-x86-redfish"
+root = ET.parse(sys.argv[1]).getroot()
+metadata = root.find(f"metadata/{{{namespace}}}vm-x86-redfish")
+assert metadata is not None
+actual = {child.tag.removeprefix(f"{{{namespace}}}"): child.text or "" for child in metadata}
+assert actual["serial-mode"] == sys.argv[2]
+if sys.argv[2] == "tcp":
+    assert actual["serial-listen-ip"] == "192.0.2.20"
+    assert actual["serial-listen-port"] == "9000"
+else:
+    assert actual["serial-listen-ip"] == ""
+    assert actual["serial-listen-port"] == ""
+PY
+    [ "$status" -eq 0 ]
+  done
+}
+
 @test "render-config rejects a missing root volume path without writing domain XML" {
   mkdir -p "$BATS_TEST_TMPDIR/state"
   printf '123e4567-e89b-42d3-a456-426614174000\n' \
@@ -245,7 +406,10 @@ write_redfish_runtime_state() {
 @test "run-redfish sets TMPDIR and execs sushy-emulator" {
   write_redfish_runtime_state
   install_mock_command uv \
-    'printf "TMPDIR=%s\nPYTHONPATH=%s\nCONFIG=%s\n" "$TMPDIR" "$PYTHONPATH" "$*"'
+    'case "$*" in
+      "python find 3.13") command -v python3 ;;
+      *) printf "TMPDIR=%s\nPYTHONPATH=%s\nCONFIG=%s\n" "$TMPDIR" "$PYTHONPATH" "$*" ;;
+    esac'
   run ./scripts/run-redfish
   [ "$status" -eq 0 ]
   [[ "$output" == *"TMPDIR=$VM_X86_REDFISH_STATE_DIR/tmp"* ]]

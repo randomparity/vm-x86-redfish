@@ -34,6 +34,12 @@ replacements = {
     "@ROOT_VOLUME_NAME@": os.environ.get("ROOT_VOLUME_NAME"),
     "@ROOT_VOLUME_PATH@": os.environ.get("ROOT_VOLUME_PATH"),
     "@ROOT_DISK_GIB@": os.environ.get("ROOT_DISK_GIB"),
+    "@LISTEN_IP@": os.environ.get("LISTEN_IP"),
+    "@LISTEN_PORT@": os.environ.get("LISTEN_PORT"),
+    "@SERIAL_DEVICE@": os.environ.get("SERIAL_DEVICE"),
+    "@SERIAL_LISTEN_IP@": os.environ.get("SERIAL_LISTEN_IP"),
+    "@SERIAL_LISTEN_PORT@": os.environ.get("SERIAL_LISTEN_PORT"),
+    "@SERIAL_MODE@": os.environ.get("SERIAL_MODE"),
     "@SOURCE_IMAGE_SHA256@": os.environ.get("SOURCE_IMAGE_SHA256"),
     "@STATE_DIR@": os.environ.get("STATE_DIR"),
 }
@@ -61,6 +67,43 @@ PY
   mv -- "$tmp_output" "$output"
 }
 
+serial_xml() {
+  case "$SERIAL_MODE" in
+  pty)
+    cat <<'XML'
+<serial type='pty'>
+      <target type='isa-serial' port='0'>
+        <model name='isa-serial'/>
+      </target>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+XML
+    ;;
+  tcp)
+    "$(python_313)" - "$SERIAL_LISTEN_IP" "$SERIAL_LISTEN_PORT" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+host, port = sys.argv[1:]
+serial = ET.Element("serial", {"type": "tcp"})
+ET.SubElement(serial, "source", {"mode": "bind", "host": host, "service": port})
+ET.SubElement(serial, "protocol", {"type": "raw"})
+target = ET.SubElement(serial, "target", {"type": "isa-serial", "port": "0"})
+ET.SubElement(target, "model", {"name": "isa-serial"})
+console = ET.Element("console", {"type": "tcp"})
+ET.SubElement(console, "source", {"mode": "bind", "host": host, "service": port})
+ET.SubElement(console, "protocol", {"type": "raw"})
+ET.SubElement(console, "target", {"type": "serial", "port": "0"})
+print(ET.tostring(serial, encoding="unicode"))
+print(ET.tostring(console, encoding="unicode"))
+PY
+    ;;
+  *) fail "unsupported serial mode: $SERIAL_MODE" ;;
+  esac
+}
+
 render_domain() {
   ensure_private_dir "$STATE_DIR"
   export DOMAIN_NAME="$DEFAULT_DOMAIN_NAME"
@@ -69,9 +112,14 @@ render_domain() {
   export ROOT_DISK_GIB
   export ROOT_VOLUME_NAME
   export ROOT_VOLUME_PATH="${VM_X86_REDFISH_ROOT_VOLUME_PATH:?missing root volume path}"
+  export SERIAL_LISTEN_IP
+  export SERIAL_LISTEN_PORT
+  export SERIAL_MODE
+  export SERIAL_DEVICE
   export SOURCE_IMAGE_SHA256="${VM_X86_REDFISH_SOURCE_IMAGE_SHA256:?missing source image digest}"
   export STATE_DIR
   DOMAIN_UUID="$(read_domain_uuid)"
+  SERIAL_DEVICE="$(serial_xml)"
   render_template "${repo_dir}/config/domain.xml" "${STATE_DIR}/domain.xml"
 }
 
@@ -80,6 +128,8 @@ render_sushy() {
   ensure_private_dir "${STATE_DIR}/sushy"
   ensure_private_dir "${STATE_DIR}/tmp"
   export DOMAIN_UUID
+  export LISTEN_IP="$REDFISH_LISTEN_IP"
+  export LISTEN_PORT="$REDFISH_LISTEN_PORT"
   export STATE_DIR
   DOMAIN_UUID="$(read_domain_uuid)"
   render_template "${repo_dir}/config/sushy-emulator.conf.py.in" \

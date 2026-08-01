@@ -8,6 +8,9 @@
       <rp:memory-mib>@MEMORY_MIB@</rp:memory-mib>
       <rp:root-disk-gib>@ROOT_DISK_GIB@</rp:root-disk-gib>
       <rp:source-image-sha256>@SOURCE_IMAGE_SHA256@</rp:source-image-sha256>
+      <rp:serial-mode>@SERIAL_MODE@</rp:serial-mode>
+      <rp:serial-listen-ip>@SERIAL_LISTEN_IP@</rp:serial-listen-ip>
+      <rp:serial-listen-port>@SERIAL_LISTEN_PORT@</rp:serial-listen-port>
     </rp:vm-x86-redfish>
   </metadata>
   <memory unit='MiB'>@MEMORY_MIB@</memory>
@@ -39,14 +42,7 @@
       <source network='default'/>
       <model type='virtio'/>
     </interface>
-    <serial type='pty'>
-      <target type='isa-serial' port='0'>
-        <model name='isa-serial'/>
-      </target>
-    </serial>
-    <console type='pty'>
-      <target type='serial' port='0'/>
-    </console>
+    @SERIAL_DEVICE@
     <channel type='unix'>
       <target type='virtio' name='org.qemu.guest_agent.0'/>
     </channel>
