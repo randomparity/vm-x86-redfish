@@ -147,7 +147,6 @@ import_root_volume() {
 }
 
 create_redfish_runtime_state() {
-  validate_existing_tls
   create_redfish_credentials_once
   create_tls_once
   write_connection_metadata
@@ -253,7 +252,6 @@ create_tls_once() {
   local key_path="${STATE_DIR}/tls.key"
   local san
   local tmp_cert tmp_key
-  validate_existing_tls
   if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
     return 0
   fi
@@ -330,6 +328,7 @@ create_new_domain() {
 }
 
 create_vm_transaction() {
+  validate_existing_tls
   if validate_or_reject_existing_domain; then
     create_redfish_runtime_state
     return 0

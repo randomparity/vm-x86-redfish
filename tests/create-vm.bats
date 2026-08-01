@@ -310,6 +310,31 @@ PY
   done
 }
 
+@test "create-vm rejects stale TLS SAN before libvirt mutation" {
+  local cert_before key_before state_path
+  install_create_success_mocks
+  printf 'test-cert\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  cert_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")"
+
+  VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS=1 \
+    VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not cover configured Redfish listener 192.0.2.20"* ]]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")" = "$cert_before" ]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")" = "$key_before" ]
+  run grep -F "virsh " "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+  for state_path in domain-uuid domain.xml credentials.env htpasswd connection.env \
+    sushy-emulator.conf.py; do
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/$state_path" ]
+  done
+}
+
 @test "create-vm reports TLS SAN verification errors" {
   install_existing_domain_mocks
   printf 'test-cert\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
