@@ -121,7 +121,9 @@ check_loopback_port() {
   "$python_bin" - <<'PY' || fail "127.0.0.1:8000 is already in use"
 import socket
 with socket.socket() as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", 8000))
+    sock.listen()
 PY
 }
 

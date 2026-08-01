@@ -108,6 +108,33 @@ esac
   [[ "$output" == *"127.0.0.1:8000 is already in use"* ]]
 }
 
+@test "doctor accepts recently closed loopback connections" {
+  python_bin="$(PATH="${PATH#*:}" UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+  "$python_bin" - <<'PY'
+import socket
+
+with socket.socket() as server:
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 8000))
+    server.listen()
+    with socket.create_connection(("127.0.0.1", 8000)) as client:
+        connection, _ = server.accept()
+        with connection:
+            connection.shutdown(socket.SHUT_WR)
+            client.recv(1)
+PY
+  install_all_doctor_success_mocks
+  install_mock_command uv "
+case \"\$*\" in
+  \"python find 3.13\") printf '%s\\n' '$python_bin' ;;
+  *) exit 2 ;;
+esac
+"
+
+  run ./scripts/doctor
+  [ "$status" -eq 0 ]
+}
+
 @test "doctor reports missing uuidgen with Fedora package hint" {
   install_all_doctor_success_mocks
   rm "$BATS_TEST_TMPDIR/bin/uuidgen"

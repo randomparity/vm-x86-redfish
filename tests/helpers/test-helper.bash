@@ -73,8 +73,33 @@ wait_for_url() {
   done
 }
 
+wait_for_file() {
+  local path="$1"
+  local deadline=$((SECONDS + 30))
+  until [ -f "$path" ]; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
 track_child() {
   TRACKED_CHILDREN+=("$1")
+}
+
+untrack_child() {
+  local target_pid="$1"
+  local pid
+  local remaining=()
+  for pid in "${TRACKED_CHILDREN[@]:-}"; do
+    [ "$pid" = "$target_pid" ] || remaining+=("$pid")
+  done
+  TRACKED_CHILDREN=("${remaining[@]}")
+}
+
+stop_tracked_child() {
+  local pid="$1"
+  stop_child "$pid"
+  untrack_child "$pid"
 }
 
 stop_tracked_children() {

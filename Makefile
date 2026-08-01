@@ -33,13 +33,13 @@ test:
 >@for script in $(EXECUTABLE_SCRIPTS); do test -x "$$script"; done
 >@if [ -n "$(SHFMT_PATHS)" ]; then shfmt -i 2 -d $(SHFMT_PATHS); fi
 >@if [ -n "$(PYTHON_FILES)" ]; then \
->  uv run --locked --only-group dev --no-install-project ruff check $(PYTHON_FILES); \
+>  uv run --locked --only-group dev ruff check $(PYTHON_FILES); \
 >fi
 >@if [ -n "$(PYTHON_FILES)" ]; then \
->  uv run --locked --only-group dev --no-install-project ruff format --check $(PYTHON_FILES); \
+>  uv run --locked --only-group dev ruff format --check $(PYTHON_FILES); \
 >fi
 >@if [ -n "$(PYTHON_FILES)" ]; then \
->  uv run --locked --only-group dev --no-install-project ty check $(PYTHON_FILES); \
+>  uv run --locked --only-group dev ty check $(PYTHON_FILES); \
 >fi
 >@if [ -f uv.lock ]; then uv lock --check; fi
 >@if [ -f config/sushy-emulator.conf.py.in ]; then \
