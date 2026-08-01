@@ -13,6 +13,11 @@ MEMORY_MIB="4096"
 ROOT_DISK_GIB="40"
 SOURCE_IMAGE=""
 SOURCE_IMAGE_SHA256=""
+REDFISH_LISTEN_IP="127.0.0.1"
+REDFISH_LISTEN_PORT="8000"
+SERIAL_MODE="pty"
+SERIAL_LISTEN_IP=""
+SERIAL_LISTEN_PORT=""
 DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
 LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
 
@@ -45,6 +50,121 @@ reject_unguarded_override() {
   fi
 }
 
+canonical_ip_address() {
+  local address="$2"
+  local canonical_address
+  local python_bin
+  local variable="$1"
+  python_bin="$(python_313)"
+  if ! canonical_address="$(
+    "$python_bin" - "$address" <<'PY'
+import ipaddress
+import sys
+
+try:
+    parsed = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+
+if parsed.is_unspecified or parsed.is_multicast:
+    raise SystemExit(1)
+
+print(parsed)
+PY
+  )"; then
+    fail "$variable must be a concrete unicast IP address"
+  fi
+  printf '%s\n' "$canonical_address"
+}
+
+canonical_port() {
+  local canonical_value
+  local value="$2"
+  local variable="$1"
+  [[ "$value" =~ ^[0-9]+$ ]] || fail "$variable must be a decimal port from 1 through 65535"
+
+  canonical_value="$value"
+  while [ "${#canonical_value}" -gt 1 ] && [ "${canonical_value:0:1}" = "0" ]; do
+    canonical_value="${canonical_value:1}"
+  done
+  if [ "${#canonical_value}" -gt 5 ] || [ "$canonical_value" = "0" ]; then
+    fail "$variable must be a decimal port from 1 through 65535"
+  fi
+  if [ "${#canonical_value}" -eq 5 ] && [ "$canonical_value" -gt 65535 ]; then
+    fail "$variable must be a decimal port from 1 through 65535"
+  fi
+  printf '%s\n' "$canonical_value"
+}
+
+address_is_loopback() {
+  local address="$1"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$address" <<'PY'
+import ipaddress
+import sys
+
+raise SystemExit(0 if ipaddress.ip_address(sys.argv[1]).is_loopback else 1)
+PY
+}
+
+validate_runtime_endpoints() {
+  case "$SERIAL_MODE" in
+  pty)
+    [ -z "${VM_X86_REDFISH_SERIAL_LISTEN_IP+x}" ] ||
+      fail "VM_X86_REDFISH_SERIAL_LISTEN_IP is only valid when VM_X86_REDFISH_SERIAL_MODE=tcp"
+    [ -z "${VM_X86_REDFISH_SERIAL_LISTEN_PORT+x}" ] ||
+      fail "VM_X86_REDFISH_SERIAL_LISTEN_PORT is only valid when VM_X86_REDFISH_SERIAL_MODE=tcp"
+    SERIAL_LISTEN_IP=""
+    SERIAL_LISTEN_PORT=""
+    ;;
+  tcp)
+    [ -n "$SERIAL_LISTEN_IP" ] ||
+      fail "VM_X86_REDFISH_SERIAL_LISTEN_IP is required when VM_X86_REDFISH_SERIAL_MODE=tcp"
+    [ -n "$SERIAL_LISTEN_PORT" ] ||
+      fail "VM_X86_REDFISH_SERIAL_LISTEN_PORT is required when VM_X86_REDFISH_SERIAL_MODE=tcp"
+    SERIAL_LISTEN_IP="$(canonical_ip_address VM_X86_REDFISH_SERIAL_LISTEN_IP "$SERIAL_LISTEN_IP")"
+    SERIAL_LISTEN_PORT="$(canonical_port VM_X86_REDFISH_SERIAL_LISTEN_PORT "$SERIAL_LISTEN_PORT")"
+    ;;
+  *)
+    fail "VM_X86_REDFISH_SERIAL_MODE must be either pty or tcp"
+    ;;
+  esac
+
+  REDFISH_LISTEN_IP="$(canonical_ip_address VM_X86_REDFISH_LISTEN_IP "$REDFISH_LISTEN_IP")"
+  REDFISH_LISTEN_PORT="$(canonical_port VM_X86_REDFISH_LISTEN_PORT "$REDFISH_LISTEN_PORT")"
+}
+
+format_uri_host() {
+  local host="$1"
+  case "$host" in
+  *:*) printf '[%s]\n' "$host" ;;
+  *) printf '%s\n' "$host" ;;
+  esac
+}
+
+redfish_endpoint() {
+  printf 'https://%s:%s\n' "$(format_uri_host "$REDFISH_LISTEN_IP")" "$REDFISH_LISTEN_PORT"
+}
+
+serial_endpoint() {
+  if [ "$SERIAL_MODE" = "tcp" ]; then
+    printf 'tcp://%s:%s\n' "$(format_uri_host "$SERIAL_LISTEN_IP")" "$SERIAL_LISTEN_PORT"
+  else
+    printf 'libvirt-console://%s/serial0\n' "$DEFAULT_DOMAIN_NAME"
+  fi
+}
+
+warn_network_exposure() {
+  if ! address_is_loopback "$REDFISH_LISTEN_IP"; then
+    printf 'warning: non-loopback Redfish listener at %s\n' "$(redfish_endpoint)" >&2
+  fi
+  if [ "$SERIAL_MODE" = "tcp" ]; then
+    printf 'warning: unauthenticated plaintext TCP serial listener at %s\n' \
+      "$(serial_endpoint)" >&2
+  fi
+}
+
 load_runtime_config() {
   reject_unguarded_override VM_X86_REDFISH_DOMAIN_NAME
   reject_unguarded_override VM_X86_REDFISH_LIBVIRT_URI
@@ -61,6 +181,12 @@ load_runtime_config() {
   MEMORY_MIB="${VM_X86_REDFISH_MEMORY_MIB:-4096}"
   ROOT_DISK_GIB="${VM_X86_REDFISH_ROOT_DISK_GIB:-40}"
   SOURCE_IMAGE="${VM_X86_REDFISH_SOURCE_IMAGE:-}"
+  REDFISH_LISTEN_IP="${VM_X86_REDFISH_LISTEN_IP-127.0.0.1}"
+  REDFISH_LISTEN_PORT="${VM_X86_REDFISH_LISTEN_PORT-8000}"
+  SERIAL_MODE="${VM_X86_REDFISH_SERIAL_MODE-pty}"
+  SERIAL_LISTEN_IP="${VM_X86_REDFISH_SERIAL_LISTEN_IP-}"
+  SERIAL_LISTEN_PORT="${VM_X86_REDFISH_SERIAL_LISTEN_PORT-}"
+  validate_runtime_endpoints
   DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
   LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
 }
