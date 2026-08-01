@@ -24,7 +24,8 @@ SHELL_SCRIPTS += $(wildcard scripts/render-config scripts/run-redfish scripts/li
 SHELLCHECK_FILES := $(SHELL_SCRIPTS) $(wildcard tests/helpers/test-helper.bash)
 EXECUTABLE_SCRIPTS := $(filter-out scripts/lib/common,$(SHELL_SCRIPTS))
 PYTHON_313 := $(shell UV_PYTHON_DOWNLOADS=never uv python find 3.13 2>/dev/null)
-PYTHON_FILES := $(wildcard tests/helpers/*.py)
+PYTHON_FILES := $(wildcard python/*.py tests/*.py tests/helpers/*.py)
+PYTEST_FILES := $(wildcard tests/test_*.py)
 SHFMT_PATHS := $(wildcard scripts tests)
 
 test:
@@ -33,13 +34,16 @@ test:
 >@for script in $(EXECUTABLE_SCRIPTS); do test -x "$$script"; done
 >@if [ -n "$(SHFMT_PATHS)" ]; then shfmt -i 2 -d $(SHFMT_PATHS); fi
 >@if [ -n "$(PYTHON_FILES)" ]; then \
->  uv run --locked --only-group dev ruff check $(PYTHON_FILES); \
+>  uv run --locked --group dev ruff check $(PYTHON_FILES); \
 >fi
 >@if [ -n "$(PYTHON_FILES)" ]; then \
->  uv run --locked --only-group dev ruff format --check $(PYTHON_FILES); \
+>  uv run --locked --group dev ruff format --check $(PYTHON_FILES); \
 >fi
 >@if [ -n "$(PYTHON_FILES)" ]; then \
->  uv run --locked --only-group dev ty check $(PYTHON_FILES); \
+>  uv run --locked --group dev ty check $(PYTHON_FILES); \
+>fi
+>@if [ -n "$(PYTEST_FILES)" ]; then \
+>  PYTHONPATH="$(CURDIR)/python" uv run --locked --group dev pytest $(PYTEST_FILES); \
 >fi
 >@if [ -f uv.lock ]; then uv lock --check; fi
 >@if [ -f config/sushy-emulator.conf.py.in ]; then \

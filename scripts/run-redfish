@@ -6,12 +6,14 @@ script_dir="${BASH_SOURCE[0]%/*}"
 source "${script_dir}/lib/common"
 
 run_redfish() {
-  local tmpdir
+  local patch_dir tmpdir
   [ -f "${STATE_DIR}/sushy-emulator.conf.py" ] ||
     fail "missing ${STATE_DIR}/sushy-emulator.conf.py: run make create first"
   require_private_dir "${STATE_DIR}/tmp"
   tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
+  patch_dir="$(repo_root)/python"
   export TMPDIR="$tmpdir"
+  export PYTHONPATH="${patch_dir}${PYTHONPATH:+:${PYTHONPATH}}"
   exec uv run --locked sushy-emulator --config "${STATE_DIR}/sushy-emulator.conf.py"
 }
 

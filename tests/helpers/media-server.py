@@ -18,6 +18,7 @@ class MediaHandler(SimpleHTTPRequestHandler):
     server_directory: Path
     chunk_size: int
     chunk_delay: float
+    content_disposition: str | None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=str(self.server_directory), **kwargs)
@@ -38,6 +39,11 @@ class MediaHandler(SimpleHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
+    def end_headers(self) -> None:
+        if self.content_disposition is not None:
+            self.send_header("Content-Disposition", self.content_disposition)
+        super().end_headers()
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -48,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tls-key", type=Path)
     parser.add_argument("--chunk-size", type=int, default=64 * 1024)
     parser.add_argument("--chunk-delay", type=float, default=0)
+    parser.add_argument("--content-disposition")
     args = parser.parse_args()
     if (args.tls_cert is None) != (args.tls_key is None):
         parser.error("--tls-cert and --tls-key must be provided together")
@@ -72,6 +79,7 @@ def main() -> None:
     MediaHandler.server_directory = args.directory.resolve(strict=True)
     MediaHandler.chunk_size = args.chunk_size
     MediaHandler.chunk_delay = args.chunk_delay
+    MediaHandler.content_disposition = args.content_disposition
 
     with ThreadingHTTPServer(("127.0.0.1", 0), MediaHandler) as server:
         if args.tls_cert is not None:

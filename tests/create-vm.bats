@@ -75,6 +75,44 @@ esac
 '
 }
 
+install_existing_domain_mocks() {
+  printf '11111111-2222-3333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  install_mock_command virsh '
+printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+case "$*" in
+  *"dominfo vm-x86-redfish")
+    exit 0
+    ;;
+  *"dumpxml vm-x86-redfish")
+    cat <<XML
+<domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+  <uuid>11111111-2222-3333-8444-555555555555</uuid>
+  <metadata>
+    <rp:project>vm-x86-redfish</rp:project>
+    <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
+  </metadata>
+  <devices>
+    <disk type="file" device="disk">
+      <source file="/var/lib/libvirt/images/vm-x86-redfish.qcow2"/>
+    </disk>
+  </devices>
+</domain>
+XML
+    ;;
+  *"vol-info --pool default vm-x86-redfish.qcow2")
+    exit 0
+    ;;
+  *"vol-path --pool default vm-x86-redfish.qcow2")
+    printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\\n"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+'
+}
+
 @test "create-vm writes private Redfish credentials and connection metadata" {
   install_create_success_mocks
 
@@ -196,6 +234,48 @@ esac
   [ "$status" -ne 0 ]
   run grep -F "htpasswd -iB -c" "$BATS_TEST_TMPDIR/commands.log"
   [ "$status" -eq 0 ]
+}
+
+@test "create-vm rejects malformed existing Redfish credentials without sourcing them" {
+  install_existing_domain_mocks
+  printf "REDFISH_USERNAME='admin'\ntouch '%s'\nREDFISH_PASSWORD='redfish-test-password'\n" \
+    "$BATS_TEST_TMPDIR/sourced" >"$VM_X86_REDFISH_STATE_DIR/credentials.env"
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"malformed Redfish credentials file"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/sourced" ]
+  run grep -F "htpasswd" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm rejects Redfish state output symlinks before writing through them" {
+  install_existing_domain_mocks
+  printf "REDFISH_USERNAME='admin'\nREDFISH_PASSWORD='redfish-test-password'\n" \
+    >"$VM_X86_REDFISH_STATE_DIR/credentials.env"
+  printf 'outside\n' >"$BATS_TEST_TMPDIR/outside-htpasswd"
+  ln -s "$BATS_TEST_TMPDIR/outside-htpasswd" "$VM_X86_REDFISH_STATE_DIR/htpasswd"
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected project state file"* ]]
+  run cat "$BATS_TEST_TMPDIR/outside-htpasswd"
+  [ "$status" -eq 0 ]
+  [ "$output" = "outside" ]
+}
+
+@test "create-vm rejects incomplete Redfish TLS state" {
+  install_existing_domain_mocks
+  touch "$VM_X86_REDFISH_STATE_DIR/tls.crt"
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"incomplete Redfish TLS state"* ]]
+  run grep -F "openssl req" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
 }
 
 @test "create-vm refuses existing domain without project metadata" {

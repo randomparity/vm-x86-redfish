@@ -173,10 +173,12 @@ load "helpers/test-helper"
   mkdir -p "$VM_X86_REDFISH_STATE_DIR/tmp"
   touch "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
   chmod 700 "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_STATE_DIR/tmp"
-  install_mock_command uv 'printf "TMPDIR=%s\nCONFIG=%s\n" "$TMPDIR" "$*"'
+  install_mock_command uv \
+    'printf "TMPDIR=%s\nPYTHONPATH=%s\nCONFIG=%s\n" "$TMPDIR" "$PYTHONPATH" "$*"'
   run ./scripts/run-redfish
   [ "$status" -eq 0 ]
   [[ "$output" == *"TMPDIR=$VM_X86_REDFISH_STATE_DIR/tmp"* ]]
+  [[ "$output" == *"PYTHONPATH=$REPO_ROOT/python"* ]]
   [[ "$output" == *run\ --locked\ sushy-emulator\ --config\ */sushy-emulator.conf.py* ]]
 }
 

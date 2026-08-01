@@ -59,9 +59,10 @@ Run `make doctor` to identify missing host dependencies, unavailable libvirt res
 listener already using `127.0.0.1:8000`. Lifecycle commands fail immediately when another
 command holds the project lock; wait for that command to exit before retrying.
 
-Generated configuration, credentials, certificates, logs, and runtime files remain in the
-ignored `.state/` directory. Integration-test diagnostics remain in ignored `.artifacts/`.
-Do not commit generated files or credentials.
+Generated configuration, credentials, certificates, logs, virtual-media metadata, and runtime
+files remain in the ignored `.state/` directory. Treat `.state/` as sensitive while the
+service exists, especially if virtual-media credentials were supplied. Integration-test
+diagnostics remain in ignored `.artifacts/`. Do not commit generated files or credentials.
 
 ## Limitations and security boundaries
 

@@ -144,6 +144,54 @@ esac
   [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
 }
 
+@test "destroy-vm undefines owned domain when root volume is already absent" {
+  printf '11111111-2222-4333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  install_mock_command virsh '
+printf "virsh %s\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
+case "$*" in
+  *"dumpxml vm-x86-redfish")
+    cat <<XML
+<domain xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
+  <uuid>11111111-2222-4333-8444-555555555555</uuid>
+  <metadata>
+    <rp:project>vm-x86-redfish</rp:project>
+    <rp:root-volume>vm-x86-redfish.qcow2</rp:root-volume>
+  </metadata>
+  <devices>
+    <disk type="file" device="disk">
+      <source file="/var/lib/libvirt/images/missing-root.qcow2"/>
+    </disk>
+  </devices>
+</domain>
+XML
+    ;;
+  *"domstate vm-x86-redfish")
+    printf "shut off\n"
+    ;;
+  *"vol-path --pool default vm-x86-redfish.qcow2")
+    exit 2
+    ;;
+  *"vol-list --pool default")
+    printf "partial-11111111-2222-4333-8444-555555555555.img\n"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+'
+  run ./scripts/destroy-vm
+  [ "$status" -eq 0 ]
+  grep -F "undefine vm-x86-redfish --nvram" "$BATS_TEST_TMPDIR/commands.log"
+  grep -F "vol-delete --pool default partial-11111111-2222-4333-8444-555555555555.img" \
+    "$BATS_TEST_TMPDIR/commands.log"
+  run grep -F "vol-path --pool default vm-x86-redfish.qcow2" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+  run grep -F "vol-delete --pool default vm-x86-redfish.qcow2" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+  [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+}
+
 @test "destroy-vm refuses root volume metadata mismatch" {
   printf '11111111-2222-4333-8444-555555555555\n' \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
@@ -193,6 +241,9 @@ XML
     ;;
   *"vol-path --pool default vm-x86-redfish.qcow2")
     printf "/var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
+    ;;
+  *"vol-list --pool default")
+    printf "vm-x86-redfish.qcow2 /var/lib/libvirt/images/vm-x86-redfish.qcow2\n"
     ;;
   *)
     exit 0
@@ -412,6 +463,57 @@ esac
     "$BATS_TEST_TMPDIR/commands.log"
   [ ! -e "$VM_X86_REDFISH_STATE_DIR/tmp" ]
   [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+}
+
+@test "destroy-vm removes credential-bearing Sushy persistent state" {
+  printf '11111111-2222-4333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR/sushy"
+  chmod 700 "$VM_X86_REDFISH_STATE_DIR/sushy"
+  printf 'media_password=secret\n' >"$VM_X86_REDFISH_STATE_DIR/sushy/vmedia.sqlite"
+  install_mock_command virsh '
+case "$*" in
+  *"dumpxml vm-x86-redfish")
+    exit 1
+    ;;
+  *"list --all --name"|*"vol-list --pool default")
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+'
+  run ./scripts/destroy-vm
+  [ "$status" -eq 0 ]
+  [ ! -e "$VM_X86_REDFISH_STATE_DIR/sushy" ]
+  [ ! -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
+}
+
+@test "destroy-vm fails closed on unexpected Sushy persistent state entries" {
+  printf '11111111-2222-4333-8444-555555555555\n' \
+    >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR/sushy"
+  chmod 700 "$VM_X86_REDFISH_STATE_DIR/sushy"
+  touch "$BATS_TEST_TMPDIR/outside-sushy"
+  ln -s "$BATS_TEST_TMPDIR/outside-sushy" "$VM_X86_REDFISH_STATE_DIR/sushy/vmedia.sqlite"
+  install_mock_command virsh '
+case "$*" in
+  *"dumpxml vm-x86-redfish")
+    exit 1
+    ;;
+  *"list --all --name"|*"vol-list --pool default")
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+'
+  run ./scripts/destroy-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected entry in Sushy state directory"* ]]
+  [ -L "$VM_X86_REDFISH_STATE_DIR/sushy/vmedia.sqlite" ]
+  [ -e "$BATS_TEST_TMPDIR/outside-sushy" ]
+  [ -e "$VM_X86_REDFISH_STATE_DIR/domain-uuid" ]
 }
 
 @test "destroy-vm removes empty Sushy tmp child directory after eject" {

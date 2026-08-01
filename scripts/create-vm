@@ -56,30 +56,103 @@ create_redfish_runtime_state() {
   ./scripts/render-config sushy
 }
 
+require_safe_create_state_file_or_absent() {
+  local path="$1"
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+    fail "unexpected project state file: $path"
+  fi
+}
+
+require_create_state_file() {
+  local path="$1"
+  if [ -L "$path" ] || [ ! -f "$path" ]; then
+    fail "expected regular project state file: $path"
+  fi
+}
+
+read_redfish_credentials() {
+  local line password="" password_seen=0 path="$1" username="" username_seen=0
+  local password_regex="^REDFISH_PASSWORD='([^']+)'$"
+  local username_regex="^REDFISH_USERNAME='([^']+)'$"
+  require_create_state_file "$path"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ $username_regex ]]; then
+      [ "$username_seen" -eq 0 ] || fail "duplicate REDFISH_USERNAME in $path"
+      username="${BASH_REMATCH[1]}"
+      username_seen=1
+    elif [[ "$line" =~ $password_regex ]]; then
+      [ "$password_seen" -eq 0 ] || fail "duplicate REDFISH_PASSWORD in $path"
+      password="${BASH_REMATCH[1]}"
+      password_seen=1
+    else
+      fail "malformed Redfish credentials file: $path"
+    fi
+  done <"$path"
+  [ "$username_seen" -eq 1 ] || fail "missing REDFISH_USERNAME in $path"
+  [ "$password_seen" -eq 1 ] || fail "missing REDFISH_PASSWORD in $path"
+  REDFISH_USERNAME="$username"
+  REDFISH_PASSWORD="$password"
+}
+
+write_htpasswd() {
+  local htpasswd_path="$1"
+  local tmp_path
+  require_safe_create_state_file_or_absent "$htpasswd_path"
+  tmp_path="$(mktemp "${STATE_DIR}/.htpasswd.XXXXXX")" ||
+    fail "cannot create temporary htpasswd file in $STATE_DIR"
+  if ! printf '%s\n' "$REDFISH_PASSWORD" |
+    htpasswd -iB -c "$tmp_path" "$REDFISH_USERNAME" >/dev/null; then
+    rm -- "$tmp_path"
+    fail "failed to write Redfish htpasswd"
+  fi
+  chmod 600 "$tmp_path"
+  mv -- "$tmp_path" "$htpasswd_path"
+}
+
 create_redfish_credentials_once() {
+  local credentials_path="${STATE_DIR}/credentials.env"
+  local htpasswd_path="${STATE_DIR}/htpasswd"
   local password
-  if [ ! -f "${STATE_DIR}/credentials.env" ]; then
+  require_safe_create_state_file_or_absent "$credentials_path"
+  if [ ! -f "$credentials_path" ]; then
     password="$(openssl rand -base64 30)"
-    write_secret_file "${STATE_DIR}/credentials.env" \
+    write_secret_file "$credentials_path" \
       "REDFISH_USERNAME='admin'
 REDFISH_PASSWORD='${password}'"
   fi
-  # shellcheck disable=SC1091
-  source "${STATE_DIR}/credentials.env"
-  printf '%s\n' "$REDFISH_PASSWORD" |
-    htpasswd -iB -c "${STATE_DIR}/htpasswd" "$REDFISH_USERNAME" >/dev/null
-  chmod 600 "${STATE_DIR}/htpasswd"
+  read_redfish_credentials "$credentials_path"
+  write_htpasswd "$htpasswd_path"
 }
 
 create_tls_once() {
-  if [ ! -f "${STATE_DIR}/tls.crt" ] || [ ! -f "${STATE_DIR}/tls.key" ]; then
-    openssl req -x509 -newkey rsa:3072 -sha256 -days 365 -nodes \
-      -subj "/CN=localhost" \
-      -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
-      -keyout "${STATE_DIR}/tls.key" \
-      -out "${STATE_DIR}/tls.crt"
-    chmod 600 "${STATE_DIR}/tls.key" "${STATE_DIR}/tls.crt"
+  local cert_path="${STATE_DIR}/tls.crt"
+  local key_path="${STATE_DIR}/tls.key"
+  local tmp_cert tmp_key
+  require_safe_create_state_file_or_absent "$cert_path"
+  require_safe_create_state_file_or_absent "$key_path"
+  if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+    return 0
   fi
+  if [ -f "$cert_path" ] || [ -f "$key_path" ]; then
+    fail "incomplete Redfish TLS state: expected both $cert_path and $key_path"
+  fi
+  tmp_cert="$(mktemp "${STATE_DIR}/.tls.crt.XXXXXX")" ||
+    fail "cannot create temporary TLS certificate in $STATE_DIR"
+  tmp_key="$(mktemp "${STATE_DIR}/.tls.key.XXXXXX")" || {
+    rm -- "$tmp_cert"
+    fail "cannot create temporary TLS key in $STATE_DIR"
+  }
+  if ! openssl req -x509 -newkey rsa:3072 -sha256 -days 365 -nodes \
+    -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+    -keyout "$tmp_key" \
+    -out "$tmp_cert"; then
+    rm -- "$tmp_cert" "$tmp_key"
+    fail "failed to create Redfish TLS certificate"
+  fi
+  chmod 600 "$tmp_key" "$tmp_cert"
+  mv -- "$tmp_cert" "$cert_path"
+  mv -- "$tmp_key" "$key_path"
 }
 
 write_connection_metadata() {

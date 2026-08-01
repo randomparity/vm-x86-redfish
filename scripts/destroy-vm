@@ -126,6 +126,28 @@ cleanup_tmpdir() {
   rmdir "$tmpdir" || fail "temporary directory is not empty after cleanup: $tmpdir"
 }
 
+cleanup_sushy_state_dir() {
+  local entry file state_dir
+  state_dir="${STATE_DIR}/sushy"
+  reject_symlink "$state_dir"
+  [ -e "$state_dir" ] || return 0
+  require_private_dir "$state_dir"
+  state_dir="$(canonical_dir "$state_dir")"
+  while IFS= read -r -d '' entry; do
+    file="${entry##*/}"
+    case "$file" in
+    vmedia.sqlite | vmedia.sqlite-shm | vmedia.sqlite-wal) ;;
+    *) fail "unexpected entry in Sushy state directory: $entry" ;;
+    esac
+    if [ -f "$entry" ] && [ ! -L "$entry" ]; then
+      rm -- "$entry"
+    else
+      fail "unexpected entry in Sushy state directory: $entry"
+    fi
+  done < <(find "$state_dir" -mindepth 1 -maxdepth 1 -print0)
+  rmdir "$state_dir" || fail "Sushy state directory is not empty after cleanup: $state_dir"
+}
+
 delete_uuid_media_volumes() {
   local uuid="$1"
   local volume
@@ -171,6 +193,7 @@ cleanup_absent_domain() {
   fi
   delete_uuid_media_volumes "$uuid"
   cleanup_tmpdir
+  cleanup_sushy_state_dir
   printf 'destroy: domain %s is already absent\n' "$DEFAULT_DOMAIN_NAME"
   cleanup_project_state_files
 }
@@ -185,7 +208,7 @@ destroy_domain_if_active() {
 }
 
 destroy_transaction() {
-  local current_probe_path root_path uuid xml_path
+  local current_probe_path root_path root_volume_present=0 uuid xml_path
   if [ ! -e "$DOMAIN_UUID_FILE" ] && [ ! -L "$DOMAIN_UUID_FILE" ]; then
     printf 'destroy: no project state found\n'
     return 0
@@ -215,20 +238,24 @@ destroy_transaction() {
     fail "refusing to destroy $DEFAULT_DOMAIN_NAME with mismatched UUID"
   domain_root_volume_matches_state "$xml_path" ||
     fail "existing domain $DEFAULT_DOMAIN_NAME does not reference $ROOT_VOLUME_NAME"
-  if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
-    "$ROOT_VOLUME_NAME")"; then
-    fail "cannot resolve root volume path for $ROOT_VOLUME_NAME"
+  if volume_exists; then
+    root_volume_present=1
+    if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
+      "$ROOT_VOLUME_NAME")"; then
+      fail "cannot resolve root volume path for $ROOT_VOLUME_NAME"
+    fi
+    domain_disk_source_matches "$xml_path" "$root_path" ||
+      fail "refusing to destroy $DEFAULT_DOMAIN_NAME with unexpected disk source"
   fi
-  domain_disk_source_matches "$xml_path" "$root_path" ||
-    fail "refusing to destroy $DEFAULT_DOMAIN_NAME with unexpected disk source"
 
   destroy_domain_if_active
   virsh -c "$LIBVIRT_URI" undefine "$DEFAULT_DOMAIN_NAME" --nvram
-  if volume_exists; then
+  if [ "$root_volume_present" -eq 1 ]; then
     virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
   fi
   delete_uuid_media_volumes "$uuid"
   cleanup_tmpdir
+  cleanup_sushy_state_dir
   cleanup_project_state_files
 }
 

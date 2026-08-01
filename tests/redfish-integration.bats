@@ -104,6 +104,30 @@ post_virtual_media_action() {
     "https://127.0.0.1:8000${system_url}/VirtualMedia/Cd/Actions/VirtualMedia.${action}"
 }
 
+add_virtual_media_certificate() {
+  local cert_path="$2"
+  local payload_path="$BATS_TEST_TMPDIR/virtual-media-cert.json"
+  local python_bin system_url="$1"
+  python_bin="$(python_313)"
+  "$python_bin" - "$cert_path" "$payload_path" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+cert_path, payload_path = sys.argv[1:]
+payload = {
+    "CertificateString": Path(cert_path).read_text(encoding="utf-8"),
+    "CertificateType": "PEM",
+}
+Path(payload_path).write_text(json.dumps(payload), encoding="utf-8")
+PY
+  bounded_curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --cacert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
+    --user "${REDFISH_USERNAME}:${REDFISH_PASSWORD}" \
+    -H 'Content-Type: application/json' --data-binary @"$payload_path" \
+    "https://127.0.0.1:8000${system_url}/VirtualMedia/Cd/Certificates"
+}
+
 patch_boot_override() {
   local system_url="$1"
   local target="$2"
@@ -728,24 +752,53 @@ PY
 
   start_media_server "$BATS_TEST_TMPDIR/media" sentinel-http
   media_port="$MEDIA_SERVER_PORT"
-  start_media_server "$BATS_TEST_TMPDIR/media" sentinel-https \
+  untrusted_cert="$BATS_TEST_TMPDIR/untrusted-media.crt"
+  untrusted_key="$BATS_TEST_TMPDIR/untrusted-media.key"
+  openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+    -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+    -keyout "$untrusted_key" \
+    -out "$untrusted_cert" \
+    >"$VM_X86_REDFISH_ARTIFACTS_DIR/untrusted-media-openssl.log" 2>&1
+  start_media_server "$BATS_TEST_TMPDIR/media" untrusted-https \
+    --tls-cert "$untrusted_cert" \
+    --tls-key "$untrusted_key"
+  untrusted_tls_media_port="$MEDIA_SERVER_PORT"
+  start_media_server "$BATS_TEST_TMPDIR/media" trusted-https \
     --tls-cert "$VM_X86_REDFISH_STATE_DIR/tls.crt" \
     --tls-key "$VM_X86_REDFISH_STATE_DIR/tls.key"
-  tls_media_port="$MEDIA_SERVER_PORT"
+  trusted_tls_media_port="$MEDIA_SERVER_PORT"
 
   start_sushy
   sushy_pid="$SUSHY_PID"
 
   run bounded_curl --silent --show-error --fail --insecure --output /dev/null \
-    "https://127.0.0.1:${tls_media_port}/${iso_name}"
+    "https://127.0.0.1:${untrusted_tls_media_port}/${iso_name}"
   [ "$status" -eq 0 ]
-  untrusted_payload="{\"Image\":\"https://127.0.0.1:${tls_media_port}/${iso_name}\",\
+  untrusted_payload="{\"Image\":\"https://127.0.0.1:${untrusted_tls_media_port}/${iso_name}\",\
 \"Inserted\":true}"
   run post_virtual_media_action "$system_url" InsertMedia "$untrusted_payload"
   [ "$status" -eq 0 ]
   [ "$output" = "500" ]
 
-  media_url="http://127.0.0.1:${media_port}/${iso_name}"
+  outside_vmedia="$VM_X86_REDFISH_STATE_DIR/outside-vmedia"
+  printf 'unchanged\n' >"$outside_vmedia"
+  start_media_server "$BATS_TEST_TMPDIR/media" hostile-filename \
+    --content-disposition 'attachment; filename="../outside-vmedia"'
+  hostile_media_port="$MEDIA_SERVER_PORT"
+  hostile_url="http://127.0.0.1:${hostile_media_port}/${iso_name}"
+  hostile_payload="{\"Image\":\"${hostile_url}\",\"Inserted\":true}"
+  run post_virtual_media_action "$system_url" InsertMedia "$hostile_payload"
+  [ "$status" -eq 0 ]
+  [ "$output" = "400" ]
+  run cat "$outside_vmedia"
+  [ "$status" -eq 0 ]
+  [ "$output" = "unchanged" ]
+
+  run add_virtual_media_certificate "$system_url" "$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  [ "$status" -eq 0 ]
+  [ "$output" = "204" ]
+  media_url="https://127.0.0.1:${trusted_tls_media_port}/${iso_name}"
   insert_payload="{\"Image\":\"${media_url}\",\"Inserted\":true}"
   run post_virtual_media_action "$system_url" InsertMedia "$insert_payload"
   [ "$status" -eq 0 ]
