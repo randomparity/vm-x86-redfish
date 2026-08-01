@@ -108,21 +108,24 @@ esac
   [[ "$output" == *"127.0.0.1:8000 is already in use"* ]]
 }
 
-@test "doctor accepts recently closed loopback connections" {
+@test "doctor honors an integration-only loopback port override" {
   python_bin="$(PATH="${PATH#*:}" UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
-  "$python_bin" - <<'PY'
+  port_file="$BATS_TEST_TMPDIR/listener.port"
+  "$python_bin" - "$port_file" <<'PY' &
+import pathlib
+import signal
 import socket
+import sys
 
 with socket.socket() as server:
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", 8000))
+    server.bind(("127.0.0.1", 0))
     server.listen()
-    with socket.create_connection(("127.0.0.1", 8000)) as client:
-        connection, _ = server.accept()
-        with connection:
-            connection.shutdown(socket.SHUT_WR)
-            client.recv(1)
+    pathlib.Path(sys.argv[1]).write_text(str(server.getsockname()[1]))
+    signal.pause()
 PY
+  listener_pid="$!"
+  wait_for_file "$port_file"
+  test_port="$(<"$port_file")"
   install_all_doctor_success_mocks
   install_mock_command uv "
 case \"\$*\" in
@@ -131,7 +134,44 @@ case \"\$*\" in
 esac
 "
 
-  run ./scripts/doctor
+  VM_X86_REDFISH_PORT_CHECK_PORT="$test_port" run ./scripts/doctor
+  doctor_status="$status"
+  doctor_output="$output"
+  kill "$listener_pid"
+  wait "$listener_pid" || :
+
+  [ "$doctor_status" -ne 0 ]
+  [[ "$doctor_output" == *"127.0.0.1:${test_port} is already in use"* ]]
+}
+
+@test "doctor accepts recently closed loopback connections" {
+  python_bin="$(PATH="${PATH#*:}" UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+  test_port="$(
+    "$python_bin" - <<'PY'
+import socket
+
+with socket.socket() as server:
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    port = server.getsockname()[1]
+    with socket.create_connection(("127.0.0.1", port)) as client:
+        connection, _ = server.accept()
+        with connection:
+            connection.shutdown(socket.SHUT_WR)
+            client.recv(1)
+    print(port)
+PY
+  )"
+  install_all_doctor_success_mocks
+  install_mock_command uv "
+case \"\$*\" in
+  \"python find 3.13\") printf '%s\\n' '$python_bin' ;;
+  *) exit 2 ;;
+esac
+"
+
+  VM_X86_REDFISH_PORT_CHECK_PORT="$test_port" run ./scripts/doctor
   [ "$status" -eq 0 ]
 }
 

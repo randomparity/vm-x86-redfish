@@ -112,17 +112,24 @@ PY
 }
 
 check_loopback_port() {
+  local port=8000
   local python_bin
   if integration_override_enabled &&
+    [ -n "${VM_X86_REDFISH_PORT_CHECK_PORT:-}" ]; then
+    port="$VM_X86_REDFISH_PORT_CHECK_PORT"
+  fi
+  if integration_override_enabled &&
     [ "${VM_X86_REDFISH_PORT_CHECK_RESULT:-}" = "busy" ]; then
-    fail "127.0.0.1:8000 is already in use"
+    fail "127.0.0.1:${port} is already in use"
   fi
   python_bin="$(python_313)"
-  "$python_bin" - <<'PY' || fail "127.0.0.1:8000 is already in use"
+  "$python_bin" - "$port" <<'PY' || fail "127.0.0.1:${port} is already in use"
 import socket
+import sys
+
 with socket.socket() as sock:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", 8000))
+    sock.bind(("127.0.0.1", int(sys.argv[1])))
     sock.listen()
 PY
 }

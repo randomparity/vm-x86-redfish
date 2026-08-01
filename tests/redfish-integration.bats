@@ -405,11 +405,27 @@ post_reset() {
     "https://127.0.0.1:8000${system_url}/Actions/ComputerSystem.Reset"
 }
 
-teardown() {
+simulate_failed_teardown_audits() {
+  wait_for_loopback_port_free() {
+    printf 'listener audit\n' >>"$BATS_TEST_TMPDIR/teardown-order"
+    return 41
+  }
+  timeout() {
+    printf 'destroy-vm\n' >>"$BATS_TEST_TMPDIR/teardown-order"
+    return 42
+  }
+  bounded_virsh() {
+    return 43
+  }
+  run_teardown_cleanup
+}
+
+run_teardown_cleanup() {
+  local listener_status=0
+  local cleanup_status=0
+  local cleanup_log="$VM_X86_REDFISH_ARTIFACTS_DIR/destroy.log"
   stop_tracked_children
-  wait_for_loopback_port_free 8000
-  cleanup_log="$VM_X86_REDFISH_ARTIFACTS_DIR/destroy.log"
-  cleanup_status=0
+  wait_for_loopback_port_free 8000 || listener_status="$?"
   timeout --kill-after=5 120 ./scripts/destroy-vm >"$cleanup_log" 2>&1 ||
     cleanup_status="$?"
   if [ "$cleanup_status" -ne 0 ]; then
@@ -420,8 +436,19 @@ teardown() {
     fi
     printf 'destroy-vm cleanup failed with status %s; see %s\n' \
       "$cleanup_status" "$cleanup_log" >&2
+  fi
+  if [ "$listener_status" -ne 0 ]; then
+    printf 'listener audit failed for 127.0.0.1:8000 with status %s\n' \
+      "$listener_status" >&2
+  fi
+  if [ "$cleanup_status" -ne 0 ]; then
     return "$cleanup_status"
   fi
+  return "$listener_status"
+}
+
+teardown() {
+  run_teardown_cleanup
 }
 
 @test "integration harness installs cleanup helpers before live mutation" {
@@ -538,6 +565,17 @@ esac
 
   run timeout --kill-after=5 120 ./scripts/destroy-vm
   [ "$status" -eq 0 ]
+}
+
+@test "teardown destroys resources and reports every failed cleanup audit" {
+  run simulate_failed_teardown_audits
+  [ "$status" -eq 42 ]
+  [[ "$output" == *"listener audit failed for 127.0.0.1:8000 with status 41"* ]]
+  [[ "$output" == *"destroy-vm cleanup failed with status 42"* ]]
+
+  run cat "$BATS_TEST_TMPDIR/teardown-order"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'listener audit\ndestroy-vm' ]
 }
 
 @test "media server helper publishes selected port after binding" {
@@ -694,6 +732,7 @@ PY
   serial_log="$VM_X86_REDFISH_ARTIFACTS_DIR/serial.log"
   run run_serial_console
   printf '%s\n' "$output" >"$serial_log"
+  [ "$status" -eq 0 ]
   [[ "$output" == *"$sentinel"* ]]
   [ -f "$nvram_path" ]
 
