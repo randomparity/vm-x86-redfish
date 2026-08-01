@@ -56,6 +56,24 @@ setup_integration_workspace() {
   mkdir -p "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_ARTIFACTS_DIR"
 }
 
+build_nmi_initramfs() {
+  local init_binary="$1"
+  local archive_path="$2"
+  local staging_root="$3"
+  (
+    umask 022
+    mkdir -p "$staging_root/dev" "$staging_root/proc"
+    cp "$init_binary" "$staging_root/init"
+    chmod 0755 "$staging_root" "$staging_root/dev" "$staging_root/proc"
+    chmod 0755 "$staging_root/init"
+    touch -d '@0' "$staging_root" "$staging_root/dev" \
+      "$staging_root/proc" "$staging_root/init"
+    cd "$staging_root" || exit 1
+    printf '%s\0' dev init proc |
+      cpio --null --create --format=newc --owner=0:0 --reproducible
+  ) >"$archive_path"
+}
+
 bounded_curl() {
   curl --connect-timeout 5 --max-time 15 "$@"
 }

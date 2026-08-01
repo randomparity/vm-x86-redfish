@@ -120,21 +120,17 @@ create_nmi_iso() {
   local fixture_root="$BATS_TEST_TMPDIR/nmi-fixture"
   local initramfs_root="$fixture_root/initramfs"
   local iso_root="$fixture_root/iso-root"
+  local init_binary="$fixture_root/nmi-init"
   local kernel_release
   local kernel_path
 
   kernel_release="$(uname -r)"
   kernel_path="$(matching_kernel_image "$kernel_release")" || return
-  mkdir -p "$initramfs_root/dev" "$initramfs_root/proc" "$iso_root/boot/grub"
+  mkdir -p "$fixture_root" "$iso_root/boot/grub"
   gcc -std=c17 -static -Os -s -Wall -Wextra -Werror \
-    -o "$initramfs_root/init" tests/fixtures/nmi-init.c
-  touch -d '@0' "$initramfs_root" "$initramfs_root/dev" \
-    "$initramfs_root/proc" "$initramfs_root/init"
-  (
-    cd "$initramfs_root" || exit 1
-    printf '%s\0' dev init proc |
-      cpio --null --create --format=newc --owner=0:0 --reproducible
-  ) >"$iso_root/boot/nmi-initramfs.cpio"
+    -o "$init_binary" tests/fixtures/nmi-init.c
+  build_nmi_initramfs \
+    "$init_binary" "$iso_root/boot/nmi-initramfs.cpio" "$initramfs_root"
   cp "$kernel_path" "$iso_root/boot/vmlinuz"
   sed -e 's/@DEFAULT_ENTRY@/1/' -e 's/@SENTINEL@/unused/' \
     tests/fixtures/grub.cfg.in >"$iso_root/boot/grub/grub.cfg"

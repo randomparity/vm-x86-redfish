@@ -64,7 +64,8 @@ require_kernel_capability() {
   local kernel_release="$2"
   local capability="$3"
   grep -Fx "${capability}=y" "$config_path" >/dev/null ||
-    fail "kernel $kernel_release lacks ${capability}=y: install an x86_64 kernel with NMI support"
+    fail "kernel $kernel_release lacks ${capability}=y required by NMI fixture;" \
+      "install kernel-core-$kernel_release with $capability enabled"
 }
 
 check_nmi_fixture_prerequisites() {
@@ -90,6 +91,10 @@ check_nmi_fixture_prerequisites() {
   fi
   require_kernel_capability "$config_path" "$kernel_release" CONFIG_X86_64
   require_kernel_capability "$config_path" "$kernel_release" CONFIG_HAVE_NMI
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_BLK_DEV_INITRD
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_PROC_FS
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_BINFMT_ELF
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_SERIAL_8250_CONSOLE
   printf 'int main(void) { return 0; }\n' |
     gcc -static -x c -o /dev/null - >/dev/null 2>&1 ||
     fail "gcc cannot link a static PID 1 for kernel $kernel_release: install glibc-static"

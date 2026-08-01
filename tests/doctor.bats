@@ -3,6 +3,17 @@
 
 load "helpers/test-helper"
 
+write_nmi_kernel_config() {
+  local config_path="$1"
+  printf '%s\n' \
+    CONFIG_X86_64=y \
+    CONFIG_HAVE_NMI=y \
+    CONFIG_BLK_DEV_INITRD=y \
+    CONFIG_PROC_FS=y \
+    CONFIG_BINFMT_ELF=y \
+    CONFIG_SERIAL_8250_CONSOLE=y >"$config_path"
+}
+
 @test "doctor reports missing qemu-img with Fedora package hint" {
   bash_bin="$(command -v bash)"
   install_mock_command uname 'printf "x86_64\n"'
@@ -56,15 +67,26 @@ case "$*" in
 esac
 '
   install_mock_command pkg-config 'exit 0'
-  for command in qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd gcc \
-    bats shellcheck shfmt grub2-mkrescue xorriso; do
+  for command in qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd \
+    bats cpio gcc shellcheck shfmt grub2-mkrescue xorriso; do
     install_recording_noop "$command"
   done
+  install_mock_command uname '
+case "${1:-}" in
+  -m) printf "x86_64\n" ;;
+  -r) printf "6.12.0-doctor-test\n" ;;
+  *) exit 2 ;;
+esac
+'
   mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
   touch "$BATS_TEST_TMPDIR/dev/kvm"
+  printf 'kernel\n' >"$BATS_TEST_TMPDIR/doctor-vmlinuz"
+  write_nmi_kernel_config "$BATS_TEST_TMPDIR/doctor-kernel.config"
   VM_X86_REDFISH_INTEGRATION_TEST=1 \
     VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm" \
     VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf" \
+    VM_X86_REDFISH_TEST_KERNEL_IMAGE="$BATS_TEST_TMPDIR/doctor-vmlinuz" \
+    VM_X86_REDFISH_TEST_KERNEL_CONFIG="$BATS_TEST_TMPDIR/doctor-kernel.config" \
     run ./scripts/doctor
   [ "$status" -eq 0 ]
   [[ "$output" == *"doctor: host prerequisites are available"* ]]
@@ -103,7 +125,7 @@ esac
   mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
   touch "$BATS_TEST_TMPDIR/dev/kvm"
   printf 'kernel\n' >"$BATS_TEST_TMPDIR/vmlinuz"
-  printf 'CONFIG_X86_64=y\nCONFIG_HAVE_NMI=y\n' >"$BATS_TEST_TMPDIR/kernel.config"
+  write_nmi_kernel_config "$BATS_TEST_TMPDIR/kernel.config"
   export VM_X86_REDFISH_INTEGRATION_TEST=1
   export VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm"
   export VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
@@ -389,7 +411,35 @@ esac
 
   [ "$status" -ne 0 ]
   [[ "$output" == *"kernel 6.12.0-nmi-test lacks CONFIG_HAVE_NMI=y"* ]]
-  [[ "$output" == *"install an x86_64 kernel with NMI support"* ]]
+  [[ "$output" == *"install kernel-core-6.12.0-nmi-test with CONFIG_HAVE_NMI enabled"* ]]
+}
+
+assert_nmi_fixture_missing_capability() {
+  local capability="$1"
+  install_all_doctor_success_mocks
+  sed -i "/^${capability}=y$/d" "$VM_X86_REDFISH_TEST_KERNEL_CONFIG"
+
+  run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"kernel 6.12.0-nmi-test lacks ${capability}=y"* ]]
+  [[ "$output" == *"install kernel-core-6.12.0-nmi-test with ${capability} enabled"* ]]
+}
+
+@test "NMI fixture doctor requires initramfs kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_BLK_DEV_INITRD
+}
+
+@test "NMI fixture doctor requires procfs kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_PROC_FS
+}
+
+@test "NMI fixture doctor requires ELF kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_BINFMT_ELF
+}
+
+@test "NMI fixture doctor requires serial console kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_SERIAL_8250_CONSOLE
 }
 
 @test "NMI fixture doctor reports static link failure with package hint" {
@@ -452,5 +502,24 @@ fi
   run grep -F 'NMI_UNSUPPORTED: ' "$init_source"
   [ "$status" -eq 0 ]
   run grep -F '_exit(EXIT_FAILURE)' "$init_source"
+  [ "$status" -eq 0 ]
+}
+
+@test "NMI fixture initramfs is reproducible across caller umasks" {
+  local archive_one="$BATS_TEST_TMPDIR/nmi-one.cpio"
+  local archive_two="$BATS_TEST_TMPDIR/nmi-two.cpio"
+  local init_binary="$BATS_TEST_TMPDIR/nmi-init"
+  printf 'deterministic init\n' >"$init_binary"
+
+  (
+    umask 077
+    build_nmi_initramfs "$init_binary" "$archive_one" "$BATS_TEST_TMPDIR/root-one"
+  )
+  (
+    umask 002
+    build_nmi_initramfs "$init_binary" "$archive_two" "$BATS_TEST_TMPDIR/root-two"
+  )
+
+  run cmp "$archive_one" "$archive_two"
   [ "$status" -eq 0 ]
 }
