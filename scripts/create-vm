@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="${BASH_SOURCE[0]%/*}"
+# shellcheck source=scripts/lib/common
+source "${script_dir}/lib/common"
+
+create_domain_uuid_once() {
+  ensure_private_dir "$STATE_DIR"
+  require_safe_project_file_or_absent "$DOMAIN_UUID_FILE"
+  if [ ! -f "$DOMAIN_UUID_FILE" ]; then
+    write_secret_file "$DOMAIN_UUID_FILE" "$(uuidgen)"
+  fi
+}
+
+dump_existing_domain_xml() {
+  local tmp_path
+  local xml_path="$1"
+  require_safe_create_state_file_or_absent "$xml_path"
+  tmp_path="$(mktemp "${STATE_DIR}/.existing-domain.xml.XXXXXX")" ||
+    fail "cannot create temporary existing domain XML in $STATE_DIR"
+  if ! virsh -c "$LIBVIRT_URI" dumpxml "$DEFAULT_DOMAIN_NAME" --inactive >"$tmp_path"; then
+    rm -- "$tmp_path"
+    fail "failed to dump existing domain XML for $DEFAULT_DOMAIN_NAME"
+  fi
+  chmod 600 "$tmp_path"
+  mv -- "$tmp_path" "$xml_path"
+}
+
+validate_or_reject_existing_domain() {
+  local xml_path="${STATE_DIR}/existing-domain.xml"
+  local root_path
+  if virsh -c "$LIBVIRT_URI" dominfo "$DEFAULT_DOMAIN_NAME" >/dev/null 2>&1; then
+    ensure_private_dir "$STATE_DIR"
+    dump_existing_domain_xml "$xml_path"
+    domain_is_project_owned "$xml_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME is not owned by this project"
+    domain_uuid_matches_state "$xml_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME UUID does not match $DOMAIN_UUID_FILE"
+    domain_root_volume_matches_state "$xml_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME does not reference $ROOT_VOLUME_NAME"
+    if ! virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+      >/dev/null 2>&1; then
+      fail "existing domain $DEFAULT_DOMAIN_NAME root volume $ROOT_VOLUME_NAME is missing"
+    fi
+    root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME")"
+    domain_disk_source_matches "$xml_path" "$root_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME does not use root volume path $root_path"
+    domain_shape_matches_expected "$xml_path" "$root_path" ||
+      fail "existing domain $DEFAULT_DOMAIN_NAME hardware does not match expected project shape"
+    return 0
+  fi
+  return 1
+}
+
+reject_root_volume_collision() {
+  if virsh -c "$LIBVIRT_URI" vol-info --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME" \
+    >/dev/null 2>&1; then
+    fail "existing root volume $ROOT_VOLUME_NAME is not adopted without matching domain"
+  fi
+}
+
+create_root_volume() {
+  reject_root_volume_collision
+  virsh -c "$LIBVIRT_URI" vol-create-as "$STORAGE_POOL" "$ROOT_VOLUME_NAME" 40G \
+    --format qcow2
+}
+
+create_redfish_runtime_state() {
+  create_redfish_credentials_once
+  create_tls_once
+  write_connection_metadata
+  ./scripts/render-config sushy
+}
+
+require_safe_create_state_file_or_absent() {
+  local path="$1"
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+    fail "unexpected project state file: $path"
+  fi
+}
+
+require_create_state_file() {
+  local path="$1"
+  if [ -L "$path" ] || [ ! -f "$path" ]; then
+    fail "expected regular project state file: $path"
+  fi
+  require_private_file "$path"
+}
+
+read_redfish_credentials() {
+  local line password="" password_seen=0 path="$1" username="" username_seen=0
+  local password_regex="^REDFISH_PASSWORD='([^']+)'$"
+  local username_regex="^REDFISH_USERNAME='([^']+)'$"
+  require_create_state_file "$path"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ $username_regex ]]; then
+      [ "$username_seen" -eq 0 ] || fail "duplicate REDFISH_USERNAME in $path"
+      username="${BASH_REMATCH[1]}"
+      username_seen=1
+    elif [[ "$line" =~ $password_regex ]]; then
+      [ "$password_seen" -eq 0 ] || fail "duplicate REDFISH_PASSWORD in $path"
+      password="${BASH_REMATCH[1]}"
+      password_seen=1
+    else
+      fail "malformed Redfish credentials file: $path"
+    fi
+  done <"$path"
+  [ "$username_seen" -eq 1 ] || fail "missing REDFISH_USERNAME in $path"
+  [ "$password_seen" -eq 1 ] || fail "missing REDFISH_PASSWORD in $path"
+  REDFISH_USERNAME="$username"
+  REDFISH_PASSWORD="$password"
+}
+
+write_htpasswd() {
+  local htpasswd_path="$1"
+  local tmp_path
+  require_safe_create_state_file_or_absent "$htpasswd_path"
+  tmp_path="$(mktemp "${STATE_DIR}/.htpasswd.XXXXXX")" ||
+    fail "cannot create temporary htpasswd file in $STATE_DIR"
+  if ! printf '%s\n' "$REDFISH_PASSWORD" |
+    htpasswd -iB -c "$tmp_path" "$REDFISH_USERNAME" >/dev/null; then
+    rm -- "$tmp_path"
+    fail "failed to write Redfish htpasswd"
+  fi
+  chmod 600 "$tmp_path"
+  mv -- "$tmp_path" "$htpasswd_path"
+}
+
+create_redfish_credentials_once() {
+  local credentials_path="${STATE_DIR}/credentials.env"
+  local htpasswd_path="${STATE_DIR}/htpasswd"
+  local password
+  require_safe_create_state_file_or_absent "$credentials_path"
+  if [ ! -f "$credentials_path" ]; then
+    password="$(openssl rand -base64 30)"
+    write_secret_file "$credentials_path" \
+      "REDFISH_USERNAME='admin'
+REDFISH_PASSWORD='${password}'"
+  fi
+  read_redfish_credentials "$credentials_path"
+  write_htpasswd "$htpasswd_path"
+}
+
+create_tls_once() {
+  local cert_path="${STATE_DIR}/tls.crt"
+  local key_path="${STATE_DIR}/tls.key"
+  local tmp_cert tmp_key
+  require_safe_create_state_file_or_absent "$cert_path"
+  require_safe_create_state_file_or_absent "$key_path"
+  if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+    require_private_file "$cert_path"
+    require_private_file "$key_path"
+    return 0
+  fi
+  if [ -f "$cert_path" ] || [ -f "$key_path" ]; then
+    fail "incomplete Redfish TLS state: expected both $cert_path and $key_path"
+  fi
+  tmp_cert="$(mktemp "${STATE_DIR}/.tls.crt.XXXXXX")" ||
+    fail "cannot create temporary TLS certificate in $STATE_DIR"
+  tmp_key="$(mktemp "${STATE_DIR}/.tls.key.XXXXXX")" || {
+    rm -- "$tmp_cert"
+    fail "cannot create temporary TLS key in $STATE_DIR"
+  }
+  if ! openssl req -x509 -newkey rsa:3072 -sha256 -days 365 -nodes \
+    -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+    -keyout "$tmp_key" \
+    -out "$tmp_cert"; then
+    rm -- "$tmp_cert" "$tmp_key"
+    fail "failed to create Redfish TLS certificate"
+  fi
+  chmod 600 "$tmp_key" "$tmp_cert"
+  mv -- "$tmp_cert" "$cert_path"
+  mv -- "$tmp_key" "$key_path"
+}
+
+write_connection_metadata() {
+  write_secret_file "${STATE_DIR}/connection.env" \
+    "REDFISH_ENDPOINT='https://127.0.0.1:8000'
+REDFISH_CA_CERT='${STATE_DIR}/tls.crt'
+REDFISH_CREDENTIALS_FILE='${STATE_DIR}/credentials.env'"
+}
+
+rollback_new_root_volume() {
+  virsh -c "$LIBVIRT_URI" vol-delete --pool "$STORAGE_POOL" "$ROOT_VOLUME_NAME"
+}
+
+create_new_domain() {
+  local root_path
+  create_root_volume
+  if ! root_path="$(virsh -c "$LIBVIRT_URI" vol-path --pool "$STORAGE_POOL" \
+    "$ROOT_VOLUME_NAME")"; then
+    rollback_new_root_volume
+    fail "failed to resolve root volume path for $ROOT_VOLUME_NAME"
+  fi
+  if ! VM_X86_REDFISH_ROOT_VOLUME_PATH="$root_path" ./scripts/render-config domain; then
+    rollback_new_root_volume
+    fail "failed to render domain XML for $DEFAULT_DOMAIN_NAME"
+  fi
+  if ! virsh -c "$LIBVIRT_URI" define "${STATE_DIR}/domain.xml"; then
+    rollback_new_root_volume
+    fail "failed to define libvirt domain $DEFAULT_DOMAIN_NAME"
+  fi
+}
+
+create_vm_transaction() {
+  if validate_or_reject_existing_domain; then
+    create_redfish_runtime_state
+    return 0
+  fi
+  reject_root_volume_collision
+  create_domain_uuid_once
+  create_new_domain
+  create_redfish_runtime_state
+}
+
+with_lifecycle_lock "$LIFECYCLE_LOCK" create_vm_transaction

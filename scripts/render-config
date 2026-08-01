@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="${BASH_SOURCE[0]%/*}"
+repo_dir="$(cd -- "${script_dir}/.." && pwd -P)"
+# shellcheck source=scripts/lib/common
+source "${script_dir}/lib/common"
+
+render_template() {
+  local input="$1"
+  local output="$2"
+  local output_base
+  local output_dir
+  local python_bin
+  local tmp_output
+  python_bin="$(python_313)"
+  output_dir="$(dirname "$output")"
+  output_base="${output##*/}"
+  require_private_dir "$output_dir"
+  require_safe_project_file_or_absent "$output"
+  tmp_output="$(mktemp "${output_dir}/.${output_base}.XXXXXX")" ||
+    fail "cannot create temporary rendered file in $output_dir"
+  if ! "$python_bin" - "$input" "$tmp_output" <<'PY'; then
+import os
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+replacements = {
+    "@DOMAIN_NAME@": os.environ.get("DOMAIN_NAME"),
+    "@DOMAIN_UUID@": os.environ.get("DOMAIN_UUID"),
+    "@ROOT_VOLUME_NAME@": os.environ.get("ROOT_VOLUME_NAME"),
+    "@ROOT_VOLUME_PATH@": os.environ.get("ROOT_VOLUME_PATH"),
+    "@STATE_DIR@": os.environ.get("STATE_DIR"),
+}
+for token, value in replacements.items():
+    if token in source and value is None:
+        print(f"error: unset template value: {token}", file=sys.stderr)
+        sys.exit(1)
+
+rendered = source
+for key, value in replacements.items():
+    if value is not None:
+        rendered = rendered.replace(key, value)
+
+unresolved = re.search(r"@[^@\n]+@", rendered)
+if unresolved:
+    print(f"error: unresolved template token: {unresolved.group()}", file=sys.stderr)
+    sys.exit(1)
+
+pathlib.Path(sys.argv[2]).write_text(rendered, encoding="utf-8")
+PY
+    rm -- "$tmp_output"
+    return 1
+  fi
+  chmod 600 "$tmp_output"
+  mv -- "$tmp_output" "$output"
+}
+
+render_domain() {
+  ensure_private_dir "$STATE_DIR"
+  export DOMAIN_NAME="$DEFAULT_DOMAIN_NAME"
+  export DOMAIN_UUID
+  export ROOT_VOLUME_NAME
+  export ROOT_VOLUME_PATH="${VM_X86_REDFISH_ROOT_VOLUME_PATH:?missing root volume path}"
+  export STATE_DIR
+  DOMAIN_UUID="$(read_domain_uuid)"
+  render_template "${repo_dir}/config/domain.xml" "${STATE_DIR}/domain.xml"
+}
+
+render_sushy() {
+  ensure_private_dir "$STATE_DIR"
+  ensure_private_dir "${STATE_DIR}/sushy"
+  ensure_private_dir "${STATE_DIR}/tmp"
+  export DOMAIN_UUID
+  export STATE_DIR
+  DOMAIN_UUID="$(read_domain_uuid)"
+  render_template "${repo_dir}/config/sushy-emulator.conf.py.in" \
+    "${STATE_DIR}/sushy-emulator.conf.py"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+  domain) render_domain ;;
+  sushy) render_sushy ;;
+  *) fail "usage: scripts/render-config domain|sushy" ;;
+  esac
+fi

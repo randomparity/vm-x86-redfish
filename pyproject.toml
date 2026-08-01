@@ -1,0 +1,23 @@
+[project]
+name = "vm-x86-redfish"
+version = "0.1.0"
+requires-python = "==3.13.*"
+dependencies = [
+  "libvirt-python==12.0.0",
+  "sushy-tools==2.2.0",
+]
+
+[dependency-groups]
+dev = [
+  "pip-audit==2.10.1",
+  "pytest==9.1.1",
+  "ruff==0.16.1",
+  "ty==0.0.65",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ty.rules]
+unresolved-import = "error"

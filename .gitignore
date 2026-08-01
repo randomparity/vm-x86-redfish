@@ -1,0 +1,8 @@
+.artifacts/
+.coverage
+.pytest_cache/
+.state/
+.venv/
+__pycache__/
+*.qcow2
+*.raw

@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="${BASH_SOURCE[0]%/*}"
+# shellcheck source=scripts/lib/common
+source "${script_dir}/lib/common"
+
+check_architecture() {
+  local arch
+  arch="$(uname -m)"
+  [ "$arch" = "x86_64" ] || fail "unsupported architecture $arch; expected x86_64"
+}
+
+check_commands() {
+  need_command virsh "libvirt-client"
+  need_command qemu-system-x86_64 "qemu-system-x86-core"
+  need_command qemu-img "qemu-img"
+  need_command uuidgen "util-linux-core"
+  need_command uv "uv"
+  need_command curl "curl"
+  need_command timeout "coreutils"
+  need_command openssl "openssl"
+  need_command htpasswd "httpd-tools"
+  need_command gcc "gcc"
+  need_command pkg-config "pkgconf-pkg-config"
+  need_command bats "bats"
+  need_command shellcheck "ShellCheck"
+  need_command shfmt "shfmt"
+  need_command grub2-mkrescue "grub2-tools-extra"
+  need_command xorriso "xorriso"
+}
+
+check_libvirt() {
+  local version
+  virsh -c "$LIBVIRT_URI" uri >/dev/null ||
+    fail "cannot connect to $LIBVIRT_URI: enable libvirtd and grant access"
+  version="$(virsh -c "$LIBVIRT_URI" version)"
+  printf '%s\n' "$version" | grep -F "Using library: libvirt 12.0." >/dev/null ||
+    fail "unsupported libvirt version: expected 12.0.x"
+  require_active_network
+  require_running_pool
+}
+
+require_active_network() {
+  local info
+  info="$(virsh -c "$LIBVIRT_URI" net-info default)" ||
+    fail "libvirt default network is unavailable: define it before running create"
+  printf '%s\n' "$info" | grep -E '^Active:[[:space:]]+yes$' >/dev/null ||
+    fail "libvirt default network is inactive: start it with virsh net-start default"
+}
+
+require_running_pool() {
+  local info
+  info="$(virsh -c "$LIBVIRT_URI" pool-info "$STORAGE_POOL")" ||
+    fail "libvirt storage pool '$STORAGE_POOL' is unavailable"
+  printf '%s\n' "$info" | grep -E '^State:[[:space:]]+running$' >/dev/null ||
+    fail "libvirt storage pool '$STORAGE_POOL' is not running"
+}
+
+kvm_device_path() {
+  if integration_override_enabled && [ -n "${VM_X86_REDFISH_DEV_KVM:-}" ]; then
+    printf '%s\n' "$VM_X86_REDFISH_DEV_KVM"
+  else
+    printf '/dev/kvm\n'
+  fi
+}
+
+ovmf_dir_path() {
+  if integration_override_enabled && [ -n "${VM_X86_REDFISH_OVMF_DIR:-}" ]; then
+    printf '%s\n' "$VM_X86_REDFISH_OVMF_DIR"
+  elif [ -d /usr/share/edk2/ovmf ]; then
+    printf '/usr/share/edk2/ovmf\n'
+  else
+    printf '/usr/share/OVMF\n'
+  fi
+}
+
+check_kvm() {
+  local kvm_path
+  kvm_path="$(kvm_device_path)"
+  [ -e "$kvm_path" ] || fail "missing $kvm_path: enable KVM virtualization"
+  if [ ! -r "$kvm_path" ] || [ ! -w "$kvm_path" ]; then
+    fail "cannot read and write $kvm_path: add the user to the kvm group"
+  fi
+}
+
+check_uefi_firmware() {
+  local ovmf_dir
+  ovmf_dir="$(ovmf_dir_path)"
+  [ -d "$ovmf_dir" ] || fail "missing UEFI firmware: install edk2-ovmf"
+}
+
+check_uv_python() {
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - <<'PY' || fail "uv must provide Python 3.13"
+import sys
+raise SystemExit(0 if sys.version_info[:2] == (3, 13) else 1)
+PY
+}
+
+check_native_build_inputs() {
+  local python_bin
+  pkg-config --exists libvirt ||
+    fail "missing libvirt development headers: install libvirt-devel"
+  python_bin="$(python_313)"
+  "$python_bin" - <<'PY' || fail "missing Python 3.13 headers: install python3-devel"
+import pathlib
+import sysconfig
+include = sysconfig.get_config_var("INCLUDEPY")
+raise SystemExit(0 if include and (pathlib.Path(include) / "Python.h").is_file() else 1)
+PY
+}
+
+check_loopback_port() {
+  local port=8000
+  local python_bin
+  if integration_override_enabled &&
+    [ -n "${VM_X86_REDFISH_PORT_CHECK_PORT:-}" ]; then
+    port="$VM_X86_REDFISH_PORT_CHECK_PORT"
+  fi
+  if integration_override_enabled &&
+    [ "${VM_X86_REDFISH_PORT_CHECK_RESULT:-}" = "busy" ]; then
+    fail "127.0.0.1:${port} is already in use"
+  fi
+  python_bin="$(python_313)"
+  "$python_bin" - "$port" <<'PY' || fail "127.0.0.1:${port} is already in use"
+import socket
+import sys
+
+with socket.socket() as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", int(sys.argv[1])))
+    sock.listen()
+PY
+}
+
+check_architecture
+check_commands
+check_kvm
+check_uefi_firmware
+check_uv_python
+check_native_build_inputs
+check_loopback_port
+check_libvirt
+printf 'doctor: host prerequisites are available\n'

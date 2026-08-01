@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034 # Sourced lifecycle scripts consume these shared globals.
+set -euo pipefail
+
+PROJECT_NAME="vm-x86-redfish"
+DEFAULT_DOMAIN_NAME="vm-x86-redfish"
+LIBVIRT_URI="qemu:///system"
+STORAGE_POOL="default"
+STATE_DIR=".state"
+ARTIFACTS_DIR=".artifacts"
+ROOT_VOLUME_NAME="vm-x86-redfish.qcow2"
+DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
+LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing command '$1': install $2"
+}
+
+python_313() {
+  UV_PYTHON_DOWNLOADS=never uv python find 3.13 2>/dev/null ||
+    fail "uv must find Python 3.13 without downloading"
+}
+
+integration_override_enabled() {
+  [ "${VM_X86_REDFISH_INTEGRATION_TEST:-}" = "1" ]
+}
+
+reject_unguarded_override() {
+  local name="$1"
+  if [ -n "${!name:-}" ] && ! integration_override_enabled; then
+    fail "test-only overrides require VM_X86_REDFISH_INTEGRATION_TEST=1"
+  fi
+}
+
+load_runtime_config() {
+  reject_unguarded_override VM_X86_REDFISH_DOMAIN_NAME
+  reject_unguarded_override VM_X86_REDFISH_LIBVIRT_URI
+  reject_unguarded_override VM_X86_REDFISH_STORAGE_POOL
+  reject_unguarded_override VM_X86_REDFISH_ROOT_VOLUME_NAME
+  reject_unguarded_override VM_X86_REDFISH_STATE_DIR
+  reject_unguarded_override VM_X86_REDFISH_ARTIFACTS_DIR
+  DEFAULT_DOMAIN_NAME="${VM_X86_REDFISH_DOMAIN_NAME:-vm-x86-redfish}"
+  LIBVIRT_URI="${VM_X86_REDFISH_LIBVIRT_URI:-qemu:///system}"
+  STORAGE_POOL="${VM_X86_REDFISH_STORAGE_POOL:-default}"
+  STATE_DIR="${VM_X86_REDFISH_STATE_DIR:-.state}"
+  ARTIFACTS_DIR="${VM_X86_REDFISH_ARTIFACTS_DIR:-.artifacts}"
+  ROOT_VOLUME_NAME="${VM_X86_REDFISH_ROOT_VOLUME_NAME:-${DEFAULT_DOMAIN_NAME}.qcow2}"
+  DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
+  LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
+}
+
+load_runtime_config
+
+reject_symlink() {
+  local path="$1"
+  [ ! -L "$path" ] || fail "refusing symlink: $path"
+}
+
+ensure_private_dir() {
+  local path="$1"
+  reject_symlink "$path"
+  mkdir -p "$path"
+  chmod 700 "$path"
+  [ -d "$path" ] || fail "not a directory: $path"
+  [ "$(stat -c '%a' "$path")" = "700" ] || fail "directory must be mode 0700: $path"
+}
+
+require_private_dir() {
+  local path="$1"
+  reject_symlink "$path"
+  [ -d "$path" ] || fail "missing private directory: $path"
+  [ "$(stat -c '%u' "$path")" = "$(id -u)" ] ||
+    fail "directory must be owned by the current user: $path"
+  [ "$(stat -c '%a' "$path")" = "700" ] || fail "directory must be mode 0700: $path"
+}
+
+require_private_file() {
+  local path="$1"
+  reject_symlink "$path"
+  [ -f "$path" ] || fail "missing private file: $path"
+  [ "$(stat -c '%u' "$path")" = "$(id -u)" ] ||
+    fail "file must be owned by the current user: $path"
+  [ "$(stat -c '%a' "$path")" = "600" ] || fail "file must be mode 0600: $path"
+}
+
+canonical_dir() {
+  local path="$1"
+  reject_symlink "$path"
+  [ -d "$path" ] || fail "missing directory: $path"
+  realpath -e "$path"
+}
+
+write_secret_file() {
+  local path="$1"
+  local content="$2"
+  reject_symlink "$path"
+  require_private_dir "$(dirname "$path")"
+  umask 077
+  printf '%s\n' "$content" >"$path"
+  chmod 600 "$path"
+}
+
+require_safe_project_file_or_absent() {
+  local path="$1"
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+    fail "unexpected project state file: $path"
+  fi
+}
+
+read_domain_uuid() {
+  local domain_uuid domain_uuid_regex
+  require_safe_project_file_or_absent "$DOMAIN_UUID_FILE"
+  [ -f "$DOMAIN_UUID_FILE" ] || fail "missing domain UUID file: $DOMAIN_UUID_FILE"
+  domain_uuid="$(<"$DOMAIN_UUID_FILE")"
+  domain_uuid_regex='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'
+  domain_uuid_regex+='[1-5][0-9a-fA-F]{3}-[89aAbB]'
+  domain_uuid_regex+='[0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
+  [[ "$domain_uuid" =~ $domain_uuid_regex ]] ||
+    fail "invalid domain UUID in $DOMAIN_UUID_FILE: expected RFC 4122 UUID"
+  printf '%s\n' "$domain_uuid"
+}
+
+with_lifecycle_lock() {
+  local lock_path="$1"
+  shift
+  reject_symlink "$lock_path"
+  ensure_private_dir "$(dirname "$lock_path")"
+  exec 9>"$lock_path"
+  flock -n 9 || fail "lifecycle lock is held: $lock_path"
+  "$@"
+}
+
+xml_text_equals() {
+  local xml="$1"
+  local namespace="$2"
+  local name="$3"
+  local expected="$4"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$xml" "$namespace" "$name" "$expected" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, namespace, name, expected = sys.argv[1:]
+target = f"{{{namespace}}}{name}" if namespace else name
+root = ET.parse(xml_path).getroot()
+for elem in root.iter(target):
+    if (elem.text or "") == expected:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+xml_metadata_text_equals() {
+  local xml="$1"
+  local namespace="$2"
+  local name="$3"
+  local expected="$4"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$xml" "$namespace" "$name" "$expected" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, namespace, name, expected = sys.argv[1:]
+target = f"{{{namespace}}}{name}" if namespace else name
+root = ET.parse(xml_path).getroot()
+for metadata in root.findall("metadata"):
+    for elem in metadata.findall(target):
+        if (elem.text or "") == expected:
+            raise SystemExit(0)
+    container = f"{{{namespace}}}vm-x86-redfish"
+    for project_metadata in metadata.findall(container):
+        for elem in project_metadata.findall(target):
+            if (elem.text or "") == expected:
+                raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+xml_disk_source_equals() {
+  local xml="$1"
+  local expected="$2"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$xml" "$expected" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, expected = sys.argv[1:]
+root = ET.parse(xml_path).getroot()
+for disk in root.findall(".//disk"):
+    if disk.get("device") != "disk":
+        continue
+    source = disk.find("source")
+    if source is not None and source.get("file") == expected:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+domain_is_project_owned() {
+  local xml="$1"
+  xml_metadata_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+    "project" "vm-x86-redfish"
+}
+
+domain_uuid_matches_state() {
+  local xml="$1"
+  local uuid
+  uuid="$(read_domain_uuid)"
+  xml_text_equals "$xml" "" "uuid" "$uuid"
+}
+
+domain_root_volume_matches_state() {
+  local xml="$1"
+  xml_metadata_text_equals "$xml" "https://github.com/randomparity/vm-x86-redfish" \
+    "root-volume" "$ROOT_VOLUME_NAME"
+}
+
+domain_disk_source_matches() {
+  local xml="$1"
+  local root_path="$2"
+  xml_disk_source_equals "$xml" "$root_path"
+}
+
+domain_shape_matches_expected() {
+  local python_bin
+  local root_path="$2"
+  local xml="$1"
+  python_bin="$(python_313)"
+  "$python_bin" - "$xml" "$DEFAULT_DOMAIN_NAME" "$root_path" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, domain_name, root_path = sys.argv[1:]
+try:
+    root = ET.parse(xml_path).getroot()
+except ET.ParseError:
+    raise SystemExit(1)
+
+def fail():
+    raise SystemExit(1)
+
+def require(condition):
+    if not condition:
+        fail()
+
+def one(elements):
+    require(len(elements) == 1)
+    return elements[0]
+
+def child(parent, name):
+    elem = parent.find(name)
+    require(elem is not None)
+    return elem
+
+def text(parent, name):
+    elem = child(parent, name)
+    return elem.text or ""
+
+require(root.tag == "domain")
+require(root.get("type") == "kvm")
+require(text(root, "name") == domain_name)
+os_elem = child(root, "os")
+boot_entries = os_elem.findall("boot")
+require(len(boot_entries) == 1)
+require(boot_entries[0].get("dev") == "hd")
+devices = child(root, "devices")
+require(not any(True for _ in devices.iter("hostdev")))
+require(not any(True for _ in devices.iter("boot")))
+all_disks = devices.findall("disk")
+disk = one(all_disks)
+require(disk.get("type") == "file")
+require(disk.get("device") == "disk")
+driver = child(disk, "driver")
+require(driver.get("name") == "qemu")
+require(driver.get("type") == "qcow2")
+require(driver.get("discard") == "unmap")
+source = child(disk, "source")
+require(source.get("file") == root_path)
+target = child(disk, "target")
+require(target.get("dev") == "vda")
+require(target.get("bus") == "virtio")
+interface = one(devices.findall("interface"))
+require(interface.get("type") == "network")
+require(child(interface, "source").get("network") == "default")
+require(child(interface, "model").get("type") == "virtio")
+serial = one(devices.findall("serial"))
+serial_target = child(serial, "target")
+require(serial.get("type") == "pty")
+require(serial_target.get("type") == "isa-serial")
+require(serial_target.get("port") == "0")
+require(child(serial_target, "model").get("name") == "isa-serial")
+console = one(devices.findall("console"))
+console_target = child(console, "target")
+require(console.get("type") == "pty")
+require(console_target.get("type") == "serial")
+require(console_target.get("port") == "0")
+channel = one(devices.findall("channel"))
+channel_target = child(channel, "target")
+require(channel.get("type") == "unix")
+require(channel_target.get("type") == "virtio")
+require(channel_target.get("name") == "org.qemu.guest_agent.0")
+graphics = one(devices.findall("graphics"))
+require(graphics.get("type") == "vnc")
+listen = graphics.get("listen")
+listen_elem = graphics.find("listen")
+if listen is None and listen_elem is not None:
+    listen = listen_elem.get("address")
+require(listen == "127.0.0.1")
+video_model = child(one(devices.findall("video")), "model")
+require(video_model.get("type") == "virtio")
+require(text(devices, "emulator") == "/usr/bin/qemu-system-x86_64")
+PY
+}
+
+volume_name_for_media() {
+  local image_url="$1"
+  local domain_uuid="$2"
+  local base
+  image_url="${image_url%%\?*}"
+  base="${image_url##*/}"
+  base="${base//./-}"
+  printf '%s-media-%s-%s.img\n' "$PROJECT_NAME" "$base" "$domain_uuid"
+}

@@ -1,0 +1,8 @@
+serial --unit=0 --speed=115200
+terminal_output serial
+set timeout=10
+
+menuentry 'vm-x86-redfish sentinel' {
+  echo '@SENTINEL@'
+  halt
+}
