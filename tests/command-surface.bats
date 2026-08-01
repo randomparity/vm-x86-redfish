@@ -114,6 +114,40 @@ ${SERIAL_LISTEN_IP_VARIABLE}=192.0.2.10|${SERIAL_LISTEN_PORT_VARIABLE}"
   [[ "$output" == *"$REDFISH_LISTEN_IP_VARIABLE"* ]]
 }
 
+@test "runtime endpoint configuration rejects IPv4-mapped IPv6 literals" {
+  local configuration expected_variable
+  local -a cases=(
+    "${REDFISH_LISTEN_IP_VARIABLE}=::ffff:192.0.2.10|${REDFISH_LISTEN_IP_VARIABLE}"
+    "${SERIAL_MODE_VARIABLE}=tcp,${SERIAL_LISTEN_IP_VARIABLE}=::ffff:c000:20a,""\
+${SERIAL_LISTEN_PORT_VARIABLE}=9000|${SERIAL_LISTEN_IP_VARIABLE}"
+  )
+  for configuration in "${cases[@]}"; do
+    IFS='|' read -r configuration expected_variable <<<"$configuration"
+
+    run_endpoint_case "$configuration"
+
+    [ "$status" -ne 0 ]
+    [ "$output" = \
+      "error: $expected_variable must not be an IPv4-mapped IPv6 address" ]
+  done
+}
+
+@test "mapped IPv6 cannot alias an IPv4 listener on the same port" {
+  run env \
+    VM_X86_REDFISH_LISTEN_IP=::ffff:192.0.2.10 \
+    VM_X86_REDFISH_LISTEN_PORT=9000 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.10 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    bash -c 'source "$1"; reject_listener_collision' \
+    _ "$BATS_TEST_DIRNAME/../scripts/lib/common"
+
+  [ "$status" -ne 0 ]
+  [ "$output" = \
+    "error: VM_X86_REDFISH_LISTEN_IP must not be an IPv4-mapped IPv6 address" ]
+  [[ "$output" != *"same address and port"* ]]
+}
+
 @test "runtime endpoint helpers format IPv6 hosts in URIs" {
   local configuration="${REDFISH_LISTEN_IP_VARIABLE}=2001:db8::10,""\
 ${REDFISH_LISTEN_PORT_VARIABLE}=65535,${SERIAL_MODE_VARIABLE}=tcp,""\

@@ -53,10 +53,11 @@ reject_unguarded_override() {
 canonical_ip_address() {
   local address="$2"
   local canonical_address
+  local canonical_status
   local python_bin
   local variable="$1"
   python_bin="$(python_313)"
-  if ! canonical_address="$(
+  if canonical_address="$(
     "$python_bin" - "$address" <<'PY'
 import ipaddress
 import sys
@@ -68,10 +69,18 @@ except ValueError:
 
 if parsed.is_unspecified or parsed.is_multicast or getattr(parsed, "scope_id", None) is not None:
     raise SystemExit(1)
+if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+    raise SystemExit(2)
 
 print(parsed)
 PY
   )"; then
+    :
+  else
+    canonical_status="$?"
+    if [ "$canonical_status" -eq 2 ]; then
+      fail "$variable must not be an IPv4-mapped IPv6 address"
+    fi
     fail "$variable must be a concrete unicast IP address"
   fi
   printf '%s\n' "$canonical_address"
