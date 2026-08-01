@@ -155,6 +155,55 @@ serial_endpoint() {
   fi
 }
 
+endpoint_address_port() {
+  local address="$1"
+  local port="$2"
+  printf '%s:%s\n' "$(format_uri_host "$address")" "$port"
+}
+
+check_listener_available() {
+  local address="$1"
+  local port="$2"
+  local probe_port="$port"
+  local python_bin
+  local endpoint
+  if integration_override_enabled && [ -n "${VM_X86_REDFISH_PORT_CHECK_PORT:-}" ]; then
+    probe_port="$VM_X86_REDFISH_PORT_CHECK_PORT"
+  fi
+  endpoint="$(endpoint_address_port "$address" "$probe_port")"
+  if integration_override_enabled; then
+    case "${VM_X86_REDFISH_PORT_CHECK_RESULT:-}" in
+    busy) fail "$endpoint is already in use" ;;
+    available) return 0 ;;
+    esac
+  fi
+  python_bin="$(python_313)"
+  "$python_bin" - "$address" "$probe_port" <<'PY' || fail "$endpoint is already in use"
+import socket
+import sys
+
+address, port = sys.argv[1:]
+infos = socket.getaddrinfo(
+    address,
+    int(port),
+    type=socket.SOCK_STREAM,
+    flags=socket.AI_NUMERICHOST | socket.AI_PASSIVE,
+)
+family, socktype, protocol, _, sockaddr = infos[0]
+with socket.socket(family, socktype, protocol) as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(sockaddr)
+    sock.listen()
+PY
+}
+
+reject_listener_collision() {
+  if [ "$SERIAL_MODE" = "tcp" ] && [ "$REDFISH_LISTEN_IP" = "$SERIAL_LISTEN_IP" ] &&
+    [ "$REDFISH_LISTEN_PORT" = "$SERIAL_LISTEN_PORT" ]; then
+    fail "Redfish and TCP serial listeners cannot use the same address and port"
+  fi
+}
+
 warn_network_exposure() {
   if ! address_is_loopback "$REDFISH_LISTEN_IP"; then
     printf 'warning: non-loopback Redfish listener at %s\n' "$(redfish_endpoint)" >&2
@@ -163,6 +212,12 @@ warn_network_exposure() {
     printf 'warning: unauthenticated plaintext TCP serial listener at %s\n' \
       "$(serial_endpoint)" >&2
   fi
+}
+
+print_effective_endpoints() {
+  local prefix="${1:-}"
+  printf '%sRedfish endpoint %s\n' "$prefix" "$(redfish_endpoint)"
+  printf '%sserial endpoint %s\n' "$prefix" "$(serial_endpoint)"
 }
 
 load_runtime_config() {

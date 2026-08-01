@@ -101,8 +101,28 @@ esac
   export VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
 }
 
+install_endpoint_probe_python_mock() {
+  install_mock_command python313 '
+program="$(cat)"
+if [ "$#" -eq 3 ]; then
+  printf "probe %s %s\\n" "$2" "$3" >>"$BATS_TEST_TMPDIR/commands.log"
+  exit 0
+fi
+if [[ "$program" == *"is_loopback"* ]]; then
+  case "$2" in
+    127.*|::1) exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+if [ "$#" -eq 2 ]; then
+  printf "%s\\n" "$2"
+fi
+'
+}
+
 @test "doctor rejects unavailable loopback port 8000" {
   install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
   VM_X86_REDFISH_PORT_CHECK_RESULT=busy run ./scripts/doctor
   [ "$status" -ne 0 ]
   [[ "$output" == *"127.0.0.1:8000 is already in use"* ]]
@@ -173,6 +193,70 @@ esac
 
   VM_X86_REDFISH_PORT_CHECK_PORT="$test_port" run ./scripts/doctor
   [ "$status" -eq 0 ]
+}
+
+@test "doctor probes configured endpoint addresses for IPv4 Redfish and IPv6 TCP serial" {
+  local doctor_output
+  install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=8443 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=2001:db8::20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/doctor
+
+  [ "$status" -eq 0 ]
+  doctor_output="$output"
+  run grep -F "probe 192.0.2.20 8443" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -eq 0 ]
+  run grep -F "probe 2001:db8::20 9000" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -eq 0 ]
+  [[ "$doctor_output" == *"doctor: Redfish endpoint https://192.0.2.20:8443"* ]]
+  [[ "$doctor_output" == *"doctor: serial endpoint tcp://[2001:db8::20]:9000"* ]]
+}
+
+@test "doctor prints default endpoints without exposure warnings" {
+  install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
+
+  run ./scripts/doctor
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"doctor: Redfish endpoint https://127.0.0.1:8000"* ]]
+  [[ "$output" == *"doctor: serial endpoint libvirt-console://vm-x86-redfish/serial0"* ]]
+  [[ "$output" != *"warning:"* ]]
+}
+
+@test "doctor warns about configured endpoint exposure" {
+  install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=2001:db8::20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/doctor
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"warning: non-loopback Redfish listener at https://192.0.2.20:8000"* ]]
+  [[ "$output" == *"unauthenticated plaintext TCP serial listener at tcp://[2001:db8::20]:9000"* ]]
+}
+
+@test "doctor rejects colliding configured listener tuples" {
+  install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=9000 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Redfish and TCP serial listeners cannot use the same address and port"* ]]
 }
 
 @test "doctor reports missing uuidgen with Fedora package hint" {

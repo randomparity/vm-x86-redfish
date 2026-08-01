@@ -259,7 +259,8 @@ PY
     install_create_success_mocks
     : >"$BATS_TEST_TMPDIR/commands.log"
 
-    VM_X86_REDFISH_LISTEN_IP="$address" run ./scripts/create-vm
+    VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+      VM_X86_REDFISH_LISTEN_IP="$address" run ./scripts/create-vm
 
     [ "$status" -eq 0 ]
     run grep -F "subjectAltName=${expected_san}" "$BATS_TEST_TMPDIR/commands.log"
@@ -276,7 +277,8 @@ PY
   printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
   chmod 600 "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
 
-  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 run ./scripts/create-vm
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_LISTEN_IP=192.0.2.20 run ./scripts/create-vm
 
   [ "$status" -eq 0 ]
   run grep -F "x509 -checkip 192.0.2.20 -noout" "$BATS_TEST_TMPDIR/commands.log"
@@ -295,7 +297,8 @@ PY
   domain_uuid_before="$(<"$VM_X86_REDFISH_STATE_DIR/domain-uuid")"
   key_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")"
 
-  VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS=1 \
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS=1 \
     VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
     run ./scripts/create-vm
 
@@ -319,7 +322,8 @@ PY
   cert_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")"
   key_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")"
 
-  VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS=1 \
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS=1 \
     VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
     run ./scripts/create-vm
 
@@ -396,7 +400,8 @@ printf "%s|%s|%s|%s|%s\\n" \
   local connection_path
   install_create_success_mocks
 
-  VM_X86_REDFISH_LISTEN_IP=2001:db8::20 \
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_LISTEN_IP=2001:db8::20 \
     VM_X86_REDFISH_LISTEN_PORT=8443 \
     VM_X86_REDFISH_SERIAL_MODE=tcp \
     VM_X86_REDFISH_SERIAL_LISTEN_IP=2001:db8::21 \
@@ -433,6 +438,146 @@ printf "%s|%s|%s\\n" "$REDFISH_ENDPOINT" "$SERIAL_TRANSPORT" "$SERIAL_ENDPOINT"
     run ./scripts/create-vm
 
   [ "$status" -eq 0 ]
+}
+
+@test "create-vm warns about configured endpoint exposure" {
+  install_create_success_mocks
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=8443 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=2001:db8::20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"warning: non-loopback Redfish listener at https://192.0.2.20:8443"* ]]
+  [[ "$output" == *"unauthenticated plaintext TCP serial listener at tcp://[2001:db8::20]:9000"* ]]
+  [[ "$output" == *"create: Redfish endpoint https://192.0.2.20:8443"* ]]
+  [[ "$output" == *"create: serial endpoint tcp://[2001:db8::20]:9000"* ]]
+}
+
+@test "create-vm rejects a busy Redfish listener before libvirt mutation" {
+  install_create_success_mocks
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=busy \
+    VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=8443 \
+    run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"192.0.2.20:8443 is already in use"* ]]
+  run grep -F "virsh " "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm rejects colliding configured listener tuples before libvirt mutation" {
+  install_create_success_mocks
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=9000 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Redfish and TCP serial listeners cannot use the same address and port"* ]]
+  run grep -F "virsh " "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm rejects a busy TCP serial listener before defining a new domain" {
+  local listener_pid port_file redfish_port serial_port
+  local python_bin
+  python_bin="$(UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+  port_file="$BATS_TEST_TMPDIR/serial-listener.port"
+  "$python_bin" - "$port_file" <<'PY' &
+import pathlib
+import signal
+import socket
+import sys
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    pathlib.Path(sys.argv[1]).write_text(str(server.getsockname()[1]))
+    signal.pause()
+PY
+  listener_pid="$!"
+  wait_for_file "$port_file"
+  serial_port="$(<"$port_file")"
+  redfish_port="$(
+    "$python_bin" - <<'PY'
+import socket
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    print(server.getsockname()[1])
+PY
+  )"
+  install_create_success_mocks
+
+  VM_X86_REDFISH_LISTEN_PORT="$redfish_port" \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=127.0.0.1 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT="$serial_port" \
+    run ./scripts/create-vm
+  create_status="$status"
+  create_output="$output"
+  kill "$listener_pid"
+  wait "$listener_pid" || :
+
+  [ "$create_status" -ne 0 ]
+  [[ "$create_output" == *"127.0.0.1:${serial_port} is already in use"* ]]
+  run grep -F "vol-create-as" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm accepts an active matching TCP serial domain without probing its listener" {
+  local listener_pid port_file redfish_port serial_port
+  local python_bin
+  python_bin="$(UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+  port_file="$BATS_TEST_TMPDIR/serial-listener.port"
+  "$python_bin" - "$port_file" <<'PY' &
+import pathlib
+import signal
+import socket
+import sys
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    pathlib.Path(sys.argv[1]).write_text(str(server.getsockname()[1]))
+    signal.pause()
+PY
+  listener_pid="$!"
+  wait_for_file "$port_file"
+  serial_port="$(<"$port_file")"
+  redfish_port="$(
+    "$python_bin" - <<'PY'
+import socket
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    print(server.getsockname()[1])
+PY
+  )"
+  install_existing_domain_mocks tcp 127.0.0.1 "$serial_port"
+
+  VM_X86_REDFISH_LISTEN_PORT="$redfish_port" \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=127.0.0.1 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT="$serial_port" \
+    run ./scripts/create-vm
+  create_status="$status"
+  create_output="$output"
+  kill "$listener_pid"
+  wait "$listener_pid" || :
+
+  [ "$create_status" -eq 0 ]
+  [[ "$create_output" == *"create: serial endpoint tcp://127.0.0.1:${serial_port}"* ]]
 }
 
 @test "create-vm rejects incompatible serial transports before rewriting runtime state" {

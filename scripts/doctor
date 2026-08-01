@@ -112,27 +112,12 @@ raise SystemExit(0 if include and (pathlib.Path(include) / "Python.h").is_file()
 PY
 }
 
-check_loopback_port() {
-  local port=8000
-  local python_bin
-  if integration_override_enabled &&
-    [ -n "${VM_X86_REDFISH_PORT_CHECK_PORT:-}" ]; then
-    port="$VM_X86_REDFISH_PORT_CHECK_PORT"
+check_configured_listeners() {
+  reject_listener_collision
+  check_listener_available "$REDFISH_LISTEN_IP" "$REDFISH_LISTEN_PORT"
+  if [ "$SERIAL_MODE" = "tcp" ]; then
+    check_listener_available "$SERIAL_LISTEN_IP" "$SERIAL_LISTEN_PORT"
   fi
-  if integration_override_enabled &&
-    [ "${VM_X86_REDFISH_PORT_CHECK_RESULT:-}" = "busy" ]; then
-    fail "127.0.0.1:${port} is already in use"
-  fi
-  python_bin="$(python_313)"
-  "$python_bin" - "$port" <<'PY' || fail "127.0.0.1:${port} is already in use"
-import socket
-import sys
-
-with socket.socket() as sock:
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", int(sys.argv[1])))
-    sock.listen()
-PY
 }
 
 check_architecture
@@ -141,6 +126,8 @@ check_kvm
 check_uefi_firmware
 check_uv_python
 check_native_build_inputs
-check_loopback_port
+warn_network_exposure
+check_configured_listeners
 check_libvirt
+print_effective_endpoints 'doctor: '
 printf 'doctor: host prerequisites are available\n'

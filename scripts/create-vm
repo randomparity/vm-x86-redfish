@@ -328,15 +328,23 @@ create_new_domain() {
 }
 
 create_vm_transaction() {
+  warn_network_exposure
+  reject_listener_collision
+  check_listener_available "$REDFISH_LISTEN_IP" "$REDFISH_LISTEN_PORT"
   validate_existing_tls
   if validate_or_reject_existing_domain; then
     create_redfish_runtime_state
+    print_effective_endpoints 'create: '
     return 0
+  fi
+  if [ "$SERIAL_MODE" = "tcp" ]; then
+    check_listener_available "$SERIAL_LISTEN_IP" "$SERIAL_LISTEN_PORT"
   fi
   reject_root_volume_collision
   create_domain_uuid_once
   create_new_domain
   create_redfish_runtime_state
+  print_effective_endpoints 'create: '
 }
 
 validate_create_config
