@@ -377,7 +377,7 @@ start_remote_sushy() {
 }
 
 namespace_exec() {
-  nsenter --target "$REMOTE_NAMESPACE_PID" --user --net "$@"
+  nsenter --target "$REMOTE_NAMESPACE_PID" --user --net --preserve-credentials "$@"
 }
 
 namespace_curl() {
@@ -735,7 +735,7 @@ run_namespace_smoke_client() {
   local server_status
   port="$(<"$NAMESPACE_SMOKE_DIR/server.port")"
   if timeout --kill-after=2 15 nsenter \
-    --target "$NAMESPACE_SMOKE_NAMESPACE_PID" --user --net \
+    --target "$NAMESPACE_SMOKE_NAMESPACE_PID" --user --net --preserve-credentials \
     "$NAMESPACE_SMOKE_PYTHON" - "$NAMESPACE_SMOKE_ADDRESS" "$port" <<'PY'; then
 import socket
 import sys
@@ -1515,7 +1515,7 @@ printf "%s\n" "$*" >"$BATS_TEST_TMPDIR/smoke-nsenter.args"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --target) shift 2 ;;
-    --user | --net) shift ;;
+    --user | --net | --preserve-credentials) shift ;;
     *) break ;;
   esac
 done
@@ -1541,7 +1541,7 @@ esac
   [ "$status" -ne 0 ]
   run grep -F -- '--disable-host-loopback' "$BATS_TEST_TMPDIR/smoke-slirp.args"
   [ "$status" -eq 0 ]
-  run grep -F -- "--target $namespace_pid --user --net" \
+  run grep -F -- "--target $namespace_pid --user --net --preserve-credentials" \
     "$BATS_TEST_TMPDIR/smoke-nsenter.args"
   [ "$status" -eq 0 ]
 }
@@ -1596,8 +1596,9 @@ esac
   run namespace_exec curl https://192.0.2.10:8443/redfish/v1
 
   [ "$status" -eq 0 ]
-  [ "$output" = \
-    "--target 4242 --user --net curl https://192.0.2.10:8443/redfish/v1" ]
+  expected="--target 4242 --user --net --preserve-credentials "
+  expected+="curl https://192.0.2.10:8443/redfish/v1"
+  [ "$output" = "$expected" ]
 }
 
 @test "bind-collision classification accepts only configured attempt endpoints" {
