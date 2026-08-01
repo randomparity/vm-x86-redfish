@@ -4,10 +4,10 @@ Status: Accepted
 
 ## Purpose
 
-Build a local x86_64 virtual machine that behaves like a bare-metal server managed through
-Redfish. A developer or automation client must be able to discover the server, inspect and
-change its power state, select its next boot device, and attach installation media without
-using `virsh` directly.
+Build an x86_64 virtual machine that behaves like a bare-metal server managed through Redfish.
+A developer or test automation client must be able to discover the server, inspect and change
+its power state, select its next boot device, attach installation media, and consume diagnostic
+serial output without using `virsh` directly for management actions.
 
 The first release targets Fedora 44 hosts and `qemu:///system`. It is a development and test
 tool, not a production BMC.
@@ -15,9 +15,10 @@ tool, not a production BMC.
 ## Goals
 
 - Define one project-owned libvirt domain backed by KVM and QEMU.
-- Serve a TLS-enabled Redfish endpoint on loopback and authenticate protected resources.
+- Serve a TLS-enabled Redfish endpoint on an explicitly configured address and authenticate
+  protected resources.
 - Expose only the project-owned domain through Redfish.
-- Support power on, forced power off, and forced restart.
+- Support `On`, `ForceOff`, `ForceRestart`, and `Nmi` reset actions.
 - Support `Hdd`, `Cd`, and `Pxe` boot overrides.
 - Insert and eject HTTP- or HTTPS-hosted virtual CD media.
 - Make creation, verification, and removal idempotent and safe around unrelated libvirt
@@ -30,7 +31,7 @@ tool, not a production BMC.
 - Multiple managed VMs, alternate hypervisors, or remote libvirt hosts.
 - PXE infrastructure, operating-system installation automation, or guest SSH setup.
 - Graceful shutdown verification before a guest operating system is installed.
-- Redfish schema extensions, production deployment, or externally reachable management.
+- Redfish schema extensions, production deployment, or a new authorization model.
 - Secure Boot control, firmware updates, sensors, RAID emulation, or a web interface.
 
 ## Architecture
@@ -38,7 +39,7 @@ tool, not a production BMC.
 ```text
 Redfish client
     |
-    | HTTPS on 127.0.0.1:8000; Basic authentication on protected resources
+    | HTTPS on configured concrete IP and port; Basic authentication on protected resources
     v
 Sushy Emulator 2.2.0 (Python 3.13, vmedia feature set)
     |
@@ -87,13 +88,45 @@ missing dependencies. It must not install packages or alter host configuration. 
 - active `default` network and storage pool;
 - Python 3.13 through `uv`, plus `curl`, `openssl`, `htpasswd`, Bats, ShellCheck,
   shfmt, `grub2-mkrescue`, and `xorriso`;
-- availability of TCP port 8000 on loopback.
+- availability of the configured Redfish listener and, in TCP serial mode, the configured
+  serial listener.
 
 Other libvirt versions are unsupported until their matching Python binding and integration
 suite have been verified and this specification and lock file have been updated. The scripts
 must fail with actionable diagnostics rather than changing libvirt networks, pools,
 permissions, SELinux policy, or packages. On Fedora 44, `htpasswd` is supplied by
 `httpd-tools`; the doctor reports package names but never installs them.
+
+When `VM_X86_REDFISH_INTEGRATION_TEST=1` is set, doctor also requires `cpio`, a readable
+kernel image and kernel configuration matching `uname -r`, `CONFIG_X86_64`, `CONFIG_HAVE_NMI`,
+`CONFIG_BLK_DEV_INITRD`, `CONFIG_PROC_FS`, `CONFIG_PROC_SYSCTL`, `CONFIG_BINFMT_ELF`,
+`CONFIG_PRINTK`, and `CONFIG_SERIAL_8250_CONSOLE`, plus a compiler that can statically link a
+PID 1. These are prerequisites for the NMI initramfs fixture, not ordinary create/doctor use.
+
+### Endpoint configuration
+
+The create-time endpoint inputs are:
+
+- `VM_X86_REDFISH_LISTEN_IP`, default `127.0.0.1`;
+- `VM_X86_REDFISH_LISTEN_PORT`, default `8000`;
+- `VM_X86_REDFISH_SERIAL_MODE`, `pty` by default and otherwise `tcp`;
+- `VM_X86_REDFISH_SERIAL_LISTEN_IP`, required only for `tcp`; and
+- `VM_X86_REDFISH_SERIAL_LISTEN_PORT`, required only for `tcp`.
+
+Each address is parsed as a concrete IPv4 or IPv6 literal. Hostnames, unspecified addresses,
+multicast addresses, and scoped IPv6 addresses are rejected. Each port is a decimal integer
+from 1 through 65535. PTY mode rejects the TCP-only variables; TCP mode requires both. A TCP
+serial address/port tuple cannot equal the Redfish tuple. Values are canonicalized before they
+are used in configuration, XML, certificates, diagnostics, or shell metadata. IPv6 hosts in
+published URIs are bracketed.
+
+The defaults retain a loopback Redfish listener and a libvirt PTY console. Selecting a
+non-loopback Redfish address emits `warning: non-loopback Redfish listener at <endpoint>` from
+doctor and create. Selecting TCP serial always emits
+`warning: unauthenticated plaintext TCP serial listener at <endpoint>`. The project does not
+configure routing or firewall rules: the local operator owns the exposure decision and network
+policy. TCP serial has no authentication or encryption and is appropriate only for isolated
+test networks.
 
 ## VM Definition
 
@@ -105,10 +138,16 @@ The fixed domain name is `vm-x86-redfish`. Its definition contains:
 - one managed qcow2 volume in the `default` pool, copied from an operator-selected qcow2
   image and resized to a configurable capacity (40 GiB by default);
 - one virtio NIC attached to the active `default` network;
-- one emulated 16550A serial device at COM1 with a matching libvirt console target named
-  `serial0`; no virtio console;
+- exactly one emulated 16550A serial device at COM1 and one matching console target named
+  `serial0`; no virtio console. PTY mode renders `serial type='pty'` and `console type='pty'`.
+  TCP mode renders both as `type='tcp'`, each with `source mode='bind' host='<configured IP>'`
+  and `service='<configured port>'`, `protocol type='raw'`, and the same COM1/`serial0`
+  targets;
 - no permanently attached CD-ROM; Sushy adds and removes virtual media;
-- namespaced libvirt metadata identifying project ownership and the exact root-volume name.
+- namespaced libvirt metadata identifying project ownership and the exact root-volume name,
+  configured memory, disk size, source-image digest, serial mode, serial listen IP, and serial
+  listen port. PTY serial address and port metadata are empty; TCP metadata repeats the
+  canonical TCP endpoint.
 
 The create-time inputs are `VM_X86_REDFISH_SOURCE_IMAGE`,
 `VM_X86_REDFISH_MEMORY_MIB`, and `VM_X86_REDFISH_ROOT_DISK_GIB`. The source image is
@@ -121,7 +160,9 @@ Creation generates a UUID once and records it in `.state/domain-uuid`. If a reso
 the fixed name already exists without matching ownership metadata and UUID, creation fails.
 Re-running creation validates the existing definition and repairs only missing project-owned
 runtime files; it does not overwrite divergent VM hardware. Namespaced metadata records the
-configured memory, disk size, and source-image digest so incompatible reruns fail.
+configured memory, disk size, source-image digest, and serial contract so incompatible reruns
+fail. A serial-mode, serial-address, serial-port, or serial-device mismatch tells the operator
+to destroy and recreate the project-owned domain.
 
 If domain definition fails after creating the disk, creation deletes that exact new volume.
 It never modifies the existing `ubuntu25.10` domain or any host network or pool.
@@ -151,20 +192,27 @@ running, a second service invocation fails immediately, and service startup cann
 creation or destruction. The generated Sushy configuration must set:
 
 - `SUSHY_EMULATOR_LIBVIRT_URI = "qemu:///system"`;
-- `SUSHY_EMULATOR_LISTEN_IP = "127.0.0.1"` and port `8000`;
+- `SUSHY_EMULATOR_LISTEN_IP` and `SUSHY_EMULATOR_LISTEN_PORT` from the canonical configured
+  Redfish endpoint;
 - `SUSHY_EMULATOR_FEATURE_SET = "vmedia"`;
 - `SUSHY_EMULATOR_ALLOWED_INSTANCES` to the generated domain UUID only;
 - `SUSHY_EMULATOR_VMEDIA_DEVICES` to a single `Cd` device;
 - `SUSHY_EMULATOR_STORAGE_POOL = "default"`;
 - a private persistent state directory, TLS certificate and key, and htpasswd file.
 
-Creation generates a self-signed certificate valid for `localhost` and `127.0.0.1`, plus a
-fixed local username `admin` and a random password. It writes the recoverable values as
-shell-escaped `REDFISH_USERNAME` and `REDFISH_PASSWORD` assignments in
+Creation generates a self-signed certificate with SANs for `localhost`, `127.0.0.1`, and the
+configured Redfish IP address, deduplicating the loopback address. On reuse, it verifies the
+configured address with `openssl x509 -checkip`; if the SAN is absent, creation fails with
+destroy/recreate remediation rather than silently replacing a trusted identity. A fixed local
+username `admin` and random password are written as shell-escaped `REDFISH_USERNAME` and
+`REDFISH_PASSWORD` assignments in
 `.state/credentials.env`, then derives `.state/htpasswd` from that file. Secret-bearing files
 use mode `0600`; state directories use `0700`. The password is not printed or committed.
-`.state/connection.env` contains the endpoint, certificate path, and credentials-file path so
-clients and agents can locate, but need not duplicate, the secret.
+`.state/connection.env` is mode `0600` and contains shell-quoted `REDFISH_ENDPOINT`,
+`REDFISH_CA_CERT`, `REDFISH_CREDENTIALS_FILE`, `SERIAL_TRANSPORT`, and `SERIAL_ENDPOINT` so
+clients can source it without duplicating secrets. `SERIAL_ENDPOINT` is
+`libvirt-console://<domain>/serial0` in PTY mode and `tcp://host:port` in TCP mode; IPv6 URI
+hosts are bracketed. The standard domain uses `libvirt-console://vm-x86-redfish/serial0`.
 
 `make redfish` sets `TMPDIR` to the canonical `.state/tmp` directory before starting Sushy.
 This contains downloaded virtual media and crash leftovers inside project-owned state. The
@@ -188,10 +236,11 @@ requests while the VM is running, but they do not affect the current process. Th
 client sequence is force off, change media or boot configuration, then power on. Tests follow
 that sequence and do not require Sushy to reject changes submitted while the VM is active.
 
-The verified reset actions are `On`, `ForceOff`, and `ForceRestart`. Sushy may advertise
-additional reset types, but they are outside the initial acceptance contract. In particular,
-`GracefulShutdown` cannot be verified against the blank disk because no guest agent or
-operating system is present.
+The verified reset actions are `On`, `ForceOff`, `ForceRestart`, and `Nmi`. The pinned Sushy
+2.2.0 boundary is tested to advertise `Nmi`, forward it through the reset handler, and invoke
+libvirt `injectNMI()` for an active domain (with no NMI injection for an inactive domain).
+`GracefulShutdown` remains unverified because the blank-disk fixture has no guest agent or
+installed operating system.
 
 ## Virtual Media Storage
 
@@ -211,10 +260,10 @@ filenames are covered by cleanup tests. Once the lifecycle lock is held, destruc
 enumerated temporary-media files beneath the canonical, non-symlink `.state/tmp` and removes
 the directory only when it is empty. It never uses an unchecked recursive deletion.
 
-Because authenticated Redfish users can cause server-side URL fetches, the endpoint remains
-loopback-only. Virtual-media TLS verification is enabled. The documentation warns that media
-URLs are trusted local test inputs and that supplied media credentials may persist in the
-private Sushy state directory.
+Authenticated Redfish users can cause server-side URL fetches. Virtual-media TLS verification
+is enabled, but remote Redfish exposure is an explicit local-operator decision. Media URLs are
+trusted test inputs, and supplied media credentials may persist in the private Sushy state
+directory.
 
 ## Commands
 
@@ -225,8 +274,9 @@ private Sushy state directory.
   private temporary directory.
 - `make test`: run offline Bats tests, ShellCheck, shfmt verification, and configuration
   validation.
-- `make test-integration`: exercise isolated, test-owned libvirt and Redfish resources;
-  disabled unless explicitly invoked.
+- `make test-integration`: exercise isolated, test-owned libvirt resources, both serial
+  transports, remote Redfish reachability, and NMI behavior; disabled unless explicitly
+  invoked.
 - `make destroy`: acquire the lifecycle lock without waiting and refuse if Redfish is running;
   otherwise hold the lock through cleanup, undefine only the owned domain, remove its NVRAM
   and UUID-scoped volumes, and retain logs needed to diagnose cleanup failures. It never
@@ -234,64 +284,43 @@ private Sushy state directory.
 
 ## Verification
 
-Offline tests mock only command boundaries and cover missing tools, malformed state, name
-collisions, mismatched ownership, reruns, and failures between disk creation and domain
-definition. Every handled error path has a test.
+Offline tests mock only command boundaries and cover missing tools, malformed endpoint input,
+listener collisions, TLS SAN reuse, sourceable connection metadata, PTY/TCP XML shape and
+metadata, ownership, reruns, NMI dependency mapping, and failures between disk creation and
+domain definition. Every handled error path has a test.
+
+`make test-integration` requires the integration doctor checks above, a non-root outer user,
+`unshare`, `nsenter`, `slirp4netns`, and `readlink`, working unprivileged user/network
+namespaces, and a bindable non-loopback IPv4 route source. Before it mutates libvirt, the
+harness creates a rootless user/network namespace, proves its network-namespace inode differs
+from the host's, starts slirp with host-loopback disabled, and requires a networking smoke
+probe to traverse that context. A missing prerequisite is an explicit preflight failure.
 
 The integration suite uses only the random test resources described above. It retains the
-exact PIDs of the Sushy, media-server, and asynchronous Redfish-client children it starts. A
-trap applies bounded termination and wait operations to only those children before attempting
-resource cleanup. It:
+exact PIDs of Sushy, media servers, namespaces, slirp processes, and serial clients. A trap
+applies bounded termination and wait operations to only those children before resource cleanup.
+The standard arm creates and validates the powered-off domain, proves TLS/authentication and
+the existing `On`, `ForceRestart`, and `ForceOff` behavior, exercises virtual media and boot
+overrides, captures a COM1 serial sentinel, and checks interruption cleanup.
 
-1. Creates the powered-off domain twice and proves the second run makes no changes.
-2. Starts Sushy, verifies the self-signed TLS certificate, confirms that the service root is
-   public, and confirms that `/Systems` rejects missing credentials.
-3. Authenticates and confirms the Systems collection contains exactly the recorded UUID.
-4. Exercises `On`, `ForceRestart`, and `ForceOff` through `ComputerSystem.Reset`, polling
-   boundedly for each expected state.
-5. Renders `tests/fixtures/grub.cfg.in` with a run-specific sentinel. The GRUB configuration
-   selects serial unit 0 at 115200 baud, waits ten seconds for console attachment, prints the
-   sentinel, and halts. `grub2-mkrescue` and `xorriso` build a temporary UEFI-bootable ISO
-   containing that configuration. The domain XML and preflight checks confirm that serial unit
-   0 is the COM1 `serial0` console, not a virtio console.
-6. Starts a test-owned HTTP server on a kernel-selected loopback port, inserts its ISO through
-   Redfish, selects `Cd`, and verifies the copied pool volume and first boot order in inactive
-   domain XML.
-7. Powers on through Redfish, polls until libvirt reports the domain running, then immediately
-   attaches `virsh console --devname serial0 --force` under a 60-second timeout. The test
-   requires the exact sentinel in captured serial output; timeout or VM exit without it fails
-   the test.
-8. Forces the VM off, ejects the media, and verifies that the CD device disappears from domain
-   XML. It then exercises `Hdd` and `Pxe` overrides and verifies their inactive XML.
-9. Starts a second insertion request asynchronously and records its exact PID while the media
-   server returns a throttled response. After a file appears beneath the test `TMPDIR`, it
-   terminates only its Sushy child to simulate interruption. It waits boundedly for the client
-   to fail; if the client remains alive, it terminates and waits for that exact PID.
-10. Terminates and waits for its remaining exact child PIDs, runs locked destruction, and
-    proves the domain, root disk, NVRAM, partial temporary download, manifest-owned project
-    media volumes for the recorded UUID, and temporary state are absent while the developer
-    domain and unrelated libvirt resources remain unchanged.
+The remote NMI arm runs once with PTY serial and once with TCP serial. For each transport it:
 
-All polling and child-process termination have explicit timeouts. A test failure copies
-diagnostic logs to `.artifacts/<test-id>/`, then performs best-effort cleanup of resources that
-pass the test-run ownership checks. Failure to prove ownership leaves the resource in place
-and reports the exact manual inspection command.
+1. Allocates fresh ports on a concrete non-loopback host IPv4 address and creates the isolated
+   domain. TCP adds a raw bind-mode serial listener; PTY retains the libvirt console.
+2. Starts Sushy, creates the second network context, proves that it cannot reach a host-loopback
+   control listener, and fetches the Systems collection through TLS-authenticated Redfish from
+   that context.
+3. Builds the matching-kernel/initramfs NMI fixture, inserts it through Redfish, selects CD
+   boot, powers on, and captures `NMI_READY` from `virsh console` for PTY or from a raw TCP
+   serial client in the second network context for TCP.
+4. Posts `{"ResetType":"Nmi"}` through remote Redfish, then requires `Kernel panic`, a second
+   `NMI_READY`, and the restarted running domain. HTTP success alone is insufficient.
+5. Stops and waits for exact children, destroys only verified owned resources, verifies removal
+   of the domain, root volume, UUID-scoped media volumes, NVRAM, listeners, and test state, and
+   confirms unrelated libvirt inventory is unchanged.
 
-## Delivery Sequence
-
-1. Add `.gitignore`, the pinned `uv` project, Make targets, static checks, and failing Bats
-   tests.
-2. Implement `doctor`, domain rendering, ownership metadata, test isolation, creation, and
-   rollback.
-3. Generate private TLS, recoverable authentication, Sushy configuration and temporary state,
-   and the lifecycle lock.
-4. Add authenticated Redfish discovery and power-control integration tests.
-5. Add the UEFI serial-sentinel fixture, boot overrides, virtual media, media-volume cleanup,
-   and destruction tests.
-6. Update `README.md` with the verified workflow and limitations.
-
-The first implementation checkpoint is the serial-sentinel integration test proving that
-Sushy 2.2.0 can upload virtual media to the system libvirt pool and boot the Fedora 44
-q35/UEFI domain under enforcing SELinux. Failure at that checkpoint stops implementation; it
-does not introduce a second backend. The specification must then be revised to select either
-a session libvirt domain or a dedicated service identity.
+A proven Redfish bind collision retries either arm with fresh endpoints up to three attempts;
+a proven TCP-serial bind collision retries the TCP arm the same way. Non-collision failures do
+not retry. All polling and child-process termination have explicit timeouts. Test failures
+retain diagnostics in `.artifacts/<test-id>/`; a failure to prove ownership leaves the resource
+in place and reports the exact manual inspection command.
