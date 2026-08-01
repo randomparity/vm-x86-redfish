@@ -79,8 +79,9 @@ check_kvm() {
   local kvm_path
   kvm_path="$(kvm_device_path)"
   [ -e "$kvm_path" ] || fail "missing $kvm_path: enable KVM virtualization"
-  [ -r "$kvm_path" ] && [ -w "$kvm_path" ] ||
+  if [ ! -r "$kvm_path" ] || [ ! -w "$kvm_path" ]; then
     fail "cannot read and write $kvm_path: add the user to the kvm group"
+  fi
 }
 
 check_uefi_firmware() {
