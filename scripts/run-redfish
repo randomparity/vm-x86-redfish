@@ -18,16 +18,151 @@ require_redfish_runtime_state() {
   done
 }
 
+decode_connection_value() {
+  local encoded="$1"
+  local inner
+  local remainder
+  local separator="'\\''"
+  [ "${#encoded}" -ge 2 ] || return 1
+  [ "${encoded:0:1}" = "'" ] && [ "${encoded: -1}" = "'" ] || return 1
+  inner="${encoded:1:${#encoded}-2}"
+  remainder="${inner//"$separator"/}"
+  [[ "$remainder" != *"'"* ]] || return 1
+  printf '%s\n' "${inner//"$separator"/\'}"
+}
+
+read_connection_metadata() {
+  local key line value
+  local path="${STATE_DIR}/connection.env"
+  local assignment_regex='^([A-Z_]+)=(.*)$'
+  local -a required_keys=(
+    REDFISH_ENDPOINT
+    REDFISH_CA_CERT
+    REDFISH_CREDENTIALS_FILE
+    SERIAL_TRANSPORT
+    SERIAL_ENDPOINT
+  )
+  local -A values=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ $assignment_regex ]] ||
+      fail "malformed Redfish connection metadata: $path"
+    key="${BASH_REMATCH[1]}"
+    case "$key" in
+    REDFISH_ENDPOINT | REDFISH_CA_CERT | REDFISH_CREDENTIALS_FILE | \
+      SERIAL_TRANSPORT | SERIAL_ENDPOINT) ;;
+    *) fail "malformed Redfish connection metadata: $path" ;;
+    esac
+    [[ ! -v 'values[$key]' ]] || fail "duplicate $key in $path"
+    if ! value="$(decode_connection_value "${BASH_REMATCH[2]}")"; then
+      fail "malformed Redfish connection metadata: $path"
+    fi
+    values[$key]="$value"
+  done <"$path"
+  for key in "${required_keys[@]}"; do
+    [[ -v 'values[$key]' ]] || fail "missing $key in $path"
+  done
+  PERSISTED_REDFISH_ENDPOINT="${values[REDFISH_ENDPOINT]}"
+  PERSISTED_REDFISH_CA_CERT="${values[REDFISH_CA_CERT]}"
+  PERSISTED_REDFISH_CREDENTIALS_FILE="${values[REDFISH_CREDENTIALS_FILE]}"
+  PERSISTED_SERIAL_TRANSPORT="${values[SERIAL_TRANSPORT]}"
+  PERSISTED_SERIAL_ENDPOINT="${values[SERIAL_ENDPOINT]}"
+}
+
+parse_endpoint_uri() {
+  local authority
+  local scheme="$1"
+  local uri="$2"
+  authority="${uri#"${scheme}://"}"
+  [ "$authority" != "$uri" ] || fail "malformed persisted endpoint: $uri"
+  if [[ "$authority" =~ ^\[([^][]+)\]:([0-9]+)$ ]]; then
+    PERSISTED_ENDPOINT_IP="${BASH_REMATCH[1]}"
+    PERSISTED_ENDPOINT_PORT="${BASH_REMATCH[2]}"
+  elif [[ "$authority" =~ ^([^:]+):([0-9]+)$ ]]; then
+    PERSISTED_ENDPOINT_IP="${BASH_REMATCH[1]}"
+    PERSISTED_ENDPOINT_PORT="${BASH_REMATCH[2]}"
+  else
+    fail "malformed persisted endpoint: $uri"
+  fi
+}
+
+parse_persisted_endpoint_contract() {
+  [ "$PERSISTED_REDFISH_CA_CERT" = "${STATE_DIR}/tls.crt" ] ||
+    fail "persisted Redfish CA certificate path disagrees with project state"
+  [ "$PERSISTED_REDFISH_CREDENTIALS_FILE" = "${STATE_DIR}/credentials.env" ] ||
+    fail "persisted Redfish credentials path disagrees with project state"
+  parse_endpoint_uri https "$PERSISTED_REDFISH_ENDPOINT"
+  PERSISTED_REDFISH_LISTEN_IP="$PERSISTED_ENDPOINT_IP"
+  PERSISTED_REDFISH_LISTEN_PORT="$PERSISTED_ENDPOINT_PORT"
+  PERSISTED_REDFISH_LISTEN_IP="$(canonical_ip_address persisted-Redfish-address \
+    "$PERSISTED_REDFISH_LISTEN_IP")"
+  PERSISTED_REDFISH_LISTEN_PORT="$(canonical_port persisted-Redfish-port \
+    "$PERSISTED_REDFISH_LISTEN_PORT")"
+
+  PERSISTED_SERIAL_MODE="$PERSISTED_SERIAL_TRANSPORT"
+  if [ "$PERSISTED_SERIAL_MODE" = "tcp" ]; then
+    parse_endpoint_uri tcp "$PERSISTED_SERIAL_ENDPOINT"
+    PERSISTED_SERIAL_LISTEN_IP="$(canonical_ip_address persisted-serial-address \
+      "$PERSISTED_ENDPOINT_IP")"
+    PERSISTED_SERIAL_LISTEN_PORT="$(canonical_port persisted-serial-port \
+      "$PERSISTED_ENDPOINT_PORT")"
+  elif [ "$PERSISTED_SERIAL_MODE" = "pty" ]; then
+    PERSISTED_SERIAL_LISTEN_IP=""
+    PERSISTED_SERIAL_LISTEN_PORT=""
+  else
+    fail "malformed persisted serial transport: $PERSISTED_SERIAL_MODE"
+  fi
+
+  REDFISH_LISTEN_IP="$PERSISTED_REDFISH_LISTEN_IP"
+  REDFISH_LISTEN_PORT="$PERSISTED_REDFISH_LISTEN_PORT"
+  SERIAL_MODE="$PERSISTED_SERIAL_MODE"
+  SERIAL_LISTEN_IP="$PERSISTED_SERIAL_LISTEN_IP"
+  SERIAL_LISTEN_PORT="$PERSISTED_SERIAL_LISTEN_PORT"
+  [ "$(redfish_endpoint)" = "$PERSISTED_REDFISH_ENDPOINT" ] ||
+    fail "persisted Redfish endpoint is not canonical"
+  [ "$(serial_endpoint)" = "$PERSISTED_SERIAL_ENDPOINT" ] ||
+    fail "persisted serial endpoint disagrees with its transport"
+}
+
+reject_endpoint_disagreement() {
+  local configured="$2"
+  local persisted="$3"
+  local supplied="$1"
+  local variable="$4"
+  local endpoint_name="$5"
+  if [ -n "$supplied" ] && [ "$configured" != "$persisted" ]; then
+    fail "$variable disagrees with persisted $endpoint_name endpoint"
+  fi
+}
+
 run_redfish() {
+  local configured_redfish_ip="$REDFISH_LISTEN_IP"
+  local configured_redfish_port="$REDFISH_LISTEN_PORT"
+  local configured_serial_ip="$SERIAL_LISTEN_IP"
+  local configured_serial_mode="$SERIAL_MODE"
+  local configured_serial_port="$SERIAL_LISTEN_PORT"
   local patch_dir tmpdir
   [ -f "${STATE_DIR}/sushy-emulator.conf.py" ] ||
     fail "missing ${STATE_DIR}/sushy-emulator.conf.py: run make create first"
   require_private_dir "${STATE_DIR}/tmp"
   require_redfish_runtime_state
+  read_connection_metadata
+  parse_persisted_endpoint_contract
+  reject_endpoint_disagreement "${VM_X86_REDFISH_LISTEN_IP+x}" \
+    "$configured_redfish_ip" "$REDFISH_LISTEN_IP" VM_X86_REDFISH_LISTEN_IP Redfish
+  reject_endpoint_disagreement "${VM_X86_REDFISH_LISTEN_PORT+x}" \
+    "$configured_redfish_port" "$REDFISH_LISTEN_PORT" VM_X86_REDFISH_LISTEN_PORT Redfish
+  reject_endpoint_disagreement "${VM_X86_REDFISH_SERIAL_MODE+x}" \
+    "$configured_serial_mode" "$SERIAL_MODE" VM_X86_REDFISH_SERIAL_MODE serial
+  reject_endpoint_disagreement "${VM_X86_REDFISH_SERIAL_LISTEN_IP+x}" \
+    "$configured_serial_ip" "$SERIAL_LISTEN_IP" VM_X86_REDFISH_SERIAL_LISTEN_IP serial
+  reject_endpoint_disagreement "${VM_X86_REDFISH_SERIAL_LISTEN_PORT+x}" \
+    "$configured_serial_port" "$SERIAL_LISTEN_PORT" VM_X86_REDFISH_SERIAL_LISTEN_PORT serial
   tmpdir="$(canonical_dir "${STATE_DIR}/tmp")"
   patch_dir="$(repo_root)/python"
   export TMPDIR="$tmpdir"
   export PYTHONPATH="${patch_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+  warn_network_exposure
+  print_effective_endpoints 'run: '
   exec uv run --locked sushy-emulator --config "${STATE_DIR}/sushy-emulator.conf.py"
 }
 

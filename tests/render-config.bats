@@ -18,6 +18,13 @@ write_redfish_runtime_state() {
   printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
   printf "REDFISH_ENDPOINT='https://127.0.0.1:8000'\n" \
     >"$VM_X86_REDFISH_STATE_DIR/connection.env"
+  printf "REDFISH_CA_CERT='%s/tls.crt'\n" "$VM_X86_REDFISH_STATE_DIR" \
+    >>"$VM_X86_REDFISH_STATE_DIR/connection.env"
+  printf "REDFISH_CREDENTIALS_FILE='%s/credentials.env'\n" "$VM_X86_REDFISH_STATE_DIR" \
+    >>"$VM_X86_REDFISH_STATE_DIR/connection.env"
+  printf "SERIAL_TRANSPORT='pty'\n" >>"$VM_X86_REDFISH_STATE_DIR/connection.env"
+  printf "SERIAL_ENDPOINT='libvirt-console://vm-x86-redfish/serial0'\n" \
+    >>"$VM_X86_REDFISH_STATE_DIR/connection.env"
   printf '# test config\n' >"$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py"
   chmod 600 "$VM_X86_REDFISH_STATE_DIR/credentials.env" \
     "$VM_X86_REDFISH_STATE_DIR/htpasswd" \
@@ -415,6 +422,66 @@ PY
   [[ "$output" == *"TMPDIR=$VM_X86_REDFISH_STATE_DIR/tmp"* ]]
   [[ "$output" == *"PYTHONPATH=$REPO_ROOT/python"* ]]
   [[ "$output" == *run\ --locked\ sushy-emulator\ --config\ */sushy-emulator.conf.py* ]]
+  [[ "$output" == *"run: Redfish endpoint https://127.0.0.1:8000"* ]]
+  [[ "$output" == *"run: serial endpoint libvirt-console://vm-x86-redfish/serial0"* ]]
+  [[ "$output" != *"warning:"* ]]
+}
+
+@test "run-redfish warns and reports persisted nonloopback and TCP endpoints before exec" {
+  write_redfish_runtime_state
+  sed -i \
+    -e "s|https://127.0.0.1:8000|https://192.0.2.20:8443|" \
+    -e "s|SERIAL_TRANSPORT='pty'|SERIAL_TRANSPORT='tcp'|" \
+    -e "s|libvirt-console://vm-x86-redfish/serial0|tcp://[2001:db8::20]:9000|" \
+    "$VM_X86_REDFISH_STATE_DIR/connection.env"
+  install_mock_command uv \
+    'case "$*" in
+      "python find 3.13") command -v python3 ;;
+      *) printf "EXEC=%s\n" "$*" ;;
+    esac'
+
+  run ./scripts/run-redfish
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"warning: non-loopback Redfish listener at https://192.0.2.20:8443"* ]]
+  [[ "$output" == *"plaintext TCP serial listener at tcp://[2001:db8::20]:9000"* ]]
+  [[ "$output" == *"run: Redfish endpoint https://192.0.2.20:8443"* ]]
+  [[ "$output" == *$'run: serial endpoint tcp://[2001:db8::20]:9000\nEXEC=run --locked'* ]]
+}
+
+@test "run-redfish rejects supplied endpoint settings that disagree with persisted state" {
+  write_redfish_runtime_state
+  install_mock_command uv \
+    'case "$*" in
+      "python find 3.13") command -v python3 ;;
+      *) printf "unexpected exec\n" ;;
+    esac'
+
+  VM_X86_REDFISH_LISTEN_PORT=8443 run ./scripts/run-redfish
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"VM_X86_REDFISH_LISTEN_PORT disagrees with persisted Redfish endpoint"* ]]
+  [[ "$output" != *"unexpected exec"* ]]
+}
+
+@test "run-redfish rejects malformed connection metadata without evaluating it" {
+  local sentinel="$BATS_TEST_TMPDIR/metadata-was-evaluated"
+  write_redfish_runtime_state
+  printf 'REDFISH_ENDPOINT=$(touch %s)\n' "$sentinel" \
+    >"$VM_X86_REDFISH_STATE_DIR/connection.env"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/connection.env"
+  install_mock_command uv \
+    'case "$*" in
+      "python find 3.13") command -v python3 ;;
+      *) printf "unexpected exec\n" ;;
+    esac'
+
+  run ./scripts/run-redfish
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"malformed Redfish connection metadata"* ]]
+  [ ! -e "$sentinel" ]
+  [[ "$output" != *"unexpected exec"* ]]
 }
 
 @test "run-redfish rejects loose Redfish runtime files" {
