@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2030,SC2031 # Bats isolates PATH changes to each test process.
 
 load "helpers/test-helper"
 
@@ -206,16 +207,96 @@ wait_for_tmp_file() {
   return 1
 }
 
+capture_domain_inventory() {
+  local destination="$1"
+  local inventory
+  if ! inventory="$(bounded_virsh list --all --name)"; then
+    printf 'failed to capture libvirt domain inventory\n' >&2
+    return 1
+  fi
+  printf '%s\n' "$inventory" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort >"$destination"
+}
+
+capture_volume_inventory() {
+  local destination="$1"
+  local inventory
+  if ! inventory="$(bounded_virsh vol-list --pool "$STORAGE_POOL")"; then
+    printf 'failed to capture libvirt volume inventory for pool %s\n' \
+      "$STORAGE_POOL" >&2
+    return 1
+  fi
+  printf '%s\n' "$inventory" | awk 'NR > 2 && NF { print $1 }' |
+    LC_ALL=C sort >"$destination"
+}
+
+snapshot_live_inventory() {
+  local prefix="$1"
+  capture_domain_inventory "${prefix}.domains" || return
+  capture_volume_inventory "${prefix}.volumes"
+}
+
+assert_inventory_unchanged() {
+  local before="$1"
+  local after="$2"
+  local resource_type="$3"
+  local status
+  if cmp -s -- "$before" "$after"; then
+    return 0
+  else
+    status="$?"
+  fi
+  if [ "$status" -eq 1 ]; then
+    printf 'libvirt %s inventory changed during the test\n' "$resource_type" >&2
+  else
+    printf 'failed to compare libvirt %s inventories\n' "$resource_type" >&2
+  fi
+  return 1
+}
+
+assert_domain_absent_from_inventory() {
+  local inventory="$1"
+  local domain_name="$2"
+  local status
+  if grep -Fxq -- "$domain_name" "$inventory"; then
+    printf 'test domain still exists: %s\n' "$domain_name" >&2
+    return 1
+  else
+    status="$?"
+  fi
+  if [ "$status" -ne 1 ]; then
+    printf 'failed to read libvirt domain inventory\n' >&2
+    return 1
+  fi
+}
+
+assert_volume_absent_from_inventory() {
+  local inventory="$1"
+  local volume_name="$2"
+  local status
+  if grep -Fxq -- "$volume_name" "$inventory"; then
+    printf 'test volume still exists: %s\n' "$volume_name" >&2
+    return 1
+  else
+    status="$?"
+  fi
+  if [ "$status" -ne 1 ]; then
+    printf 'failed to read libvirt volume inventory\n' >&2
+    return 1
+  fi
+}
+
 assert_no_uuid_media_volumes() {
-  local domain_uuid="$1"
+  local inventory="$1"
+  local domain_uuid="$2"
   local volume
-  while read -r volume _; do
-    [ -n "$volume" ] || continue
+  local volumes=()
+  mapfile -t volumes <"$inventory" || return
+  for volume in "${volumes[@]}"; do
     if [[ "$volume" = *-"$domain_uuid".img ]]; then
       printf 'UUID media volume still exists: %s\n' "$volume" >&2
       return 1
     fi
-  done < <(bounded_virsh vol-list --pool "$STORAGE_POOL")
+  done
 }
 
 run_serial_console() {
@@ -286,17 +367,31 @@ destroy_and_assert_virtual_media_cleanup() {
   local domain_uuid="$1"
   local interrupted_path="$2"
   local nvram_path="$3"
+  local media_volume="$4"
+  local inventory_dir="$5"
+  local before_inventory="${inventory_dir}/before"
+  local after_inventory="${inventory_dir}/after"
+  stop_tracked_children
   timeout --kill-after=5 120 ./scripts/destroy-vm || return
+  snapshot_live_inventory "$after_inventory" || return
   [ ! -e "$interrupted_path" ] || return 1
   [ ! -e "$nvram_path" ] || return 1
-  if bounded_virsh dominfo "$VM_X86_REDFISH_DOMAIN_NAME"; then
+  if [ -e "$VM_X86_REDFISH_STATE_DIR/tmp" ] ||
+    [ -L "$VM_X86_REDFISH_STATE_DIR/tmp" ]; then
     return 1
   fi
-  if bounded_virsh vol-info --pool "$STORAGE_POOL" \
-    "$VM_X86_REDFISH_ROOT_VOLUME_NAME"; then
-    return 1
-  fi
-  assert_no_uuid_media_volumes "$domain_uuid"
+  wait_for_loopback_port_free 8000 || return
+  assert_domain_absent_from_inventory \
+    "${after_inventory}.domains" "$VM_X86_REDFISH_DOMAIN_NAME" || return
+  assert_volume_absent_from_inventory \
+    "${after_inventory}.volumes" "$VM_X86_REDFISH_ROOT_VOLUME_NAME" || return
+  assert_volume_absent_from_inventory \
+    "${after_inventory}.volumes" "$media_volume" || return
+  assert_no_uuid_media_volumes "${after_inventory}.volumes" "$domain_uuid" || return
+  assert_inventory_unchanged \
+    "${before_inventory}.domains" "${after_inventory}.domains" domains || return
+  assert_inventory_unchanged \
+    "${before_inventory}.volumes" "${after_inventory}.volumes" volumes
 }
 
 post_reset() {
@@ -335,7 +430,7 @@ teardown() {
 }
 
 @test "integration harness installs bounded client helpers before live mutation" {
-  original_path="$PATH"
+  bounded_client_path="$PATH"
   install_mock_command curl 'printf "curl %s\n" "$*"'
   install_mock_command timeout 'printf "timeout %s\n" "$*"'
 
@@ -348,7 +443,71 @@ teardown() {
   [ "$status" -eq 0 ]
   [ "$output" = \
     "timeout --kill-after=2 10 virsh -c qemu:///system domstate example-domain" ]
-  export PATH="$original_path"
+  export PATH="$bounded_client_path"
+}
+
+@test "cleanup inventory snapshots require successful libvirt queries" {
+  failing_inventory_path="$PATH"
+  install_mock_command virsh '
+case "$*" in
+  *"list --all --name") exit 31 ;;
+  *"vol-list --pool default") exit 32 ;;
+esac
+'
+
+  run capture_domain_inventory "$BATS_TEST_TMPDIR/domains"
+  domain_status="$status"
+  domain_output="$output"
+  run capture_volume_inventory "$BATS_TEST_TMPDIR/volumes"
+  volume_status="$status"
+  volume_output="$output"
+  export PATH="$failing_inventory_path"
+
+  [ "$domain_status" -ne 0 ]
+  [[ "$domain_output" == *"failed to capture libvirt domain inventory"* ]]
+  [ "$volume_status" -ne 0 ]
+  [[ "$volume_output" == *"failed to capture libvirt volume inventory"* ]]
+}
+
+@test "cleanup inventory helpers compare exact resource names" {
+  exact_inventory_path="$PATH"
+  install_mock_command virsh '
+case "$*" in
+  *"list --all --name")
+    printf "%s\n" unrelated vm-x86-redfish-near-match
+    ;;
+  *"vol-list --pool default")
+    printf " Name   Path\n-----------------------------------\n"
+    printf "%s %s\n" unrelated.qcow2 /var/lib/libvirt/images/unrelated.qcow2
+    printf "%s %s\n" vm-x86-redfish-near-match.qcow2 /var/lib/libvirt/images/near
+    ;;
+esac
+'
+
+  capture_domain_inventory "$BATS_TEST_TMPDIR/domains"
+  capture_volume_inventory "$BATS_TEST_TMPDIR/volumes"
+  export PATH="$exact_inventory_path"
+
+  run assert_domain_absent_from_inventory \
+    "$BATS_TEST_TMPDIR/domains" vm-x86-redfish
+  [ "$status" -eq 0 ]
+  run assert_volume_absent_from_inventory \
+    "$BATS_TEST_TMPDIR/volumes" vm-x86-redfish.qcow2
+  [ "$status" -eq 0 ]
+  run assert_domain_absent_from_inventory \
+    "$BATS_TEST_TMPDIR/domains" unrelated
+  [ "$status" -ne 0 ]
+  run assert_volume_absent_from_inventory \
+    "$BATS_TEST_TMPDIR/volumes" unrelated.qcow2
+  [ "$status" -ne 0 ]
+  run assert_inventory_unchanged \
+    "$BATS_TEST_TMPDIR/domains" "$BATS_TEST_TMPDIR/domains" domains
+  [ "$status" -eq 0 ]
+
+  printf 'changed\n' >"$BATS_TEST_TMPDIR/changed-domains"
+  run assert_inventory_unchanged \
+    "$BATS_TEST_TMPDIR/domains" "$BATS_TEST_TMPDIR/changed-domains" domains
+  [ "$status" -ne 0 ]
 }
 
 @test "integration harness stops children before destroying VM resources" {
@@ -478,6 +637,9 @@ PY
 }
 
 @test "virtual media boots a serial sentinel and interrupted insertion is cleaned" {
+  inventory_dir="$VM_X86_REDFISH_ARTIFACTS_DIR/live-inventory"
+  mkdir -p "$inventory_dir"
+  snapshot_live_inventory "$inventory_dir/before"
   run timeout --kill-after=5 120 ./scripts/create-vm
   [ "$status" -eq 0 ]
   # shellcheck disable=SC1091 # create-vm writes this test-specific credentials file.
@@ -570,9 +732,7 @@ PY
   wait "$insert_pid" || insert_status="$?"
   untrack_child "$insert_pid"
   [ "$insert_status" -ne 0 ]
-  stop_tracked_children
 
-  run destroy_and_assert_virtual_media_cleanup \
-    "$domain_uuid" "$interrupted_path" "$nvram_path"
-  [ "$status" -eq 0 ]
+  destroy_and_assert_virtual_media_cleanup \
+    "$domain_uuid" "$interrupted_path" "$nvram_path" "$media_volume" "$inventory_dir"
 }
