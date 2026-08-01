@@ -14,6 +14,7 @@ setup() {
   export VM_X86_REDFISH_MEMORY_MIB=4096
   export VM_X86_REDFISH_ROOT_DISK_GIB=1
   qemu-img create -f qcow2 "$VM_X86_REDFISH_SOURCE_IMAGE" 64M >/dev/null
+  # shellcheck disable=SC1091 # Integration setup runs from the repository root.
   source ./scripts/lib/common
   load_runtime_config
   [ "$LIBVIRT_URI" = "qemu:///system" ]
@@ -91,10 +92,54 @@ create_sentinel_iso() {
   local sentinel="$2"
   local iso_root="$BATS_TEST_TMPDIR/iso-root"
   mkdir -p "$iso_root/boot/grub"
-  sed "s/@SENTINEL@/${sentinel}/" tests/fixtures/grub.cfg.in \
+  sed -e 's/@DEFAULT_ENTRY@/0/' -e "s/@SENTINEL@/${sentinel}/" \
+    tests/fixtures/grub.cfg.in \
     >"$iso_root/boot/grub/grub.cfg"
   grub2-mkrescue -o "$iso_path" "$iso_root" \
     >"$VM_X86_REDFISH_ARTIFACTS_DIR/grub2-mkrescue.log" 2>&1
+}
+
+matching_kernel_image() {
+  local kernel_release="$1"
+  local candidate
+  for candidate in \
+    "/usr/lib/modules/${kernel_release}/vmlinuz" \
+    "/lib/modules/${kernel_release}/vmlinuz" \
+    "/boot/vmlinuz-${kernel_release}"; do
+    if [ -r "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  printf 'matching kernel %s is not readable\n' "$kernel_release" >&2
+  return 1
+}
+
+create_nmi_iso() {
+  local iso_path="$1"
+  local fixture_root="$BATS_TEST_TMPDIR/nmi-fixture"
+  local initramfs_root="$fixture_root/initramfs"
+  local iso_root="$fixture_root/iso-root"
+  local kernel_release
+  local kernel_path
+
+  kernel_release="$(uname -r)"
+  kernel_path="$(matching_kernel_image "$kernel_release")" || return
+  mkdir -p "$initramfs_root/dev" "$initramfs_root/proc" "$iso_root/boot/grub"
+  gcc -std=c17 -static -Os -s -Wall -Wextra -Werror \
+    -o "$initramfs_root/init" tests/fixtures/nmi-init.c
+  touch -d '@0' "$initramfs_root" "$initramfs_root/dev" \
+    "$initramfs_root/proc" "$initramfs_root/init"
+  (
+    cd "$initramfs_root" || exit 1
+    printf '%s\0' dev init proc |
+      cpio --null --create --format=newc --owner=0:0 --reproducible
+  ) >"$iso_root/boot/nmi-initramfs.cpio"
+  cp "$kernel_path" "$iso_root/boot/vmlinuz"
+  sed -e 's/@DEFAULT_ENTRY@/1/' -e 's/@SENTINEL@/unused/' \
+    tests/fixtures/grub.cfg.in >"$iso_root/boot/grub/grub.cfg"
+  grub2-mkrescue -o "$iso_path" "$iso_root" \
+    >"$VM_X86_REDFISH_ARTIFACTS_DIR/grub2-mkrescue-nmi.log" 2>&1
 }
 
 post_virtual_media_action() {

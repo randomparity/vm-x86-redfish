@@ -89,16 +89,26 @@ case "$*" in
 esac
 '
   install_mock_command pkg-config 'exit 0'
-  for command in uname qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd \
-    bats gcc shellcheck shfmt grub2-mkrescue xorriso; do
+  for command in qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd \
+    bats cpio gcc shellcheck shfmt grub2-mkrescue xorriso; do
     install_recording_noop "$command"
   done
-  install_mock_command uname 'printf "x86_64\n"'
+  install_mock_command uname '
+case "${1:-}" in
+  -m) printf "x86_64\n" ;;
+  -r) printf "6.12.0-nmi-test\n" ;;
+  *) exit 2 ;;
+esac
+'
   mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
   touch "$BATS_TEST_TMPDIR/dev/kvm"
+  printf 'kernel\n' >"$BATS_TEST_TMPDIR/vmlinuz"
+  printf 'CONFIG_X86_64=y\nCONFIG_HAVE_NMI=y\n' >"$BATS_TEST_TMPDIR/kernel.config"
   export VM_X86_REDFISH_INTEGRATION_TEST=1
   export VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm"
   export VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
+  export VM_X86_REDFISH_TEST_KERNEL_IMAGE="$BATS_TEST_TMPDIR/vmlinuz"
+  export VM_X86_REDFISH_TEST_KERNEL_CONFIG="$BATS_TEST_TMPDIR/kernel.config"
 }
 
 install_endpoint_probe_python_mock() {
@@ -346,4 +356,101 @@ esac
   [ ! -e .state ]
   [ ! -e .artifacts ]
   [ ! -e .venv ]
+}
+
+@test "NMI fixture doctor reports missing cpio with kernel release and package hint" {
+  install_all_doctor_success_mocks
+  rm "$BATS_TEST_TMPDIR/bin/cpio"
+
+  PATH="$BATS_TEST_TMPDIR/bin" run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"missing command 'cpio' for NMI fixture kernel 6.12.0-nmi-test"* ]]
+  [[ "$output" == *"install cpio"* ]]
+}
+
+@test "NMI fixture doctor rejects an unreadable matching kernel" {
+  install_all_doctor_success_mocks
+  chmod 000 "$VM_X86_REDFISH_TEST_KERNEL_IMAGE"
+
+  run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"matching kernel 6.12.0-nmi-test is not readable"* ]]
+  [[ "$output" == *"install kernel-core-6.12.0-nmi-test"* ]]
+}
+
+@test "NMI fixture doctor reports missing x86 NMI kernel capability" {
+  install_all_doctor_success_mocks
+  printf 'CONFIG_X86_64=y\n# CONFIG_HAVE_NMI is not set\n' \
+    >"$VM_X86_REDFISH_TEST_KERNEL_CONFIG"
+
+  run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"kernel 6.12.0-nmi-test lacks CONFIG_HAVE_NMI=y"* ]]
+  [[ "$output" == *"install an x86_64 kernel with NMI support"* ]]
+}
+
+@test "NMI fixture doctor reports static link failure with package hint" {
+  install_all_doctor_success_mocks
+  install_mock_command gcc '
+if [ "${1:-}" = "-static" ]; then
+  exit 1
+fi
+'
+
+  run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"gcc cannot link a static PID 1 for kernel 6.12.0-nmi-test"* ]]
+  [[ "$output" == *"install glibc-static"* ]]
+}
+
+@test "ordinary doctor does not require NMI fixture prerequisites" {
+  install_all_doctor_success_mocks
+  rm "$BATS_TEST_TMPDIR/bin/cpio"
+  rm "$VM_X86_REDFISH_TEST_KERNEL_IMAGE" "$VM_X86_REDFISH_TEST_KERNEL_CONFIG"
+  install_mock_command basename 'exec /usr/bin/basename "$@"'
+  install_mock_command grep 'exec /usr/bin/grep "$@"'
+  install_mock_command gcc '
+if [ "${1:-}" = "-static" ]; then
+  exit 1
+fi
+'
+  unset VM_X86_REDFISH_INTEGRATION_TEST
+  unset VM_X86_REDFISH_DEV_KVM VM_X86_REDFISH_OVMF_DIR
+  unset VM_X86_REDFISH_STATE_DIR VM_X86_REDFISH_ARTIFACTS_DIR
+
+  PATH="$BATS_TEST_TMPDIR/bin" run ./scripts/doctor
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"doctor: host prerequisites are available"* ]]
+}
+
+@test "NMI fixture init validates panic sysctls before readiness and exits failures" {
+  local init_source="tests/fixtures/nmi-init.c"
+  local mount_line panic_line ready_line unknown_line
+
+  [ -f "$init_source" ]
+  run grep -nF 'mount("proc", "/proc", "proc"' "$init_source"
+  [ "$status" -eq 0 ]
+  mount_line="${output%%:*}"
+  run grep -nF 'read_expected("/proc/sys/kernel/unknown_nmi_panic", "1\n")' \
+    "$init_source"
+  [ "$status" -eq 0 ]
+  unknown_line="${output%%:*}"
+  run grep -nF 'read_expected("/proc/sys/kernel/panic", "1\n")' "$init_source"
+  [ "$status" -eq 0 ]
+  panic_line="${output%%:*}"
+  run grep -nF 'write_console("NMI_READY\n")' "$init_source"
+  [ "$status" -eq 0 ]
+  ready_line="${output%%:*}"
+  [ "$mount_line" -lt "$ready_line" ]
+  [ "$unknown_line" -lt "$ready_line" ]
+  [ "$panic_line" -lt "$ready_line" ]
+  run grep -F 'NMI_UNSUPPORTED: ' "$init_source"
+  [ "$status" -eq 0 ]
+  run grep -F '_exit(EXIT_FAILURE)' "$init_source"
+  [ "$status" -eq 0 ]
 }
