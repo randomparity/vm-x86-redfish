@@ -13,6 +13,11 @@ MEMORY_MIB="4096"
 ROOT_DISK_GIB="40"
 SOURCE_IMAGE=""
 SOURCE_IMAGE_SHA256=""
+REDFISH_LISTEN_IP="127.0.0.1"
+REDFISH_LISTEN_PORT="8000"
+SERIAL_MODE="pty"
+SERIAL_LISTEN_IP=""
+SERIAL_LISTEN_PORT=""
 DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
 LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
 
@@ -45,6 +50,204 @@ reject_unguarded_override() {
   fi
 }
 
+canonical_ip_address() {
+  local address="$2"
+  local canonical_address
+  local canonical_status
+  local python_bin
+  local variable="$1"
+  python_bin="$(python_313)"
+  if canonical_address="$(
+    "$python_bin" - "$address" <<'PY'
+import ipaddress
+import sys
+
+try:
+    parsed = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+
+if parsed.is_unspecified or parsed.is_multicast or getattr(parsed, "scope_id", None) is not None:
+    raise SystemExit(1)
+if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+    raise SystemExit(2)
+
+print(parsed)
+PY
+  )"; then
+    :
+  else
+    canonical_status="$?"
+    if [ "$canonical_status" -eq 2 ]; then
+      fail "$variable must not be an IPv4-mapped IPv6 address"
+    fi
+    fail "$variable must be a concrete unicast IP address"
+  fi
+  printf '%s\n' "$canonical_address"
+}
+
+canonical_port() {
+  local canonical_value
+  local value="$2"
+  local variable="$1"
+  [[ "$value" =~ ^[0-9]+$ ]] || fail "$variable must be a decimal port from 1 through 65535"
+
+  canonical_value="$value"
+  while [ "${#canonical_value}" -gt 1 ] && [ "${canonical_value:0:1}" = "0" ]; do
+    canonical_value="${canonical_value:1}"
+  done
+  if [ "${#canonical_value}" -gt 5 ] || [ "$canonical_value" = "0" ]; then
+    fail "$variable must be a decimal port from 1 through 65535"
+  fi
+  if [ "${#canonical_value}" -eq 5 ] && [ "$canonical_value" -gt 65535 ]; then
+    fail "$variable must be a decimal port from 1 through 65535"
+  fi
+  printf '%s\n' "$canonical_value"
+}
+
+address_is_loopback() {
+  local address="$1"
+  local python_bin
+  python_bin="$(python_313)"
+  "$python_bin" - "$address" <<'PY'
+import ipaddress
+import sys
+
+raise SystemExit(0 if ipaddress.ip_address(sys.argv[1]).is_loopback else 1)
+PY
+}
+
+validate_runtime_endpoints() {
+  case "$SERIAL_MODE" in
+  pty)
+    [ -z "${VM_X86_REDFISH_SERIAL_LISTEN_IP+x}" ] ||
+      fail "VM_X86_REDFISH_SERIAL_LISTEN_IP is only valid when VM_X86_REDFISH_SERIAL_MODE=tcp"
+    [ -z "${VM_X86_REDFISH_SERIAL_LISTEN_PORT+x}" ] ||
+      fail "VM_X86_REDFISH_SERIAL_LISTEN_PORT is only valid when VM_X86_REDFISH_SERIAL_MODE=tcp"
+    SERIAL_LISTEN_IP=""
+    SERIAL_LISTEN_PORT=""
+    ;;
+  tcp)
+    [ -n "$SERIAL_LISTEN_IP" ] ||
+      fail "VM_X86_REDFISH_SERIAL_LISTEN_IP is required when VM_X86_REDFISH_SERIAL_MODE=tcp"
+    [ -n "$SERIAL_LISTEN_PORT" ] ||
+      fail "VM_X86_REDFISH_SERIAL_LISTEN_PORT is required when VM_X86_REDFISH_SERIAL_MODE=tcp"
+    SERIAL_LISTEN_IP="$(canonical_ip_address VM_X86_REDFISH_SERIAL_LISTEN_IP "$SERIAL_LISTEN_IP")"
+    SERIAL_LISTEN_PORT="$(canonical_port VM_X86_REDFISH_SERIAL_LISTEN_PORT "$SERIAL_LISTEN_PORT")"
+    ;;
+  *)
+    fail "VM_X86_REDFISH_SERIAL_MODE must be either pty or tcp"
+    ;;
+  esac
+
+  REDFISH_LISTEN_IP="$(canonical_ip_address VM_X86_REDFISH_LISTEN_IP "$REDFISH_LISTEN_IP")"
+  REDFISH_LISTEN_PORT="$(canonical_port VM_X86_REDFISH_LISTEN_PORT "$REDFISH_LISTEN_PORT")"
+}
+
+format_uri_host() {
+  local host="$1"
+  case "$host" in
+  *:*) printf '[%s]\n' "$host" ;;
+  *) printf '%s\n' "$host" ;;
+  esac
+}
+
+redfish_endpoint() {
+  printf 'https://%s:%s\n' "$(format_uri_host "$REDFISH_LISTEN_IP")" "$REDFISH_LISTEN_PORT"
+}
+
+serial_endpoint() {
+  if [ "$SERIAL_MODE" = "tcp" ]; then
+    printf 'tcp://%s:%s\n' "$(format_uri_host "$SERIAL_LISTEN_IP")" "$SERIAL_LISTEN_PORT"
+  else
+    printf 'libvirt-console://%s/serial0\n' "$DEFAULT_DOMAIN_NAME"
+  fi
+}
+
+endpoint_address_port() {
+  local address="$1"
+  local port="$2"
+  printf '%s:%s\n' "$(format_uri_host "$address")" "$port"
+}
+
+check_listener_available() {
+  local address="$1"
+  local port="$2"
+  local probe_port="$port"
+  local probe_output
+  local probe_status
+  local python_bin
+  local endpoint
+  if integration_override_enabled && [ -n "${VM_X86_REDFISH_PORT_CHECK_PORT:-}" ]; then
+    probe_port="$VM_X86_REDFISH_PORT_CHECK_PORT"
+  fi
+  endpoint="$(endpoint_address_port "$address" "$probe_port")"
+  if integration_override_enabled; then
+    case "${VM_X86_REDFISH_PORT_CHECK_RESULT:-}" in
+    busy) fail "$endpoint is already in use" ;;
+    available) return 0 ;;
+    esac
+  fi
+  python_bin="$(python_313)"
+  if probe_output="$(
+    "$python_bin" - "$address" "$probe_port" 2>&1 <<'PY'
+import errno
+import socket
+import sys
+
+try:
+    address, port = sys.argv[1:]
+    infos = socket.getaddrinfo(
+        address,
+        int(port),
+        type=socket.SOCK_STREAM,
+        flags=socket.AI_NUMERICHOST | socket.AI_PASSIVE,
+    )
+    family, socktype, protocol, _, sockaddr = infos[0]
+    with socket.socket(family, socktype, protocol) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(sockaddr)
+        sock.listen()
+except OSError as error:
+    reason = (error.strerror or "socket error").replace("\n", " ")
+    print(reason)
+    raise SystemExit(2 if error.errno == errno.EADDRINUSE else 1)
+PY
+  )"; then
+    return 0
+  else
+    probe_status=$?
+  fi
+  if [ "$probe_status" -eq 2 ]; then
+    fail "$endpoint is already in use"
+  fi
+  [ -n "$probe_output" ] || probe_output="socket error"
+  fail "cannot bind $endpoint: $probe_output"
+}
+
+reject_listener_collision() {
+  if [ "$SERIAL_MODE" = "tcp" ] && [ "$REDFISH_LISTEN_IP" = "$SERIAL_LISTEN_IP" ] &&
+    [ "$REDFISH_LISTEN_PORT" = "$SERIAL_LISTEN_PORT" ]; then
+    fail "Redfish and TCP serial listeners cannot use the same address and port"
+  fi
+}
+
+warn_network_exposure() {
+  if ! address_is_loopback "$REDFISH_LISTEN_IP"; then
+    printf 'warning: non-loopback Redfish listener at %s\n' "$(redfish_endpoint)" >&2
+  fi
+  if [ "$SERIAL_MODE" = "tcp" ]; then
+    printf 'warning: unauthenticated plaintext TCP serial listener at %s\n' \
+      "$(serial_endpoint)" >&2
+  fi
+}
+
+print_effective_endpoints() {
+  local prefix="${1:-}"
+  printf '%sRedfish endpoint %s\n' "$prefix" "$(redfish_endpoint)"
+  printf '%sserial endpoint %s\n' "$prefix" "$(serial_endpoint)"
+}
+
 load_runtime_config() {
   reject_unguarded_override VM_X86_REDFISH_DOMAIN_NAME
   reject_unguarded_override VM_X86_REDFISH_LIBVIRT_URI
@@ -61,6 +264,12 @@ load_runtime_config() {
   MEMORY_MIB="${VM_X86_REDFISH_MEMORY_MIB:-4096}"
   ROOT_DISK_GIB="${VM_X86_REDFISH_ROOT_DISK_GIB:-40}"
   SOURCE_IMAGE="${VM_X86_REDFISH_SOURCE_IMAGE:-}"
+  REDFISH_LISTEN_IP="${VM_X86_REDFISH_LISTEN_IP-127.0.0.1}"
+  REDFISH_LISTEN_PORT="${VM_X86_REDFISH_LISTEN_PORT-8000}"
+  SERIAL_MODE="${VM_X86_REDFISH_SERIAL_MODE-pty}"
+  SERIAL_LISTEN_IP="${VM_X86_REDFISH_SERIAL_LISTEN_IP-}"
+  SERIAL_LISTEN_PORT="${VM_X86_REDFISH_SERIAL_LISTEN_PORT-}"
+  validate_runtime_endpoints
   DOMAIN_UUID_FILE="${STATE_DIR}/domain-uuid"
   LIFECYCLE_LOCK="${STATE_DIR}/lifecycle.lock"
 }
@@ -276,92 +485,12 @@ PY
 domain_shape_matches_expected() {
   local python_bin
   local root_path="$2"
+  local validator_path
   local xml="$1"
   python_bin="$(python_313)"
-  "$python_bin" - "$xml" "$DEFAULT_DOMAIN_NAME" "$root_path" <<'PY'
-import sys
-import xml.etree.ElementTree as ET
-
-xml_path, domain_name, root_path = sys.argv[1:]
-try:
-    root = ET.parse(xml_path).getroot()
-except ET.ParseError:
-    raise SystemExit(1)
-
-def fail():
-    raise SystemExit(1)
-
-def require(condition):
-    if not condition:
-        fail()
-
-def one(elements):
-    require(len(elements) == 1)
-    return elements[0]
-
-def child(parent, name):
-    elem = parent.find(name)
-    require(elem is not None)
-    return elem
-
-def text(parent, name):
-    elem = child(parent, name)
-    return elem.text or ""
-
-require(root.tag == "domain")
-require(root.get("type") == "kvm")
-require(text(root, "name") == domain_name)
-os_elem = child(root, "os")
-boot_entries = os_elem.findall("boot")
-require(len(boot_entries) == 1)
-require(boot_entries[0].get("dev") == "hd")
-devices = child(root, "devices")
-require(not any(True for _ in devices.iter("hostdev")))
-require(not any(True for _ in devices.iter("boot")))
-all_disks = devices.findall("disk")
-disk = one(all_disks)
-require(disk.get("type") == "file")
-require(disk.get("device") == "disk")
-driver = child(disk, "driver")
-require(driver.get("name") == "qemu")
-require(driver.get("type") == "qcow2")
-require(driver.get("discard") == "unmap")
-source = child(disk, "source")
-require(source.get("file") == root_path)
-target = child(disk, "target")
-require(target.get("dev") == "vda")
-require(target.get("bus") == "virtio")
-interface = one(devices.findall("interface"))
-require(interface.get("type") == "network")
-require(child(interface, "source").get("network") == "default")
-require(child(interface, "model").get("type") == "virtio")
-serial = one(devices.findall("serial"))
-serial_target = child(serial, "target")
-require(serial.get("type") == "pty")
-require(serial_target.get("type") == "isa-serial")
-require(serial_target.get("port") == "0")
-require(child(serial_target, "model").get("name") == "isa-serial")
-console = one(devices.findall("console"))
-console_target = child(console, "target")
-require(console.get("type") == "pty")
-require(console_target.get("type") == "serial")
-require(console_target.get("port") == "0")
-channel = one(devices.findall("channel"))
-channel_target = child(channel, "target")
-require(channel.get("type") == "unix")
-require(channel_target.get("type") == "virtio")
-require(channel_target.get("name") == "org.qemu.guest_agent.0")
-graphics = one(devices.findall("graphics"))
-require(graphics.get("type") == "vnc")
-listen = graphics.get("listen")
-listen_elem = graphics.find("listen")
-if listen is None and listen_elem is not None:
-    listen = listen_elem.get("address")
-require(listen == "127.0.0.1")
-video_model = child(one(devices.findall("video")), "model")
-require(video_model.get("type") == "virtio")
-require(text(devices, "emulator") == "/usr/bin/qemu-system-x86_64")
-PY
+  validator_path="$(repo_root)/python/domain_shape.py"
+  "$python_bin" "$validator_path" "$xml" "$DEFAULT_DOMAIN_NAME" "$root_path" \
+    "$SERIAL_MODE" "$SERIAL_LISTEN_IP" "$SERIAL_LISTEN_PORT"
 }
 
 volume_name_for_media() {

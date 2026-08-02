@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir="${BASH_SOURCE[0]%/*}"
+# shellcheck disable=SC1091 # The script resolves this source relative to its own path.
 # shellcheck source=scripts/lib/common
 source "${script_dir}/lib/common"
 
@@ -28,6 +29,77 @@ check_commands() {
   need_command shfmt "shfmt"
   need_command grub2-mkrescue "grub2-tools-extra"
   need_command xorriso "xorriso"
+}
+
+matching_kernel_image() {
+  local kernel_release="$1"
+  local candidate
+  if [ -n "${VM_X86_REDFISH_TEST_KERNEL_IMAGE:-}" ]; then
+    printf '%s\n' "$VM_X86_REDFISH_TEST_KERNEL_IMAGE"
+    return
+  fi
+  for candidate in \
+    "/usr/lib/modules/${kernel_release}/vmlinuz" \
+    "/lib/modules/${kernel_release}/vmlinuz" \
+    "/boot/vmlinuz-${kernel_release}"; do
+    if [ -e "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  printf '/boot/vmlinuz-%s\n' "$kernel_release"
+}
+
+matching_kernel_config() {
+  local kernel_release="$1"
+  if [ -n "${VM_X86_REDFISH_TEST_KERNEL_CONFIG:-}" ]; then
+    printf '%s\n' "$VM_X86_REDFISH_TEST_KERNEL_CONFIG"
+  else
+    printf '/boot/config-%s\n' "$kernel_release"
+  fi
+}
+
+require_kernel_capability() {
+  local config_path="$1"
+  local kernel_release="$2"
+  local capability="$3"
+  grep -Fx "${capability}=y" "$config_path" >/dev/null ||
+    fail "kernel $kernel_release lacks ${capability}=y required by NMI fixture;" \
+      "install kernel-core-$kernel_release with $capability enabled"
+}
+
+check_nmi_fixture_prerequisites() {
+  local config_path
+  local kernel_path
+  local kernel_release
+  if ! integration_override_enabled; then
+    return 0
+  fi
+
+  kernel_release="$(uname -r)"
+  command -v cpio >/dev/null 2>&1 ||
+    fail "missing command 'cpio' for NMI fixture kernel $kernel_release: install cpio"
+  kernel_path="$(matching_kernel_image "$kernel_release")"
+  if [ ! -r "$kernel_path" ]; then
+    fail "matching kernel $kernel_release is not readable at $kernel_path;" \
+      "install kernel-core-$kernel_release"
+  fi
+  config_path="$(matching_kernel_config "$kernel_release")"
+  if [ ! -r "$config_path" ]; then
+    fail "kernel config for $kernel_release is not readable at $config_path;" \
+      "install kernel-core-$kernel_release"
+  fi
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_X86_64
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_HAVE_NMI
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_BLK_DEV_INITRD
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_PROC_FS
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_PROC_SYSCTL
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_BINFMT_ELF
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_PRINTK
+  require_kernel_capability "$config_path" "$kernel_release" CONFIG_SERIAL_8250_CONSOLE
+  printf 'int main(void) { return 0; }\n' |
+    gcc -static -x c -o /dev/null - >/dev/null 2>&1 ||
+    fail "gcc cannot link a static PID 1 for kernel $kernel_release: install glibc-static"
 }
 
 check_libvirt() {
@@ -112,35 +184,23 @@ raise SystemExit(0 if include and (pathlib.Path(include) / "Python.h").is_file()
 PY
 }
 
-check_loopback_port() {
-  local port=8000
-  local python_bin
-  if integration_override_enabled &&
-    [ -n "${VM_X86_REDFISH_PORT_CHECK_PORT:-}" ]; then
-    port="$VM_X86_REDFISH_PORT_CHECK_PORT"
+check_configured_listeners() {
+  reject_listener_collision
+  check_listener_available "$REDFISH_LISTEN_IP" "$REDFISH_LISTEN_PORT"
+  if [ "$SERIAL_MODE" = "tcp" ]; then
+    check_listener_available "$SERIAL_LISTEN_IP" "$SERIAL_LISTEN_PORT"
   fi
-  if integration_override_enabled &&
-    [ "${VM_X86_REDFISH_PORT_CHECK_RESULT:-}" = "busy" ]; then
-    fail "127.0.0.1:${port} is already in use"
-  fi
-  python_bin="$(python_313)"
-  "$python_bin" - "$port" <<'PY' || fail "127.0.0.1:${port} is already in use"
-import socket
-import sys
-
-with socket.socket() as sock:
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", int(sys.argv[1])))
-    sock.listen()
-PY
 }
 
 check_architecture
 check_commands
+check_nmi_fixture_prerequisites
 check_kvm
 check_uefi_firmware
 check_uv_python
 check_native_build_inputs
-check_loopback_port
+warn_network_exposure
+check_configured_listeners
 check_libvirt
+print_effective_endpoints 'doctor: '
 printf 'doctor: host prerequisites are available\n'

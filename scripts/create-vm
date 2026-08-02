@@ -71,6 +71,9 @@ dump_existing_domain_xml() {
 validate_or_reject_existing_domain() {
   local xml_path="${STATE_DIR}/existing-domain.xml"
   local root_path
+  local serial_error
+  local serial_endpoint_value
+  local serial_transport_name
   if virsh -c "$LIBVIRT_URI" dominfo "$DEFAULT_DOMAIN_NAME" >/dev/null 2>&1; then
     ensure_private_dir "$STATE_DIR"
     dump_existing_domain_xml "$xml_path"
@@ -91,8 +94,22 @@ validate_or_reject_existing_domain() {
       fail "existing domain $DEFAULT_DOMAIN_NAME does not match configured VM memory"
     domain_config_metadata_matches "$xml_path" ||
       fail "existing domain $DEFAULT_DOMAIN_NAME does not match configured sizing/image metadata"
-    domain_shape_matches_expected "$xml_path" "$root_path" ||
-      fail "existing domain $DEFAULT_DOMAIN_NAME hardware does not match expected project shape"
+    if domain_shape_matches_expected "$xml_path" "$root_path"; then
+      :
+    else
+      case "$?" in
+      2)
+        serial_endpoint_value="$(serial_endpoint)"
+        serial_transport_name="${SERIAL_MODE} serial transport ${serial_endpoint_value}"
+        serial_error="existing domain $DEFAULT_DOMAIN_NAME does not match configured "
+        serial_error+="${serial_transport_name}; destroy and recreate it"
+        fail "$serial_error"
+        ;;
+      *)
+        fail "existing domain $DEFAULT_DOMAIN_NAME hardware does not match expected project shape"
+        ;;
+      esac
+    fi
     return 0
   fi
   return 1
@@ -205,19 +222,63 @@ REDFISH_PASSWORD='${password}'"
   write_htpasswd "$htpasswd_path"
 }
 
-create_tls_once() {
+validate_existing_tls() {
   local cert_path="${STATE_DIR}/tls.crt"
+  local cert_public_key
   local key_path="${STATE_DIR}/tls.key"
-  local tmp_cert tmp_key
+  local key_public_key
+  local verify_status
   require_safe_create_state_file_or_absent "$cert_path"
   require_safe_create_state_file_or_absent "$key_path"
   if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
     require_private_file "$cert_path"
     require_private_file "$key_path"
-    return 0
+    if ! openssl x509 -in "$cert_path" -noout >/dev/null 2>&1; then
+      fail "existing Redfish TLS certificate is malformed; run make destroy, then make create"
+    fi
+    if ! openssl verify -check_ss_sig -CAfile "$cert_path" "$cert_path" \
+      >/dev/null 2>&1; then
+      fail "existing Redfish TLS certificate is not a current valid self-signed identity;" \
+        "run make destroy, then make create"
+    fi
+    if ! cert_public_key="$(openssl x509 -in "$cert_path" -pubkey -noout 2>/dev/null)"; then
+      fail "cannot read existing Redfish TLS certificate public key;" \
+        "run make destroy, then make create"
+    fi
+    if ! key_public_key="$(openssl pkey -passin pass: -in "$key_path" -pubout 2>/dev/null)"; then
+      fail "existing Redfish TLS private key is malformed; run make destroy, then make create"
+    fi
+    if [ "$cert_public_key" != "$key_public_key" ]; then
+      fail "existing Redfish TLS certificate and private key do not match;" \
+        "run make destroy, then make create"
+    fi
+    if openssl x509 -checkip "$REDFISH_LISTEN_IP" -noout -in "$cert_path"; then
+      return 0
+    else
+      verify_status=$?
+    fi
+    if [ "$verify_status" -eq 1 ]; then
+      fail "existing Redfish TLS certificate does not cover configured Redfish listener" \
+        "${REDFISH_LISTEN_IP}; run make destroy, then make create"
+    fi
+    fail "failed to verify Redfish TLS certificate for ${REDFISH_LISTEN_IP}"
   fi
   if [ -f "$cert_path" ] || [ -f "$key_path" ]; then
     fail "incomplete Redfish TLS state: expected both $cert_path and $key_path"
+  fi
+}
+
+create_tls_once() {
+  local cert_path="${STATE_DIR}/tls.crt"
+  local key_path="${STATE_DIR}/tls.key"
+  local san
+  local tmp_cert tmp_key
+  if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+    return 0
+  fi
+  san="DNS:localhost,IP:127.0.0.1"
+  if [ "$REDFISH_LISTEN_IP" != "127.0.0.1" ]; then
+    san+=",IP:${REDFISH_LISTEN_IP}"
   fi
   tmp_cert="$(mktemp "${STATE_DIR}/.tls.crt.XXXXXX")" ||
     fail "cannot create temporary TLS certificate in $STATE_DIR"
@@ -227,22 +288,41 @@ create_tls_once() {
   }
   if ! openssl req -x509 -newkey rsa:3072 -sha256 -days 365 -nodes \
     -subj "/CN=localhost" \
-    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+    -addext "subjectAltName=${san}" \
     -keyout "$tmp_key" \
     -out "$tmp_cert"; then
     rm -- "$tmp_cert" "$tmp_key"
     fail "failed to create Redfish TLS certificate"
   fi
   chmod 600 "$tmp_key" "$tmp_cert"
-  mv -- "$tmp_cert" "$cert_path"
-  mv -- "$tmp_key" "$key_path"
+  if ! mv -- "$tmp_cert" "$cert_path"; then
+    rm -- "$tmp_cert" "$tmp_key"
+    fail "failed to publish Redfish TLS certificate"
+  fi
+  if ! mv -- "$tmp_key" "$key_path"; then
+    rm -- "$tmp_key" "$cert_path"
+    fail "failed to publish Redfish TLS key"
+  fi
+}
+
+shell_quote() {
+  local value="$1"
+  value="${value//\'/\'\\\'\'}"
+  printf "'%s'" "$value"
 }
 
 write_connection_metadata() {
+  local ca_cert credentials_file endpoint serial_value
+  ca_cert="${STATE_DIR}/tls.crt"
+  credentials_file="${STATE_DIR}/credentials.env"
+  endpoint="$(redfish_endpoint)"
+  serial_value="$(serial_endpoint)"
   write_secret_file "${STATE_DIR}/connection.env" \
-    "REDFISH_ENDPOINT='https://127.0.0.1:8000'
-REDFISH_CA_CERT='${STATE_DIR}/tls.crt'
-REDFISH_CREDENTIALS_FILE='${STATE_DIR}/credentials.env'"
+    "REDFISH_ENDPOINT=$(shell_quote "$endpoint")
+REDFISH_CA_CERT=$(shell_quote "$ca_cert")
+REDFISH_CREDENTIALS_FILE=$(shell_quote "$credentials_file")
+SERIAL_TRANSPORT=$(shell_quote "$SERIAL_MODE")
+SERIAL_ENDPOINT=$(shell_quote "$serial_value")"
 }
 
 rollback_new_root_volume() {
@@ -269,14 +349,23 @@ create_new_domain() {
 }
 
 create_vm_transaction() {
+  warn_network_exposure
+  reject_listener_collision
+  check_listener_available "$REDFISH_LISTEN_IP" "$REDFISH_LISTEN_PORT"
+  validate_existing_tls
   if validate_or_reject_existing_domain; then
     create_redfish_runtime_state
+    print_effective_endpoints 'create: '
     return 0
+  fi
+  if [ "$SERIAL_MODE" = "tcp" ]; then
+    check_listener_available "$SERIAL_LISTEN_IP" "$SERIAL_LISTEN_PORT"
   fi
   reject_root_volume_collision
   create_domain_uuid_once
   create_new_domain
   create_redfish_runtime_state
+  print_effective_endpoints 'create: '
 }
 
 validate_create_config

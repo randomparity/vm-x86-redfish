@@ -4,6 +4,8 @@ load "helpers/test-helper"
 
 setup() {
   setup_test_workspace
+  export VM_X86_REDFISH_REAL_OPENSSL
+  VM_X86_REDFISH_REAL_OPENSSL="$(command -v openssl)"
   export VM_X86_REDFISH_SOURCE_IMAGE="$BATS_TEST_TMPDIR/source.qcow2"
   printf 'test qcow2 image\n' >"$VM_X86_REDFISH_SOURCE_IMAGE"
   export VM_X86_REDFISH_TEST_SOURCE_SHA256
@@ -20,6 +22,84 @@ esac
     'printf "uuidgen\\n" >>"$BATS_TEST_TMPDIR/commands.log"
 printf "11111111-2222-3333-8444-555555555555\\n"'
   install_redfish_state_mocks
+}
+
+install_real_openssl() {
+  install_mock_command openssl \
+    "exec '$VM_X86_REDFISH_REAL_OPENSSL' \"\$@\""
+}
+
+install_bounded_encrypted_key_openssl() {
+  install_mock_command openssl '
+if [ "${1:-}" = "pkey" ] && [[ " $* " != *" -passin pass: "* ]]; then
+  sleep 30
+fi
+exec "$VM_X86_REDFISH_REAL_OPENSSL" "$@"
+'
+}
+
+generate_valid_tls_pair() {
+  local cert_path="$1"
+  local key_path="$2"
+  "$VM_X86_REDFISH_REAL_OPENSSL" req -x509 -newkey rsa:2048 -sha256 -days 2 -nodes \
+    -subj "/CN=localhost" -addext "subjectAltName=IP:127.0.0.1" \
+    -keyout "$key_path" -out "$cert_path" >/dev/null 2>&1
+  chmod 600 "$cert_path" "$key_path"
+}
+
+generate_expired_tls_pair() {
+  local cert_path="$1"
+  local key_path="$2"
+  local ca_dir="$BATS_TEST_TMPDIR/expired-tls-ca"
+  local config_path="$ca_dir/openssl.cnf"
+  mkdir -p "$ca_dir/certs"
+  : >"$ca_dir/index.txt"
+  printf '01\n' >"$ca_dir/serial"
+  printf '%s\n' \
+    '[ca]' \
+    'default_ca=local_ca' \
+    '[local_ca]' \
+    "database=$ca_dir/index.txt" \
+    "new_certs_dir=$ca_dir/certs" \
+    "serial=$ca_dir/serial" \
+    'default_md=sha256' \
+    'policy=local_policy' \
+    '[local_policy]' \
+    'commonName=supplied' \
+    '[server_extensions]' \
+    'subjectAltName=IP:127.0.0.1' >"$config_path"
+  "$VM_X86_REDFISH_REAL_OPENSSL" req -new -newkey rsa:2048 -nodes \
+    -subj "/CN=localhost" -keyout "$key_path" -out "$ca_dir/request.csr" \
+    >/dev/null 2>&1
+  "$VM_X86_REDFISH_REAL_OPENSSL" ca -batch -selfsign -config "$config_path" \
+    -keyfile "$key_path" -in "$ca_dir/request.csr" -out "$cert_path" \
+    -startdate 20200101000000Z -enddate 20200102000000Z \
+    -extensions server_extensions >/dev/null 2>&1
+  chmod 600 "$cert_path" "$key_path"
+}
+
+generate_encrypted_tls_pair() {
+  local cert_path="$1"
+  local key_path="$2"
+  "$VM_X86_REDFISH_REAL_OPENSSL" req -x509 -newkey rsa:2048 -sha256 -days 2 \
+    -passout pass:redfish-test-key-password -subj "/CN=localhost" \
+    -addext "subjectAltName=IP:127.0.0.1" \
+    -keyout "$key_path" -out "$cert_path" >/dev/null 2>&1
+  chmod 600 "$cert_path" "$key_path"
+}
+
+assert_tls_rejection_preserved_precreate_state() {
+  local cert_digest="$1"
+  local key_digest="$2"
+  local state_path
+  [ "$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")" = "$cert_digest" ]
+  [ "$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")" = "$key_digest" ]
+  run grep -F "virsh " "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+  for state_path in domain-uuid domain.xml credentials.env htpasswd connection.env \
+    sushy-emulator.conf.py; do
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/$state_path" ]
+  done
 }
 
 install_redfish_state_mocks() {
@@ -48,6 +128,21 @@ case "$*" in
     done
     printf "test-key\\n" >"$key"
     printf "test-cert\\n" >"$cert"
+    ;;
+  verify*)
+    exit "${VM_X86_REDFISH_OPENSSL_VERIFY_STATUS:-0}"
+    ;;
+  pkey*)
+    printf "%s\n" "${VM_X86_REDFISH_OPENSSL_KEY_PUBLIC:-test-public-key}"
+    ;;
+  x509*)
+    if [[ "$*" == *" -checkip "* ]]; then
+      exit "${VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS:-0}"
+    fi
+    if [[ "$*" == *" -pubkey "* ]]; then
+      printf "%s\n" "${VM_X86_REDFISH_OPENSSL_CERT_PUBLIC:-test-public-key}"
+    fi
+    exit "${VM_X86_REDFISH_OPENSSL_X509_STATUS:-0}"
     ;;
   *)
     exit 2
@@ -91,21 +186,56 @@ esac
 }
 
 write_existing_domain_xml() {
-  local extra_devices root_path root_volume_name target_path
+  local extra_devices root_path root_volume_name serial_devices serial_listen_ip
+  local serial_listen_port serial_metadata serial_mode target_path
   target_path="$1"
   root_volume_name="${2:-vm-x86-redfish.qcow2}"
   root_path="${3:-/var/lib/libvirt/images/vm-x86-redfish.qcow2}"
   extra_devices="${4:-}"
+  serial_mode="${5:-pty}"
+  serial_listen_ip="${6:-}"
+  serial_listen_port="${7:-}"
+  case "$serial_mode" in
+  pty)
+    serial_devices='<serial type="pty">
+      <target type="isa-serial" port="0"><model name="isa-serial"/></target>
+    </serial>
+    <console type="pty">
+      <target type="serial" port="0"/>
+    </console>'
+    ;;
+  tcp)
+    serial_devices="<serial type=\"tcp\">
+      <source mode=\"bind\" host=\"${serial_listen_ip}\" service=\"${serial_listen_port}\"/>
+      <protocol type=\"raw\"/>
+      <target type=\"isa-serial\" port=\"0\"><model name=\"isa-serial\"/></target>
+    </serial>
+    <console type=\"tcp\">
+      <source mode=\"bind\" host=\"${serial_listen_ip}\" service=\"${serial_listen_port}\"/>
+      <protocol type=\"raw\"/>
+      <target type=\"serial\" port=\"0\"/>
+    </console>"
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+  serial_metadata="      <rp:serial-mode>${serial_mode}</rp:serial-mode>
+      <rp:serial-listen-ip>${serial_listen_ip}</rp:serial-listen-ip>
+      <rp:serial-listen-port>${serial_listen_port}</rp:serial-listen-port>"
   cat >"$target_path" <<XML
 <domain type="kvm" xmlns:rp="https://github.com/randomparity/vm-x86-redfish">
   <name>vm-x86-redfish</name>
   <uuid>11111111-2222-3333-8444-555555555555</uuid>
   <metadata>
-    <rp:project>vm-x86-redfish</rp:project>
-    <rp:root-volume>${root_volume_name}</rp:root-volume>
-    <rp:memory-mib>4096</rp:memory-mib>
-    <rp:root-disk-gib>40</rp:root-disk-gib>
-    <rp:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</rp:source-image-sha256>
+    <rp:vm-x86-redfish>
+      <rp:project>vm-x86-redfish</rp:project>
+      <rp:root-volume>${root_volume_name}</rp:root-volume>
+      <rp:memory-mib>4096</rp:memory-mib>
+      <rp:root-disk-gib>40</rp:root-disk-gib>
+      <rp:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</rp:source-image-sha256>
+${serial_metadata}
+    </rp:vm-x86-redfish>
   </metadata>
   <memory unit="MiB">4096</memory>
   <vcpu placement="static">2</vcpu>
@@ -126,12 +256,7 @@ write_existing_domain_xml() {
       <source network="default"/>
       <model type="virtio"/>
     </interface>
-    <serial type="pty">
-      <target type="isa-serial" port="0"><model name="isa-serial"/></target>
-    </serial>
-    <console type="pty">
-      <target type="serial" port="0"/>
-    </console>
+${serial_devices}
     <channel type="unix">
       <target type="virtio" name="org.qemu.guest_agent.0"/>
     </channel>
@@ -144,9 +269,13 @@ XML
 }
 
 install_existing_domain_mocks() {
+  local serial_listen_ip="${2:-}"
+  local serial_listen_port="${3:-}"
+  local serial_mode="${1:-pty}"
   printf '11111111-2222-3333-8444-555555555555\n' \
     >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
-  write_existing_domain_xml "$BATS_TEST_TMPDIR/existing-domain.xml"
+  write_existing_domain_xml "$BATS_TEST_TMPDIR/existing-domain.xml" "" "" "" \
+    "$serial_mode" "$serial_listen_ip" "$serial_listen_port"
   install_mock_command virsh '
 printf "virsh %s\\n" "$*" >>"$BATS_TEST_TMPDIR/commands.log"
 case "$*" in
@@ -201,6 +330,263 @@ PY
   [ "$status" -ne 0 ]
 }
 
+@test "create-vm generates TLS SANs for canonical Redfish listener addresses" {
+  local address expected_san
+  local case_name
+  for case_name in loopback ipv4 ipv6; do
+    case "$case_name" in
+    loopback)
+      address="127.0.0.1"
+      expected_san="DNS:localhost,IP:127.0.0.1"
+      ;;
+    ipv4)
+      address="192.0.2.20"
+      expected_san="DNS:localhost,IP:127.0.0.1,IP:192.0.2.20"
+      ;;
+    ipv6)
+      address="2001:db8::20"
+      expected_san="DNS:localhost,IP:127.0.0.1,IP:2001:db8::20"
+      ;;
+    esac
+    install_create_success_mocks
+    : >"$BATS_TEST_TMPDIR/commands.log"
+
+    VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+      VM_X86_REDFISH_LISTEN_IP="$address" run ./scripts/create-vm
+
+    [ "$status" -eq 0 ]
+    run grep -F "subjectAltName=${expected_san}" "$BATS_TEST_TMPDIR/commands.log"
+    [ "$status" -eq 0 ]
+    [ "$(grep -o 'IP:127.0.0.1' "$BATS_TEST_TMPDIR/commands.log" | wc -l)" -eq 1 ]
+    unlink "$VM_X86_REDFISH_STATE_DIR/tls.crt"
+    unlink "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  done
+}
+
+@test "create-vm reuses TLS SAN identity matching the configured listener" {
+  install_existing_domain_mocks
+  printf 'test-cert\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_LISTEN_IP=192.0.2.20 run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
+  run grep -F "x509 -checkip 192.0.2.20 -noout" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -eq 0 ]
+  run grep -F "openssl req" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm rejects mismatched TLS SAN identity without replacing it" {
+  local cert_before domain_uuid_before key_before state_path
+  install_existing_domain_mocks
+  printf 'test-cert\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  cert_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  domain_uuid_before="$(<"$VM_X86_REDFISH_STATE_DIR/domain-uuid")"
+  key_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")"
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS=1 \
+    VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not cover configured Redfish listener 192.0.2.20"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")" = "$cert_before" ]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")" = "$key_before" ]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/domain-uuid")" = "$domain_uuid_before" ]
+  for state_path in credentials.env htpasswd connection.env sushy-emulator.conf.py; do
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/$state_path" ]
+  done
+}
+
+@test "create-vm rejects stale TLS SAN before libvirt mutation" {
+  local cert_before key_before state_path
+  install_create_success_mocks
+  printf 'test-cert\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  cert_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_before="$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")"
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS=1 \
+    VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not cover configured Redfish listener 192.0.2.20"* ]]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.crt")" = "$cert_before" ]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/tls.key")" = "$key_before" ]
+  run grep -F "virsh " "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+  for state_path in domain-uuid domain.xml credentials.env htpasswd connection.env \
+    sushy-emulator.conf.py; do
+    [ ! -e "$VM_X86_REDFISH_STATE_DIR/$state_path" ]
+  done
+}
+
+@test "create-vm reports TLS SAN verification errors" {
+  install_existing_domain_mocks
+  printf 'test-cert\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  printf 'test-key\n' >"$VM_X86_REDFISH_STATE_DIR/tls.key"
+  chmod 600 "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+
+  VM_X86_REDFISH_OPENSSL_CHECKIP_STATUS=2 run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"failed to verify Redfish TLS certificate"* ]]
+}
+
+@test "create-vm rejects malformed TLS before VM or generated-state mutation" {
+  local cert_digest key_digest
+  install_create_success_mocks
+  generate_valid_tls_pair \
+    "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  printf 'not a certificate\n' >"$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  cert_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")"
+  install_real_openssl
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"existing Redfish TLS certificate is malformed"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
+  assert_tls_rejection_preserved_precreate_state "$cert_digest" "$key_digest"
+}
+
+@test "create-vm rejects expired TLS before VM or generated-state mutation" {
+  local cert_digest key_digest
+  install_create_success_mocks
+  generate_expired_tls_pair \
+    "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  cert_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")"
+  install_real_openssl
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not a current valid self-signed identity"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
+  assert_tls_rejection_preserved_precreate_state "$cert_digest" "$key_digest"
+}
+
+@test "create-vm rejects a mismatched TLS key before VM or generated-state mutation" {
+  local cert_digest key_digest other_cert other_key
+  install_create_success_mocks
+  generate_valid_tls_pair \
+    "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  other_cert="$BATS_TEST_TMPDIR/other.crt"
+  other_key="$BATS_TEST_TMPDIR/other.key"
+  generate_valid_tls_pair "$other_cert" "$other_key"
+  cp -- "$other_key" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  cert_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")"
+  install_real_openssl
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"certificate and private key do not match"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
+  assert_tls_rejection_preserved_precreate_state "$cert_digest" "$key_digest"
+}
+
+@test "create-vm rejects an encrypted TLS key without waiting for a passphrase" {
+  local cert_digest key_digest
+  install_create_success_mocks
+  generate_encrypted_tls_pair \
+    "$VM_X86_REDFISH_STATE_DIR/tls.crt" "$VM_X86_REDFISH_STATE_DIR/tls.key"
+  cert_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.crt")"
+  key_digest="$(sha256sum "$VM_X86_REDFISH_STATE_DIR/tls.key")"
+  install_bounded_encrypted_key_openssl
+
+  run timeout --kill-after=1 3 ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 124 ]
+  [[ "$output" == *"existing Redfish TLS private key is malformed"* ]]
+  [[ "$output" == *"run make destroy, then make create"* ]]
+  assert_tls_rejection_preserved_precreate_state "$cert_digest" "$key_digest"
+}
+
+@test "create-vm rolls back a TLS SAN identity when publishing its key fails" {
+  local tmp_tls
+  install_existing_domain_mocks
+  install_mock_command mv '
+destination="${!#}"
+if [ "$destination" = "$VM_X86_REDFISH_STATE_DIR/tls.key" ]; then
+  exit 1
+fi
+/usr/bin/mv "$@"
+'
+
+  run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [ ! -e "$VM_X86_REDFISH_STATE_DIR/tls.crt" ]
+  [ ! -e "$VM_X86_REDFISH_STATE_DIR/tls.key" ]
+  shopt -s nullglob
+  tmp_tls=("$VM_X86_REDFISH_STATE_DIR"/.tls.*)
+  [ "${#tmp_tls[@]}" -eq 0 ]
+}
+
+@test "create-vm writes source-safe default connection metadata" {
+  local connection_path expected_ca expected_connection expected_credentials
+  export VM_X86_REDFISH_STATE_DIR="$BATS_TEST_TMPDIR/state'quoted"
+  mkdir -p "$VM_X86_REDFISH_STATE_DIR"
+  install_create_success_mocks
+
+  run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
+  connection_path="$VM_X86_REDFISH_STATE_DIR/connection.env"
+  expected_ca="$VM_X86_REDFISH_STATE_DIR/tls.crt"
+  expected_credentials="$VM_X86_REDFISH_STATE_DIR/credentials.env"
+  [ "$(stat -c '%a' "$connection_path")" = "600" ]
+  run bash -c '
+set -euo pipefail
+source "$1"
+printf "%s|%s|%s|%s|%s\\n" \
+  "$REDFISH_ENDPOINT" "$REDFISH_CA_CERT" "$REDFISH_CREDENTIALS_FILE" \
+  "$SERIAL_TRANSPORT" "$SERIAL_ENDPOINT"
+' bash "$connection_path"
+  [ "$status" -eq 0 ]
+  expected_connection="https://127.0.0.1:8000|${expected_ca}|${expected_credentials}|pty|"
+  expected_connection+="libvirt-console://vm-x86-redfish/serial0"
+  [ "$output" = "$expected_connection" ]
+}
+
+@test "create-vm writes TCP IPv6 connection metadata" {
+  local connection_path
+  install_create_success_mocks
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_LISTEN_IP=2001:db8::20 \
+    VM_X86_REDFISH_LISTEN_PORT=8443 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=2001:db8::21 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
+  connection_path="$VM_X86_REDFISH_STATE_DIR/connection.env"
+  run bash -c '
+set -euo pipefail
+source "$1"
+printf "%s|%s|%s\\n" "$REDFISH_ENDPOINT" "$SERIAL_TRANSPORT" "$SERIAL_ENDPOINT"
+' bash "$connection_path"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://[2001:db8::20]:8443|tcp|tcp://[2001:db8::21]:9000" ]
+}
+
 @test "create-vm repairs missing Redfish state for valid existing domain" {
   install_existing_domain_mocks
 
@@ -209,6 +595,328 @@ PY
   [ "$status" -eq 0 ]
   [ -f "$VM_X86_REDFISH_STATE_DIR/credentials.env" ]
   [ -f "$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py" ]
+}
+
+@test "run-redfish rejects connection metadata left newer than Sushy config" {
+  local initial_config
+  install_create_success_mocks
+  run ./scripts/create-vm
+  [ "$status" -eq 0 ]
+  initial_config="$(<"$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py")"
+  install_existing_domain_mocks
+  install_mock_command htpasswd '
+read -r password
+[ "$password" = "redfish-test-password" ]
+printf "admin:test-hash\n" >"$3"
+printf "invalid-after-validation\n" >"$VM_X86_REDFISH_STATE_DIR/domain-uuid"
+'
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_LISTEN_PORT=8443 run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid domain UUID"* ]]
+  [ "$(<"$VM_X86_REDFISH_STATE_DIR/sushy-emulator.conf.py")" = "$initial_config" ]
+  grep -F "REDFISH_ENDPOINT='https://127.0.0.1:8443'" \
+    "$VM_X86_REDFISH_STATE_DIR/connection.env"
+
+  run ./scripts/run-redfish
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"persisted Sushy listen endpoint disagrees with connection metadata"* ]]
+  [[ "$output" != *"run: Redfish endpoint"* ]]
+}
+
+@test "create-vm accepts a matching TCP serial transport on rerun" {
+  install_existing_domain_mocks tcp 192.0.2.20 9000
+
+  VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
+}
+
+@test "create-vm warns about configured endpoint exposure" {
+  install_create_success_mocks
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=available \
+    VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=8443 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=2001:db8::20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"warning: non-loopback Redfish listener at https://192.0.2.20:8443"* ]]
+  [[ "$output" == *"unauthenticated plaintext TCP serial listener at tcp://[2001:db8::20]:9000"* ]]
+  [[ "$output" == *"create: Redfish endpoint https://192.0.2.20:8443"* ]]
+  [[ "$output" == *"create: serial endpoint tcp://[2001:db8::20]:9000"* ]]
+}
+
+@test "create-vm rejects a busy Redfish listener before libvirt mutation" {
+  install_create_success_mocks
+
+  VM_X86_REDFISH_PORT_CHECK_RESULT=busy \
+    VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=8443 \
+    run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"192.0.2.20:8443 is already in use"* ]]
+  run grep -F "virsh " "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm rejects colliding configured listener tuples before libvirt mutation" {
+  install_create_success_mocks
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=9000 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Redfish and TCP serial listeners cannot use the same address and port"* ]]
+  run grep -F "virsh " "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm rejects a busy TCP serial listener before defining a new domain" {
+  local listener_pid port_file redfish_port serial_port
+  local python_bin
+  python_bin="$(UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+  port_file="$BATS_TEST_TMPDIR/serial-listener.port"
+  "$python_bin" - "$port_file" <<'PY' &
+import pathlib
+import signal
+import socket
+import sys
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    pathlib.Path(sys.argv[1]).write_text(str(server.getsockname()[1]))
+    signal.pause()
+PY
+  listener_pid="$!"
+  wait_for_file "$port_file"
+  serial_port="$(<"$port_file")"
+  redfish_port="$(
+    "$python_bin" - <<'PY'
+import socket
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    print(server.getsockname()[1])
+PY
+  )"
+  install_create_success_mocks
+
+  VM_X86_REDFISH_LISTEN_PORT="$redfish_port" \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=127.0.0.1 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT="$serial_port" \
+    run ./scripts/create-vm
+  create_status="$status"
+  create_output="$output"
+  kill "$listener_pid"
+  wait "$listener_pid" || :
+
+  [ "$create_status" -ne 0 ]
+  [[ "$create_output" == *"127.0.0.1:${serial_port} is already in use"* ]]
+  run grep -F "vol-create-as" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -ne 0 ]
+}
+
+@test "create-vm accepts an active matching TCP serial domain without probing its listener" {
+  local listener_pid port_file redfish_port serial_port
+  local python_bin
+  python_bin="$(UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+  port_file="$BATS_TEST_TMPDIR/serial-listener.port"
+  "$python_bin" - "$port_file" <<'PY' &
+import pathlib
+import signal
+import socket
+import sys
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    pathlib.Path(sys.argv[1]).write_text(str(server.getsockname()[1]))
+    signal.pause()
+PY
+  listener_pid="$!"
+  wait_for_file "$port_file"
+  serial_port="$(<"$port_file")"
+  redfish_port="$(
+    "$python_bin" - <<'PY'
+import socket
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    print(server.getsockname()[1])
+PY
+  )"
+  install_existing_domain_mocks tcp 127.0.0.1 "$serial_port"
+
+  VM_X86_REDFISH_LISTEN_PORT="$redfish_port" \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=127.0.0.1 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT="$serial_port" \
+    run ./scripts/create-vm
+  create_status="$status"
+  create_output="$output"
+  kill "$listener_pid"
+  wait "$listener_pid" || :
+
+  [ "$create_status" -eq 0 ]
+  [[ "$create_output" == *"create: serial endpoint tcp://127.0.0.1:${serial_port}"* ]]
+}
+
+@test "create-vm rejects incompatible serial transports before rewriting runtime state" {
+  local case_name
+  local duplicate_serial
+  for case_name in mode address port protocol source-mode duplicate-serial missing-console \
+    metadata-device-disagreement; do
+    install_existing_domain_mocks tcp 192.0.2.20 9000
+    case "$case_name" in
+    mode)
+      sed -i 's/type="tcp"/type="pty"/' "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    address)
+      sed -i 's/host="192.0.2.20"/host="192.0.2.21"/g' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    port)
+      sed -i 's/service="9000"/service="9001"/g' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    protocol)
+      sed -i '0,/protocol type="raw"/s//protocol type="telnet"/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    source-mode)
+      sed -i '0,/source mode="bind"/s//source mode="connect"/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    duplicate-serial)
+      duplicate_serial='<serial type="pty"><target type="isa-serial" port="1"/></serial>'
+      sed -i "/<channel type=\"unix\">/i\\    ${duplicate_serial}" \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    missing-console)
+      sed -i '/    <console type="tcp">/,/    <\/console>/d' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    metadata-device-disagreement)
+      sed -i 's/<rp:serial-listen-ip>192.0.2.20/<rp:serial-listen-ip>192.0.2.21/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    esac
+
+    : >"$BATS_TEST_TMPDIR/commands.log"
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+      VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+      VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+      run ./scripts/create-vm
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"configured tcp serial transport"* ]]
+    [[ "$output" == *"destroy and recreate"* ]]
+    run grep -F "htpasswd -iB -c" "$BATS_TEST_TMPDIR/commands.log"
+    [ "$status" -ne 0 ]
+  done
+}
+
+@test "create-vm rejects noncanonical serial and console children and attributes" {
+  local case_name
+  local console_target
+  local serial_model
+  local serial_target
+  for case_name in serial-child console-child serial-attribute console-attribute \
+    serial-target-attribute console-target-attribute serial-model-attribute; do
+    install_existing_domain_mocks tcp 192.0.2.20 9000
+    case "$case_name" in
+    serial-child)
+      sed -i '/    <\/serial>/i\      <log file="/tmp/serial.log"/>' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    console-child)
+      sed -i '/    <\/console>/i\      <log file="/tmp/console.log"/>' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    serial-attribute)
+      sed -i '0,/<serial type="tcp"/s//<serial type="tcp" unexpected="value"/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    console-attribute)
+      sed -i '0,/<console type="tcp"/s//<console type="tcp" unexpected="value"/' \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    serial-target-attribute)
+      serial_target='target type="isa-serial" port="0"'
+      sed -i "0,/${serial_target}/s//${serial_target} unexpected=\"value\"/" \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    console-target-attribute)
+      console_target='target type="serial" port="0"'
+      sed -i "0,/${console_target}/s//${console_target} unexpected=\"value\"/" \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    serial-model-attribute)
+      serial_model='model name="isa-serial"'
+      sed -i "0,/${serial_model}/s//${serial_model} unexpected=\"value\"/" \
+        "$BATS_TEST_TMPDIR/existing-domain.xml"
+      ;;
+    esac
+
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+      VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+      VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+      run ./scripts/create-vm
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"configured tcp serial transport"* ]]
+  done
+}
+
+@test "create-vm rejects direct serial metadata outside the project container" {
+  install_existing_domain_mocks tcp 192.0.2.20 9000
+  sed -i '/<rp:serial-/d' "$BATS_TEST_TMPDIR/existing-domain.xml"
+  sed -i '/^[[:space:]]*<\/metadata>/i\    <rp:serial-mode>tcp</rp:serial-mode>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+  sed -i '/^[[:space:]]*<\/metadata>/i\    <rp:serial-listen-ip>192.0.2.20</rp:serial-listen-ip>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+  sed -i '/^[[:space:]]*<\/metadata>/i\    <rp:serial-listen-port>9000</rp:serial-listen-port>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+
+  VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"configured tcp serial transport"* ]]
+}
+
+@test "create-vm accepts inactive libvirt serial aliases" {
+  install_existing_domain_mocks tcp 192.0.2.20 9000
+  sed -i '/    <\/serial>/i\      <alias name="serial0"/>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+  sed -i '/    <\/console>/i\      <alias name="serial0"/>' \
+    "$BATS_TEST_TMPDIR/existing-domain.xml"
+
+  VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/create-vm
+
+  [ "$status" -eq 0 ]
 }
 
 @test "create-vm writes uuid once and defines new owned domain" {
@@ -394,11 +1102,16 @@ case "$*" in
   <name>vm-x86-redfish</name>
   <uuid>11111111-2222-3333-8444-555555555555</uuid>
   <metadata>
-    <owned:project>vm-x86-redfish</owned:project>
-    <owned:root-volume>vm-x86-redfish&amp;owned.qcow2</owned:root-volume>
-    <owned:memory-mib>4096</owned:memory-mib>
-    <owned:root-disk-gib>40</owned:root-disk-gib>
-    <owned:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</owned:source-image-sha256>
+    <owned:vm-x86-redfish>
+      <owned:project>vm-x86-redfish</owned:project>
+      <owned:root-volume>vm-x86-redfish&amp;owned.qcow2</owned:root-volume>
+      <owned:memory-mib>4096</owned:memory-mib>
+      <owned:root-disk-gib>40</owned:root-disk-gib>
+      <owned:source-image-sha256>${VM_X86_REDFISH_TEST_SOURCE_SHA256}</owned:source-image-sha256>
+      <owned:serial-mode>pty</owned:serial-mode>
+      <owned:serial-listen-ip></owned:serial-listen-ip>
+      <owned:serial-listen-port></owned:serial-listen-port>
+    </owned:vm-x86-redfish>
   </metadata>
   <memory unit="MiB">4096</memory>
   <vcpu placement="static">2</vcpu>

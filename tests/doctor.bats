@@ -3,6 +3,19 @@
 
 load "helpers/test-helper"
 
+write_nmi_kernel_config() {
+  local config_path="$1"
+  printf '%s\n' \
+    CONFIG_X86_64=y \
+    CONFIG_HAVE_NMI=y \
+    CONFIG_BLK_DEV_INITRD=y \
+    CONFIG_PROC_FS=y \
+    CONFIG_PROC_SYSCTL=y \
+    CONFIG_BINFMT_ELF=y \
+    CONFIG_PRINTK=y \
+    CONFIG_SERIAL_8250_CONSOLE=y >"$config_path"
+}
+
 @test "doctor reports missing qemu-img with Fedora package hint" {
   bash_bin="$(command -v bash)"
   install_mock_command uname 'printf "x86_64\n"'
@@ -56,15 +69,26 @@ case "$*" in
 esac
 '
   install_mock_command pkg-config 'exit 0'
-  for command in qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd gcc \
-    bats shellcheck shfmt grub2-mkrescue xorriso; do
+  for command in qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd \
+    bats cpio gcc shellcheck shfmt grub2-mkrescue xorriso; do
     install_recording_noop "$command"
   done
+  install_mock_command uname '
+case "${1:-}" in
+  -m) printf "x86_64\n" ;;
+  -r) printf "6.12.0-doctor-test\n" ;;
+  *) exit 2 ;;
+esac
+'
   mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
   touch "$BATS_TEST_TMPDIR/dev/kvm"
+  printf 'kernel\n' >"$BATS_TEST_TMPDIR/doctor-vmlinuz"
+  write_nmi_kernel_config "$BATS_TEST_TMPDIR/doctor-kernel.config"
   VM_X86_REDFISH_INTEGRATION_TEST=1 \
     VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm" \
     VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf" \
+    VM_X86_REDFISH_TEST_KERNEL_IMAGE="$BATS_TEST_TMPDIR/doctor-vmlinuz" \
+    VM_X86_REDFISH_TEST_KERNEL_CONFIG="$BATS_TEST_TMPDIR/doctor-kernel.config" \
     run ./scripts/doctor
   [ "$status" -eq 0 ]
   [[ "$output" == *"doctor: host prerequisites are available"* ]]
@@ -89,20 +113,50 @@ case "$*" in
 esac
 '
   install_mock_command pkg-config 'exit 0'
-  for command in uname qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd \
-    bats gcc shellcheck shfmt grub2-mkrescue xorriso; do
+  for command in qemu-system-x86_64 qemu-img uuidgen curl timeout openssl htpasswd \
+    bats cpio gcc shellcheck shfmt grub2-mkrescue xorriso; do
     install_recording_noop "$command"
   done
-  install_mock_command uname 'printf "x86_64\n"'
+  install_mock_command uname '
+case "${1:-}" in
+  -m) printf "x86_64\n" ;;
+  -r) printf "6.12.0-nmi-test\n" ;;
+  *) exit 2 ;;
+esac
+'
   mkdir -p "$BATS_TEST_TMPDIR/dev" "$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
   touch "$BATS_TEST_TMPDIR/dev/kvm"
+  printf 'kernel\n' >"$BATS_TEST_TMPDIR/vmlinuz"
+  write_nmi_kernel_config "$BATS_TEST_TMPDIR/kernel.config"
   export VM_X86_REDFISH_INTEGRATION_TEST=1
   export VM_X86_REDFISH_DEV_KVM="$BATS_TEST_TMPDIR/dev/kvm"
   export VM_X86_REDFISH_OVMF_DIR="$BATS_TEST_TMPDIR/usr/share/edk2/ovmf"
+  export VM_X86_REDFISH_TEST_KERNEL_IMAGE="$BATS_TEST_TMPDIR/vmlinuz"
+  export VM_X86_REDFISH_TEST_KERNEL_CONFIG="$BATS_TEST_TMPDIR/kernel.config"
+}
+
+install_endpoint_probe_python_mock() {
+  install_mock_command python313 '
+program="$(cat)"
+if [ "$#" -eq 3 ]; then
+  printf "probe %s %s\\n" "$2" "$3" >>"$BATS_TEST_TMPDIR/commands.log"
+  exit 0
+fi
+if [[ "$program" == *"is_loopback"* ]]; then
+  case "$2" in
+    127.*|::1) exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+if [ "$#" -eq 2 ]; then
+  printf "%s\\n" "$2"
+fi
+'
 }
 
 @test "doctor rejects unavailable loopback port 8000" {
   install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
   VM_X86_REDFISH_PORT_CHECK_RESULT=busy run ./scripts/doctor
   [ "$status" -ne 0 ]
   [[ "$output" == *"127.0.0.1:8000 is already in use"* ]]
@@ -144,6 +198,27 @@ esac
   [[ "$doctor_output" == *"127.0.0.1:${test_port} is already in use"* ]]
 }
 
+@test "doctor reports a non-bindable configured endpoint without a traceback" {
+  local python_bin
+  python_bin="$(PATH="${PATH#*:}" UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
+  install_all_doctor_success_mocks
+  install_mock_command uv "
+case \"\$*\" in
+  \"python find 3.13\") printf '%s\\n' '$python_bin' ;;
+  *) exit 2 ;;
+esac
+"
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=8443 \
+    run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot bind 192.0.2.20:8443: Cannot assign requested address"* ]]
+  [[ "$output" != *"already in use"* ]]
+  [[ "$output" != *"Traceback"* ]]
+}
+
 @test "doctor accepts recently closed loopback connections" {
   python_bin="$(PATH="${PATH#*:}" UV_PYTHON_DOWNLOADS=never uv python find 3.13)"
   test_port="$(
@@ -173,6 +248,70 @@ esac
 
   VM_X86_REDFISH_PORT_CHECK_PORT="$test_port" run ./scripts/doctor
   [ "$status" -eq 0 ]
+}
+
+@test "doctor probes configured endpoint addresses for IPv4 Redfish and IPv6 TCP serial" {
+  local doctor_output
+  install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=8443 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=2001:db8::20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/doctor
+
+  [ "$status" -eq 0 ]
+  doctor_output="$output"
+  run grep -F "probe 192.0.2.20 8443" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -eq 0 ]
+  run grep -F "probe 2001:db8::20 9000" "$BATS_TEST_TMPDIR/commands.log"
+  [ "$status" -eq 0 ]
+  [[ "$doctor_output" == *"doctor: Redfish endpoint https://192.0.2.20:8443"* ]]
+  [[ "$doctor_output" == *"doctor: serial endpoint tcp://[2001:db8::20]:9000"* ]]
+}
+
+@test "doctor prints default endpoints without exposure warnings" {
+  install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
+
+  run ./scripts/doctor
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"doctor: Redfish endpoint https://127.0.0.1:8000"* ]]
+  [[ "$output" == *"doctor: serial endpoint libvirt-console://vm-x86-redfish/serial0"* ]]
+  [[ "$output" != *"warning:"* ]]
+}
+
+@test "doctor warns about configured endpoint exposure" {
+  install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=2001:db8::20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/doctor
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"warning: non-loopback Redfish listener at https://192.0.2.20:8000"* ]]
+  [[ "$output" == *"unauthenticated plaintext TCP serial listener at tcp://[2001:db8::20]:9000"* ]]
+}
+
+@test "doctor rejects colliding configured listener tuples" {
+  install_all_doctor_success_mocks
+  install_endpoint_probe_python_mock
+
+  VM_X86_REDFISH_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_LISTEN_PORT=9000 \
+    VM_X86_REDFISH_SERIAL_MODE=tcp \
+    VM_X86_REDFISH_SERIAL_LISTEN_IP=192.0.2.20 \
+    VM_X86_REDFISH_SERIAL_LISTEN_PORT=9000 \
+    run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Redfish and TCP serial listeners cannot use the same address and port"* ]]
 }
 
 @test "doctor reports missing uuidgen with Fedora package hint" {
@@ -241,4 +380,157 @@ esac
   [ ! -e .state ]
   [ ! -e .artifacts ]
   [ ! -e .venv ]
+}
+
+@test "NMI fixture doctor reports missing cpio with kernel release and package hint" {
+  install_all_doctor_success_mocks
+  rm "$BATS_TEST_TMPDIR/bin/cpio"
+
+  PATH="$BATS_TEST_TMPDIR/bin" run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"missing command 'cpio' for NMI fixture kernel 6.12.0-nmi-test"* ]]
+  [[ "$output" == *"install cpio"* ]]
+}
+
+@test "NMI fixture doctor rejects an unreadable matching kernel" {
+  install_all_doctor_success_mocks
+  chmod 000 "$VM_X86_REDFISH_TEST_KERNEL_IMAGE"
+
+  run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"matching kernel 6.12.0-nmi-test is not readable"* ]]
+  [[ "$output" == *"install kernel-core-6.12.0-nmi-test"* ]]
+}
+
+@test "NMI fixture doctor reports missing x86 NMI kernel capability" {
+  install_all_doctor_success_mocks
+  printf 'CONFIG_X86_64=y\n# CONFIG_HAVE_NMI is not set\n' \
+    >"$VM_X86_REDFISH_TEST_KERNEL_CONFIG"
+
+  run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"kernel 6.12.0-nmi-test lacks CONFIG_HAVE_NMI=y"* ]]
+  [[ "$output" == *"install kernel-core-6.12.0-nmi-test with CONFIG_HAVE_NMI enabled"* ]]
+}
+
+assert_nmi_fixture_missing_capability() {
+  local capability="$1"
+  install_all_doctor_success_mocks
+  sed -i "/^${capability}=y$/d" "$VM_X86_REDFISH_TEST_KERNEL_CONFIG"
+
+  run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"kernel 6.12.0-nmi-test lacks ${capability}=y"* ]]
+  [[ "$output" == *"install kernel-core-6.12.0-nmi-test with ${capability} enabled"* ]]
+}
+
+@test "NMI fixture doctor requires initramfs kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_BLK_DEV_INITRD
+}
+
+@test "NMI fixture doctor requires procfs kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_PROC_FS
+}
+
+@test "NMI fixture doctor requires proc sysctl kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_PROC_SYSCTL
+}
+
+@test "NMI fixture doctor requires ELF kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_BINFMT_ELF
+}
+
+@test "NMI fixture doctor requires kernel logging support" {
+  assert_nmi_fixture_missing_capability CONFIG_PRINTK
+}
+
+@test "NMI fixture doctor requires serial console kernel support" {
+  assert_nmi_fixture_missing_capability CONFIG_SERIAL_8250_CONSOLE
+}
+
+@test "NMI fixture doctor reports static link failure with package hint" {
+  install_all_doctor_success_mocks
+  install_mock_command gcc '
+if [ "${1:-}" = "-static" ]; then
+  exit 1
+fi
+'
+
+  run ./scripts/doctor
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"gcc cannot link a static PID 1 for kernel 6.12.0-nmi-test"* ]]
+  [[ "$output" == *"install glibc-static"* ]]
+}
+
+@test "ordinary doctor skips NMI fixture prerequisites" {
+  install_all_doctor_success_mocks
+  rm "$BATS_TEST_TMPDIR/bin/cpio"
+  rm "$VM_X86_REDFISH_TEST_KERNEL_IMAGE" "$VM_X86_REDFISH_TEST_KERNEL_CONFIG"
+  install_mock_command basename 'exec /usr/bin/basename "$@"'
+  install_mock_command grep 'exec /usr/bin/grep "$@"'
+  install_mock_command gcc '
+if [ "${1:-}" = "-static" ]; then
+  exit 1
+fi
+'
+  unset VM_X86_REDFISH_INTEGRATION_TEST
+  unset VM_X86_REDFISH_DEV_KVM VM_X86_REDFISH_OVMF_DIR
+  unset VM_X86_REDFISH_STATE_DIR VM_X86_REDFISH_ARTIFACTS_DIR
+
+  PATH="$BATS_TEST_TMPDIR/bin" run ./scripts/doctor
+
+  [[ "$output" != *"missing command 'cpio' for NMI fixture"* ]]
+  [[ "$output" != *"matching kernel 6.12.0-nmi-test"* ]]
+  [[ "$output" != *"gcc cannot link a static PID 1"* ]]
+}
+
+@test "NMI fixture init validates panic sysctls before readiness and exits failures" {
+  local init_source="tests/fixtures/nmi-init.c"
+  local mount_line panic_line ready_line unknown_line
+
+  [ -f "$init_source" ]
+  run grep -nF 'mount("proc", "/proc", "proc"' "$init_source"
+  [ "$status" -eq 0 ]
+  mount_line="${output%%:*}"
+  run grep -nF 'read_expected("/proc/sys/kernel/unknown_nmi_panic", "1\n")' \
+    "$init_source"
+  [ "$status" -eq 0 ]
+  unknown_line="${output%%:*}"
+  run grep -nF 'read_expected("/proc/sys/kernel/panic", "1\n")' "$init_source"
+  [ "$status" -eq 0 ]
+  panic_line="${output%%:*}"
+  run grep -nF 'write_console("NMI_READY\n")' "$init_source"
+  [ "$status" -eq 0 ]
+  ready_line="${output%%:*}"
+  [ "$mount_line" -lt "$ready_line" ]
+  [ "$unknown_line" -lt "$ready_line" ]
+  [ "$panic_line" -lt "$ready_line" ]
+  run grep -F 'NMI_UNSUPPORTED: ' "$init_source"
+  [ "$status" -eq 0 ]
+  run grep -F '_exit(EXIT_FAILURE)' "$init_source"
+  [ "$status" -eq 0 ]
+}
+
+@test "NMI fixture initramfs is reproducible across caller umasks" {
+  local archive_one="$BATS_TEST_TMPDIR/nmi-one.cpio"
+  local archive_two="$BATS_TEST_TMPDIR/nmi-two.cpio"
+  local init_binary="$BATS_TEST_TMPDIR/nmi-init"
+  printf 'deterministic init\n' >"$init_binary"
+
+  (
+    umask 077
+    build_nmi_initramfs "$init_binary" "$archive_one" "$BATS_TEST_TMPDIR/root-one"
+  )
+  (
+    umask 002
+    build_nmi_initramfs "$init_binary" "$archive_two" "$BATS_TEST_TMPDIR/root-two"
+  )
+
+  run cmp "$archive_one" "$archive_two"
+  [ "$status" -eq 0 ]
 }

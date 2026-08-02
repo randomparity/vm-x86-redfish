@@ -56,6 +56,24 @@ setup_integration_workspace() {
   mkdir -p "$VM_X86_REDFISH_STATE_DIR" "$VM_X86_REDFISH_ARTIFACTS_DIR"
 }
 
+build_nmi_initramfs() {
+  local init_binary="$1"
+  local archive_path="$2"
+  local staging_root="$3"
+  (
+    umask 022
+    mkdir -p "$staging_root/dev" "$staging_root/proc"
+    cp "$init_binary" "$staging_root/init"
+    chmod 0755 "$staging_root" "$staging_root/dev" "$staging_root/proc"
+    chmod 0755 "$staging_root/init"
+    touch -d '@0' "$staging_root" "$staging_root/dev" \
+      "$staging_root/proc" "$staging_root/init"
+    cd "$staging_root" || exit 1
+    printf '%s\0' dev init proc |
+      cpio --null --create --format=newc --owner=0:0 --reproducible
+  ) >"$archive_path"
+}
+
 bounded_curl() {
   curl --connect-timeout 5 --max-time 15 "$@"
 }
@@ -110,22 +128,33 @@ stop_tracked_children() {
   TRACKED_CHILDREN=()
 }
 
+child_is_running_job() {
+  local target_pid="$1"
+  local job_pid
+  while IFS= read -r job_pid; do
+    [ "$job_pid" = "$target_pid" ] && return 0
+  done < <(jobs -pr)
+  return 1
+}
+
 stop_child() {
   local pid="$1"
-  if ! kill "$pid" 2>/dev/null; then
+  local timeout_seconds="${CHILD_STOP_TIMEOUT_SECONDS:-10}"
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 2
+  if ! child_is_running_job "$pid"; then
+    wait "$pid" 2>/dev/null || true
     return 0
   fi
-  local deadline=$((SECONDS + 10))
-  while kill -0 "$pid" 2>/dev/null; do
+  kill "$pid" 2>/dev/null || true
+  local deadline=$((SECONDS + timeout_seconds))
+  while child_is_running_job "$pid"; do
     [ "$SECONDS" -lt "$deadline" ] || break
-    sleep 1
+    sleep 0.1
   done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -9 "$pid"
+  if child_is_running_job "$pid"; then
+    kill -9 "$pid" 2>/dev/null || true
   fi
-  if wait "$pid" 2>/dev/null; then
-    return 0
-  fi
+  wait "$pid" 2>/dev/null || true
   return 0
 }
 

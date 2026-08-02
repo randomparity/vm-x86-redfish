@@ -1,8 +1,14 @@
 serial --unit=0 --speed=115200
 terminal_output serial
 set timeout=10
+set default=@DEFAULT_ENTRY@
 
 menuentry 'vm-x86-redfish sentinel' {
   echo '@SENTINEL@'
   halt
+}
+
+menuentry 'vm-x86-redfish panic on NMI' {
+  linux /boot/vmlinuz unknown_nmi_panic=1 panic=1 console=ttyS0
+  initrd /boot/nmi-initramfs.cpio
 }
