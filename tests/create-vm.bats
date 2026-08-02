@@ -50,14 +50,31 @@ generate_valid_tls_pair() {
 generate_expired_tls_pair() {
   local cert_path="$1"
   local key_path="$2"
-  local extension_path="$BATS_TEST_TMPDIR/expired-tls.extensions"
-  "$VM_X86_REDFISH_REAL_OPENSSL" genpkey -algorithm RSA \
-    -pkeyopt rsa_keygen_bits:2048 -out "$key_path" >/dev/null 2>&1
-  printf 'subjectAltName=IP:127.0.0.1\n' >"$extension_path"
-  "$VM_X86_REDFISH_REAL_OPENSSL" x509 -new -key "$key_path" \
-    -subj "/CN=localhost" -not_before 20200101000000Z -not_after 20200102000000Z \
-    -extfile "$extension_path" -out "$cert_path" >/dev/null 2>&1
-  rm -- "$extension_path"
+  local ca_dir="$BATS_TEST_TMPDIR/expired-tls-ca"
+  local config_path="$ca_dir/openssl.cnf"
+  mkdir -p "$ca_dir/certs"
+  : >"$ca_dir/index.txt"
+  printf '01\n' >"$ca_dir/serial"
+  printf '%s\n' \
+    '[ca]' \
+    'default_ca=local_ca' \
+    '[local_ca]' \
+    "database=$ca_dir/index.txt" \
+    "new_certs_dir=$ca_dir/certs" \
+    "serial=$ca_dir/serial" \
+    'default_md=sha256' \
+    'policy=local_policy' \
+    '[local_policy]' \
+    'commonName=supplied' \
+    '[server_extensions]' \
+    'subjectAltName=IP:127.0.0.1' >"$config_path"
+  "$VM_X86_REDFISH_REAL_OPENSSL" req -new -newkey rsa:2048 -nodes \
+    -subj "/CN=localhost" -keyout "$key_path" -out "$ca_dir/request.csr" \
+    >/dev/null 2>&1
+  "$VM_X86_REDFISH_REAL_OPENSSL" ca -batch -selfsign -config "$config_path" \
+    -keyfile "$key_path" -in "$ca_dir/request.csr" -out "$cert_path" \
+    -startdate 20200101000000Z -enddate 20200102000000Z \
+    -extensions server_extensions >/dev/null 2>&1
   chmod 600 "$cert_path" "$key_path"
 }
 

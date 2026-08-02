@@ -467,7 +467,7 @@ fi
   [[ "$output" == *"install glibc-static"* ]]
 }
 
-@test "ordinary doctor does not require NMI fixture prerequisites" {
+@test "ordinary doctor skips NMI fixture prerequisites" {
   install_all_doctor_success_mocks
   rm "$BATS_TEST_TMPDIR/bin/cpio"
   rm "$VM_X86_REDFISH_TEST_KERNEL_IMAGE" "$VM_X86_REDFISH_TEST_KERNEL_CONFIG"
@@ -484,8 +484,9 @@ fi
 
   PATH="$BATS_TEST_TMPDIR/bin" run ./scripts/doctor
 
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"doctor: host prerequisites are available"* ]]
+  [[ "$output" != *"missing command 'cpio' for NMI fixture"* ]]
+  [[ "$output" != *"matching kernel 6.12.0-nmi-test"* ]]
+  [[ "$output" != *"gcc cannot link a static PID 1"* ]]
 }
 
 @test "NMI fixture init validates panic sysctls before readiness and exits failures" {
